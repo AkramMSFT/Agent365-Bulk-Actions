@@ -16,9 +16,15 @@
   (list only), and the caller must be a Teams Service Administrator or higher. App-only is not
   supported. /beta = not for production.
 
-  SCOPE NOTE: this acts on the app-catalog REVIEW queue (Pending review / Pending update).
-  It does NOT cover Agent 365 blueprint "Pending activate" requests, which have no documented
-  Graph API and remain an admin-center action.
+  SCOPE NOTE: this acts ONLY on apps submitted to the TEAMS APP CATALOG for review
+  (publishingState = 'submitted'). It does NOT cover the Microsoft 365 admin center
+  "Agents > Requests" queue for agents built with Copilot Studio / Azure AI Foundry /
+  Agent 365 (shown as "Pending review" / internal state "Staged"), nor blueprint
+  "Pending activate" requests. Those are served by an internal admin-center API
+  (admin.cloud.microsoft/fd/addins/api/actionableApps) with no documented Graph
+  equivalent, so approve/reject for them remains a Microsoft 365 admin center action.
+  If -List returns 0 but the admin center Requests tab shows pending agents, they are
+  in that registry queue, not the Teams app catalog.
 
 .PARAMETER TenantId
   Optional. Target a specific tenant (GUID or domain). Default = your account's home tenant.

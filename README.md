@@ -200,7 +200,7 @@ PATCH /beta/appCatalogs/teamsApps/{teamsAppId}/appDefinitions/{appDefinitionId} 
 **Permissions:** delegated `AppCatalog.ReadWrite.All` (approve/reject) or `AppCatalog.Read.All` (list); caller must be **Teams Service Administrator** or higher. App‑only is not supported.
 
 > [!NOTE]
-> This acts on the app‑catalog **review** queue. It does **not** cover Agent 365 blueprint **"Pending activate"** requests (activating a blueprint so users can create instances), which currently have no documented Graph API and remain a Microsoft 365 admin center action.
+> This acts **only** on apps submitted to the **Teams app catalog** for review (`publishingState = 'submitted'`). It does **not** cover the Microsoft 365 admin center **Agents → Requests** queue for agents built with **Copilot Studio / Azure AI Foundry / Agent 365** (shown as "Pending review", internal state `Staged`), nor blueprint **"Pending activate"** requests. That registry queue is served by an internal admin‑center API with **no documented Graph equivalent**, so approve/reject for those remains a Microsoft 365 admin center action. If `-List` returns 0 while the Requests tab shows pending agents, they're in that registry queue — not the Teams app catalog.
 
 ## Disclaimer
 
