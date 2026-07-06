@@ -171,6 +171,37 @@ ev
 | summarize LastActivity = max(LastActivity) by Key
 ```
 
+## Companion tool: `Agent365-Review-Requests.ps1`
+
+Bulk **approve or reject** agents/apps that members have **submitted for admin review** (the "Pending review / Pending update" queue), via the Microsoft Graph **Teams App Submission API**:
+
+```
+GET   /beta/appCatalogs/teamsApps?$filter=appDefinitions/any(a:a/publishingState eq 'submitted')&$expand=appDefinitions
+PATCH /beta/appCatalogs/teamsApps/{teamsAppId}/appDefinitions/{appDefinitionId}   { "publishingState": "published" | "rejected" }
+```
+
+```powershell
+# List everything awaiting review
+.\Agent365-Review-Requests.ps1 -List
+
+# Approve (publish) or reject by display name and/or teamsAppId
+.\Agent365-Review-Requests.ps1 -Approve "Contoso HR Agent","06805b9e-77e3-4b93-ac81-525eb87513b8"
+.\Agent365-Review-Requests.ps1 -Reject  "Northwind Sales Agent"
+
+# Pick from the queue interactively (default action approve; -Action reject / list)
+.\Agent365-Review-Requests.ps1 -Select
+.\Agent365-Review-Requests.ps1 -Select -Action reject
+
+# Dry run / skip confirmation
+.\Agent365-Review-Requests.ps1 -Approve "Contoso HR Agent" -Preview
+.\Agent365-Review-Requests.ps1 -Approve "Contoso HR Agent" -Force
+```
+
+**Permissions:** delegated `AppCatalog.ReadWrite.All` (approve/reject) or `AppCatalog.Read.All` (list); caller must be **Teams Service Administrator** or higher. App‑only is not supported.
+
+> [!NOTE]
+> This acts on the app‑catalog **review** queue. It does **not** cover Agent 365 blueprint **"Pending activate"** requests (activating a blueprint so users can create instances), which currently have no documented Graph API and remain a Microsoft 365 admin center action.
+
 ## Disclaimer
 
 Provided as‑is, without warranty of any kind. It targets a `/beta` Microsoft Graph API that can change without notice. Not an official Microsoft product. Test in a non‑production tenant first. See [LICENSE](LICENSE).
