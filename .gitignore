@@ -1,0 +1,9 @@
+# PowerShell / editor cruft
+*.log
+*.tmp
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
