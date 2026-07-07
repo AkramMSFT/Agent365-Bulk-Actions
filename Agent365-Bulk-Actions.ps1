@@ -53,6 +53,12 @@
   .\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 90 -By modified -AgentsOnly
 
 .EXAMPLE
+  # List RISKY agents (those with Defender AI-security alerts), then block them
+  .\Agent365-Bulk-Actions.ps1 -Risky -Action list                    # dry run, shows alert count/severity
+  .\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -AgentsOnly
+  .\Agent365-Bulk-Actions.ps1 -Risky -Pick                           # choose which risky agents to block
+
+.EXAMPLE
   # Undo
   .\Agent365-Bulk-Actions.ps1 -Unblock "Contoso HR Agent","Northwind Sales Agent"
 
@@ -89,27 +95,44 @@ param(
     [string]$By = 'activity',                 # activity = no usage telemetry; modified = manifest age
 
     [Parameter(ParameterSetName = 'Stale')]
-    [string]$HuntingQuery,                    # optional KQL override; must return columns: Key, LastActivity
+    [Parameter(ParameterSetName = 'Risky')]
+    [string]$HuntingQuery,                    # optional KQL override. Stale: return Key,LastActivity.
+                                              # Risky: return Key,AlertCount,Severity,LastAlert
 
     [Parameter(ParameterSetName = 'Stale')]
     [switch]$IncludeNeverSeen,                # activity mode: ALSO treat agents with zero telemetry as
                                               # stale (default = only agents that HAVE reported, but idle)
 
+    [Parameter(ParameterSetName = 'Risky', Mandatory)]
+    [switch]$Risky,                           # act on agents with Defender AI-security alerts
+
+    [Parameter(ParameterSetName = 'Risky')]
+    [ValidateRange(1, 3650)]
+    [int]$RiskDays = 30,                       # alert lookback window (Advanced Hunting retains ~30 days)
+
+    [Parameter(ParameterSetName = 'Risky')]
+    [ValidateRange(1, 10000)]
+    [int]$MinAlerts = 1,                       # minimum alert count for an agent to count as risky
+
     [Parameter(ParameterSetName = 'Select')]
     [Parameter(ParameterSetName = 'Stale')]
+    [Parameter(ParameterSetName = 'Risky')]
     [ValidateSet('block', 'unblock', 'list')]
     [string]$Action = 'block',                # what to do with the matched set ('list' = preview only)
 
     [Parameter(ParameterSetName = 'List')]
     [Parameter(ParameterSetName = 'Select')]
     [Parameter(ParameterSetName = 'Stale')]
+    [Parameter(ParameterSetName = 'Risky')]
     [switch]$AgentsOnly,                       # filter supportedHosts eq 'Copilot'
 
     [Parameter(ParameterSetName = 'Stale')]
+    [Parameter(ParameterSetName = 'Risky')]
     [switch]$Force,                           # skip the "proceed?" confirmation
 
     [Parameter(ParameterSetName = 'Stale')]
-    [switch]$Pick,                            # choose WHICH stale agents to act on via the picker
+    [Parameter(ParameterSetName = 'Risky')]
+    [switch]$Pick,                            # choose WHICH stale/risky agents to act on via the picker
 
     [string]$TenantId,                        # optional: target a specific tenant (default = home tenant)
 
@@ -129,9 +152,10 @@ Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -eq 'List') -or
-            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale') -and $Action -eq 'list')
+            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
-if ($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') { $scopes += 'ThreatHunting.Read.All' }
+if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
+    $PSCmdlet.ParameterSetName -eq 'Risky') { $scopes += 'ThreatHunting.Read.All' }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -316,6 +340,74 @@ function Show-StalePreview {
         Format-Table -AutoSize | Out-Host
 }
 
+# Query Defender Advanced Hunting for agents with AI-security alerts; return Key -> risk info.
+function Get-RiskyIndex {
+    param([int]$Days)
+    $kql = if ($HuntingQuery) { $HuntingQuery } else { @"
+let win = ${Days}d;
+let inv = AgentsInfo
+    | extend r = todynamic(RawAgentInfo)
+    | project joinKey = tolower(AgentId), TitleId = tostring(r.titleId), AppId = tostring(r.appId);
+AlertInfo
+| where Timestamp > ago(win) and (DetectionSource == "Microsoft Security for AI" or ServiceSource == "Microsoft Security for AI")
+| join kind=inner (AlertEvidence) on AlertId
+| extend af = todynamic(AdditionalFields)
+| extend joinKey = tolower(tostring(coalesce(af.AgentId, af.agentId, EntityId, AccountObjectId)))
+| where isnotempty(joinKey)
+| join kind=leftouter (inv) on joinKey
+| extend Key = tolower(coalesce(TitleId, AppId, joinKey))
+| extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
+| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp) by Key
+| extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
+"@ }
+    try {
+        $resp = Invoke-MgGraphRequest -Method POST `
+            -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' `
+            -Body (@{ Query = $kql } | ConvertTo-Json) -ContentType 'application/json'
+    } catch {
+        throw ("Advanced Hunting query failed ({0}). Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded." -f $_.Exception.Message)
+    }
+    $idx = @{}
+    foreach ($row in $resp.results) {
+        $k = [string]$row.Key
+        if ([string]::IsNullOrWhiteSpace($k)) { continue }
+        $idx[$k] = [pscustomobject]@{
+            AlertCount = [int]$row.AlertCount
+            Severity   = [string]$row.Severity
+            LastAlert  = if ($row.LastAlert) { [datetimeoffset]$row.LastAlert } else { $null }
+        }
+    }
+    $idx
+}
+
+# Return agent packages with >= MinAlerts AI-security alerts, annotated with risk info.
+function Get-RiskyPackages {
+    param([int]$Days, [int]$MinAlerts, [switch]$AgentsOnly)
+    $idx = Get-RiskyIndex -Days $Days
+    $out = foreach ($p in (Get-Packages -AgentsOnly:$AgentsOnly)) {
+        $keys = @($p.appId, $p.id, $p.displayName) | Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() }
+        $hit = $null
+        foreach ($k in $keys) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
+        if ($hit -and $hit.AlertCount -ge $MinAlerts) {
+            $p | Add-Member -NotePropertyName RiskAlerts    -NotePropertyValue $hit.AlertCount -Force
+            $p | Add-Member -NotePropertyName RiskSeverity  -NotePropertyValue $hit.Severity   -Force
+            $p | Add-Member -NotePropertyName RiskLastAlert -NotePropertyValue $hit.LastAlert  -Force -PassThru
+        }
+    }
+    @($out | Sort-Object -Property @{ e = { $_.RiskAlerts } } -Descending)
+}
+
+# Preview table for a risky set.
+function Show-RiskyPreview {
+    param([object[]]$Packages)
+    $Packages | Select-Object displayName, id,
+        @{ n = 'alerts';    e = { $_.RiskAlerts } },
+        @{ n = 'severity';  e = { $_.RiskSeverity } },
+        @{ n = 'lastAlert'; e = { if ($_.RiskLastAlert) { $_.RiskLastAlert.ToString('yyyy-MM-dd') } else { '-' } } },
+        isBlocked |
+        Format-Table -AutoSize | Out-Host
+}
+
 # Apply block/unblock to each package; keep going on error, then summarize.
 function Invoke-PackageAction {
     param([object[]]$Packages, [ValidateSet('block', 'unblock')][string]$Action)
@@ -377,6 +469,29 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($matched.Count -eq 0) { Write-Host 'Nothing selected.'; break }
         }
 
+        if (-not $Force -and -not $Pick) {
+            $ans = Read-Host ("Proceed to {0} these {1} agent(s)? [y/N]" -f $Action, $matched.Count)
+            if ($ans -notmatch '^(y|yes)$') { Write-Host 'Cancelled.'; break }
+        }
+        Invoke-PackageAction -Packages $matched -Action $Action
+    }
+    'Risky'   {
+        $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -AgentsOnly:$AgentsOnly)
+        if     ($Action -eq 'block')   { $matched = @($matched | Where-Object { -not $_.isBlocked }) }
+        elseif ($Action -eq 'unblock') { $matched = @($matched | Where-Object { $_.isBlocked }) }
+
+        Write-Host ("`nAgents with >= {0} AI-security alert(s) in {1} days: {2} match(es){3}." -f
+            $MinAlerts, $RiskDays, $matched.Count,
+            $(if ($Action -ne 'list') { " needing $Action" } else { '' })) -ForegroundColor Cyan
+        if ($matched.Count -eq 0) { break }
+        Show-RiskyPreview -Packages $matched
+
+        if ($Action -eq 'list') { break }
+
+        if ($Pick) {
+            $matched = @(Invoke-Picker -Packages $matched -Title "Risky agents to $Action - select which (Ctrl/Shift), then OK")
+            if ($matched.Count -eq 0) { Write-Host 'Nothing selected.'; break }
+        }
         if (-not $Force -and -not $Pick) {
             $ans = Read-Host ("Proceed to {0} these {1} agent(s)? [y/N]" -f $Action, $matched.Count)
             if ($ans -notmatch '^(y|yes)$') { Write-Host 'Cancelled.'; break }

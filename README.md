@@ -104,9 +104,21 @@ By default, activity mode only treats agents that **have** reported telemetry bu
 # Stale by manifest age instead of telemetry (no Defender needed)
 .\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -By modified -AgentsOnly
 
+# List RISKY agents (those with Defender AI-security alerts), then block them
+.\Agent365-Bulk-Actions.ps1 -Risky -Action list                 # dry run: shows alert count + severity
+.\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -AgentsOnly
+.\Agent365-Bulk-Actions.ps1 -Risky -Pick                        # pick which risky agents to block
+
 # Undo
 .\Agent365-Bulk-Actions.ps1 -Unblock "Contoso HR Agent","Northwind Sales Agent"
 ```
+
+### Risky agents
+
+`-Risky` finds agents that have **Microsoft Defender "Security for AI" alerts** (jailbreak, prompt injection, credential/secret access, etc.) via Advanced Hunting (`runHuntingQuery`), enriches each with `alerts` / `severity` / `lastAlert`, and lets you block them with the same preview → confirm/pick flow. Needs `ThreatHunting.Read.All` plus a Defender/E5 license with **Security for AI** onboarded (same prerequisite as `-Stale -By activity`).
+
+> [!NOTE]
+> The correlation from an alert to a catalog package is best-effort (it bridges `AlertEvidence → AgentsInfo.titleId/appId → package`). **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return columns `Key, AlertCount, Severity, LastAlert`). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
 
 ## Parameter reference
 
@@ -121,7 +133,10 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, or `Stale`) is used
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |
-| `-HuntingQuery` | KQL (optional) | Custom KQL returning columns `Key`, `LastActivity`; overrides the built‑in query. |
+| `-Risky` | switch | Act on agents with Defender AI‑security alerts (Advanced Hunting). |
+| `-RiskDays` | 1–3650 (default 30) | Alert lookback window (Advanced Hunting retains ~30 days). |
+| `-MinAlerts` | int (default 1) | Minimum alert count for an agent to count as risky. |
+| `-HuntingQuery` | KQL (optional) | Custom KQL. Stale: returns `Key,LastActivity`. Risky: returns `Key,AlertCount,Severity,LastAlert`. |
 | `-IncludeNeverSeen` | switch | Activity mode: also treat agents with zero telemetry as stale. |
 | `-Action` | `block` / `unblock` / `list` | What to do with the matched set. `list` = preview only (dry run). |
 | `-AgentsOnly` | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
