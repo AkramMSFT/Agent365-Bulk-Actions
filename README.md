@@ -105,8 +105,9 @@ By default, activity mode only treats agents that **have** reported telemetry bu
 .\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -By modified -AgentsOnly
 
 # List RISKY agents (those with Defender AI-security alerts), then block them
-.\Agent365-Bulk-Actions.ps1 -Risky -Action list                 # dry run: shows alert count + severity
-.\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -AgentsOnly
+.\Agent365-Bulk-Actions.ps1 -Risky -Action list                 # dry run: severity, alert count, and WHY
+.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Action list   # only High-severity agents
+.\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -MinSeverity Medium -AgentsOnly
 .\Agent365-Bulk-Actions.ps1 -Risky -Pick                        # pick which risky agents to block
 
 # Undo
@@ -115,7 +116,7 @@ By default, activity mode only treats agents that **have** reported telemetry bu
 
 ### Risky agents
 
-`-Risky` finds agents that have **Microsoft Defender "Security for AI" alerts** (jailbreak, prompt injection, credential/secret access, etc.) via Advanced Hunting (`runHuntingQuery`), enriches each with `alerts` / `severity` / `lastAlert`, and lets you block them with the same preview → confirm/pick flow. Needs `ThreatHunting.Read.All` plus a Defender/E5 license with **Security for AI** onboarded (same prerequisite as `-Stale -By activity`).
+`-Risky` finds agents that have **Microsoft Defender "Security for AI" alerts** (jailbreak, prompt injection, credential/secret access, etc.) via Advanced Hunting (`runHuntingQuery`), and enriches each with **`severity` (Informational/Low/Medium/High)**, **`alerts`** (count), **`why`** (the alert titles), **`categories`**, and `lastAlert` — so you can decide by severity what to block. Use `-MinSeverity High` (or Medium/Low) to act only on the worst, and `-MinAlerts` for a count threshold; results are sorted worst-severity-first. Then block with the same preview → confirm/pick flow. Needs `ThreatHunting.Read.All` plus a Defender/E5 license with **Security for AI** onboarded (same prerequisite as `-Stale -By activity`).
 
 > [!NOTE]
 > The correlation from an alert to a catalog package is best-effort (it bridges `AlertEvidence → AgentsInfo.titleId/appId → package`). **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return columns `Key, AlertCount, Severity, LastAlert`). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
@@ -136,6 +137,7 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, or `Stale`) is used
 | `-Risky` | switch | Act on agents with Defender AI‑security alerts (Advanced Hunting). |
 | `-RiskDays` | 1–3650 (default 30) | Alert lookback window (Advanced Hunting retains ~30 days). |
 | `-MinAlerts` | int (default 1) | Minimum alert count for an agent to count as risky. |
+| `-MinSeverity` | Informational/Low/Medium/High | Only act on agents at/above this alert severity. |
 | `-HuntingQuery` | KQL (optional) | Custom KQL. Stale: returns `Key,LastActivity`. Risky: returns `Key,AlertCount,Severity,LastAlert`. |
 | `-IncludeNeverSeen` | switch | Activity mode: also treat agents with zero telemetry as stale. |
 | `-Action` | `block` / `unblock` / `list` | What to do with the matched set. `list` = preview only (dry run). |

@@ -114,6 +114,10 @@ param(
     [ValidateRange(1, 10000)]
     [int]$MinAlerts = 1,                       # minimum alert count for an agent to count as risky
 
+    [Parameter(ParameterSetName = 'Risky')]
+    [ValidateSet('Informational', 'Low', 'Medium', 'High')]
+    [string]$MinSeverity = 'Informational',    # only act on agents at/above this alert severity
+
     [Parameter(ParameterSetName = 'Select')]
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
@@ -357,7 +361,8 @@ AlertInfo
 | join kind=leftouter (inv) on joinKey
 | extend Key = tolower(coalesce(TitleId, AppId, joinKey))
 | extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
-| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp) by Key
+| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp),
+            Reasons = make_set(Title, 8), Categories = make_set(Category, 6) by Key
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 "@ }
     try {
@@ -367,6 +372,12 @@ AlertInfo
     } catch {
         throw ("Advanced Hunting query failed ({0}). Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded." -f $_.Exception.Message)
     }
+    # make_set columns come back as arrays (or a JSON string) — normalize to a "; "-joined string.
+    $joinSet = {
+        param($v)
+        if ($v -is [string]) { try { $v = $v | ConvertFrom-Json } catch {} }
+        (@($v) | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join '; '
+    }
     $idx = @{}
     foreach ($row in $resp.results) {
         $k = [string]$row.Key
@@ -375,37 +386,51 @@ AlertInfo
             AlertCount = [int]$row.AlertCount
             Severity   = [string]$row.Severity
             LastAlert  = if ($row.LastAlert) { [datetimeoffset]$row.LastAlert } else { $null }
+            Reasons    = (& $joinSet $row.Reasons)
+            Categories = (& $joinSet $row.Categories)
         }
     }
     $idx
 }
 
-# Return agent packages with >= MinAlerts AI-security alerts, annotated with risk info.
+# Rank a severity string so we can filter/sort (higher = worse).
+function Get-SevRank { param([string]$S)
+    switch ($S) { 'High' { 4 } 'Medium' { 3 } 'Low' { 2 } 'Informational' { 1 } default { 0 } } }
+
+# Return agent packages with >= MinAlerts alerts at/above MinSeverity, annotated with risk info.
 function Get-RiskyPackages {
-    param([int]$Days, [int]$MinAlerts, [switch]$AgentsOnly)
+    param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly)
     $idx = Get-RiskyIndex -Days $Days
+    $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Get-Packages -AgentsOnly:$AgentsOnly)) {
         $keys = @($p.appId, $p.id, $p.displayName) | Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() }
         $hit = $null
         foreach ($k in $keys) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
-        if ($hit -and $hit.AlertCount -ge $MinAlerts) {
-            $p | Add-Member -NotePropertyName RiskAlerts    -NotePropertyValue $hit.AlertCount -Force
-            $p | Add-Member -NotePropertyName RiskSeverity  -NotePropertyValue $hit.Severity   -Force
-            $p | Add-Member -NotePropertyName RiskLastAlert -NotePropertyValue $hit.LastAlert  -Force -PassThru
+        if ($hit -and $hit.AlertCount -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
+            $p | Add-Member -NotePropertyName RiskAlerts     -NotePropertyValue $hit.AlertCount -Force
+            $p | Add-Member -NotePropertyName RiskSeverity   -NotePropertyValue $hit.Severity   -Force
+            $p | Add-Member -NotePropertyName RiskReasons    -NotePropertyValue $hit.Reasons    -Force
+            $p | Add-Member -NotePropertyName RiskCategories -NotePropertyValue $hit.Categories -Force
+            $p | Add-Member -NotePropertyName RiskLastAlert  -NotePropertyValue $hit.LastAlert  -Force -PassThru
         }
     }
-    @($out | Sort-Object -Property @{ e = { $_.RiskAlerts } } -Descending)
+    # worst first: by severity, then alert count
+    @($out | Sort-Object -Property @{ e = { Get-SevRank $_.RiskSeverity } ; Descending = $true },
+                                   @{ e = { $_.RiskAlerts } ; Descending = $true })
 }
 
-# Preview table for a risky set.
+# Preview table for a risky set (severity, alert count, and WHY / reasons).
 function Show-RiskyPreview {
     param([object[]]$Packages)
-    $Packages | Select-Object displayName, id,
-        @{ n = 'alerts';    e = { $_.RiskAlerts } },
+    $Packages | Select-Object `
         @{ n = 'severity';  e = { $_.RiskSeverity } },
+        @{ n = 'alerts';    e = { $_.RiskAlerts } },
+        displayName,
+        @{ n = 'why (alert titles)'; e = { $_.RiskReasons } },
+        @{ n = 'categories'; e = { $_.RiskCategories } },
         @{ n = 'lastAlert'; e = { if ($_.RiskLastAlert) { $_.RiskLastAlert.ToString('yyyy-MM-dd') } else { '-' } } },
-        isBlocked |
-        Format-Table -AutoSize | Out-Host
+        isBlocked, id |
+        Format-Table -AutoSize -Wrap | Out-Host
 }
 
 # Apply block/unblock to each package; keep going on error, then summarize.
@@ -476,12 +501,12 @@ switch ($PSCmdlet.ParameterSetName) {
         Invoke-PackageAction -Packages $matched -Action $Action
     }
     'Risky'   {
-        $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -AgentsOnly:$AgentsOnly)
+        $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -MinSeverity $MinSeverity -AgentsOnly:$AgentsOnly)
         if     ($Action -eq 'block')   { $matched = @($matched | Where-Object { -not $_.isBlocked }) }
         elseif ($Action -eq 'unblock') { $matched = @($matched | Where-Object { $_.isBlocked }) }
 
-        Write-Host ("`nAgents with >= {0} AI-security alert(s) in {1} days: {2} match(es){3}." -f
-            $MinAlerts, $RiskDays, $matched.Count,
+        Write-Host ("`nAgents with >= {0} AI-security alert(s) at/above {1} severity in {2} days: {3} match(es){4}." -f
+            $MinAlerts, $MinSeverity, $RiskDays, $matched.Count,
             $(if ($Action -ne 'list') { " needing $Action" } else { '' })) -ForegroundColor Cyan
         if ($matched.Count -eq 0) { break }
         Show-RiskyPreview -Packages $matched
