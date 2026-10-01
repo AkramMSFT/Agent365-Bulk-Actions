@@ -185,6 +185,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Dot-sourcing (. .\Agent365-Bulk-Actions.ps1) loads the functions only: no sign-in, no action. Used by the tests.
+$script:LoadOnly = ($MyInvocation.InvocationName -eq '.')
 if ($PSCmdlet.ParameterSetName -eq 'Ownerless' -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
 if ($Action -eq 'reassign' -and $PSCmdlet.ParameterSetName -ne 'Ownerless') { throw '-Action reassign is only valid with -Ownerless. Use -Reassign <agents> -To <user> for manual assignment.' }
 $Base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
@@ -198,11 +200,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity' -and $StaleDa
 }
 
 # --- ensure the Graph auth module (no full SDK needed) ---
-if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
+if (-not $script:LoadOnly -and -not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
     Write-Host 'Installing Microsoft.Graph.Authentication (CurrentUser)...' -ForegroundColor Yellow
     Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
 }
-Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
@@ -217,7 +219,7 @@ if ($PSCmdlet.ParameterSetName -eq 'DeleteCandidates') { $scopes += 'ThreatHunti
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
-Connect-MgGraph @connect
+if (-not $script:LoadOnly) { Connect-MgGraph @connect }
 
 # Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
 function Invoke-Graph {
@@ -476,7 +478,7 @@ function Get-StalePackages {
     if ($By -eq 'modified') {
         $out = foreach ($p in $pkgs) {
             $since = $null
-            if ($p.lastModifiedDateTime) { try { $since = [datetimeoffset]$p.lastModifiedDateTime } catch {} }
+            if ($p.lastModifiedDateTime) { try { $since = [datetimeoffset]$p.lastModifiedDateTime } catch { $null = $_ } }
             if ($null -ne $since -and $since -lt $cutoff) {
                 $p | Add-Member -NotePropertyName StaleSince -NotePropertyValue $since -Force -PassThru
             }
@@ -694,7 +696,11 @@ function Show-RiskyPreview {
 }
 
 # Single seam over ShouldProcess so -WhatIf applies to every write.
-function Test-Proceed { param([string]$Target, [string]$Verb) $PSCmdlet.ShouldProcess($Target, $Verb) }
+function Test-Proceed {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '', Justification = 'Delegates to the script-level ShouldProcess so -WhatIf covers every write.')]
+    param([string]$Target, [string]$Verb)
+    $PSCmdlet.ShouldProcess($Target, $Verb)
+}
 
 # Ask once before a batch write. -Force and -WhatIf skip the prompt; a picker selection counts as consent.
 function Confirm-Batch {
@@ -792,8 +798,9 @@ function Show-ImpactPreview {
 # Blocked agents that have stayed blocked at least MinDaysBlocked. The block date comes from this
 # tool's own logs and, for the last ~30 days, from the BlockedAgent/UnblockedAgent audit events.
 function Get-DeleteCandidates {
-    param([int]$MinDays, [string[]]$HistoryPaths, [switch]$IncludeUnknown)
-    $logDir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+    param([int]$MinDays, [string[]]$HistoryPaths, [switch]$IncludeUnknown,
+          [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'))
+    $logDir = $LogDir
     $files = @()
     foreach ($p in @($logDir) + @($HistoryPaths)) {
         if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
@@ -1647,6 +1654,8 @@ function Show-Console {
     $script:ctx.Window.Add_ContentRendered({ if (-not $script:ctx.Loaded) { $script:ctx.Loaded = $true; & $script:ctx.Load } })
     [void]$script:ctx.Window.ShowDialog()
 }
+
+if ($script:LoadOnly) { return }
 
 switch ($PSCmdlet.ParameterSetName) {
     'Gui' { Show-Console }
