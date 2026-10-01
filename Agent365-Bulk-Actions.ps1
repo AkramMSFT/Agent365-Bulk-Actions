@@ -146,6 +146,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $Base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
 
+# Advanced Hunting keeps ~30 days, so an agent last seen before the cutoff can only be found when
+# the cutoff is inside that window. At 30+ days only "no activity at all in the window" is provable.
+if ($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity' -and $StaleDays -ge 30 -and
+    -not $IncludeNeverSeen -and -not $HuntingQuery) {
+    throw (("-StaleDays {0} with -By activity cannot find agents that reported before: telemetry is retained ~30 days. " -f $StaleDays) +
+           'Use a value below 30, add -IncludeNeverSeen to flag agents with no activity in the last 30 days, or use -By modified.')
+}
+
 # --- ensure the Graph auth module (no full SDK needed) ---
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
     Write-Host 'Installing Microsoft.Graph.Authentication (CurrentUser)...' -ForegroundColor Yellow
@@ -200,41 +208,66 @@ function Resolve-Packages {
     $resolved
 }
 
-# Build a lookup of  agentKey (lowercased AgentId or AgentName)  ->  last telemetry timestamp,
-# from Defender Advanced Hunting over the retained window (Defender keeps ~30 days).
-function Get-ActivityIndex {
-    param([int]$Days)
-    $win = [Math]::Min($Days, 30)
-    if ($Days -gt 30) {
-        Write-Warning ("Advanced Hunting retains ~30 days: querying {0}d, so 'no activity' can only be proven for 30 days (StaleDays={1})." -f $win, $Days)
-    }
-    $kql = if ($HuntingQuery) { $HuntingQuery } else { @"
-let win = ${win}d;
-let ev = CloudAppEvents | where Timestamp > ago(win) | extend d = todynamic(RawEventData);
-ev
-| extend Key = tolower(tostring(coalesce(d.AgentId, d.agentId)))
-| where isnotempty(Key)
-| summarize LastActivity = max(Timestamp) by Key
-| union (
-    ev
-    | extend Key = tolower(tostring(coalesce(d.AgentName, d.agentName)))
-    | where isnotempty(Key)
-    | summarize LastActivity = max(Timestamp) by Key )
-| summarize LastActivity = max(LastActivity) by Key
-"@ }
+# Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
+# observability id, platform source id, bot id) to its catalog id. Package ids equal AgentsInfo titleId.
+$InventoryKql = @'
+let inv = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | project CatalogId = tolower(tostring(r.titleId)),
+              Keys = pack_array(tolower(tostring(AgentId)), tolower(tostring(EntraAgentID)),
+                                tolower(tostring(ObservabilityID)), tolower(tostring(SourceAgentId)),
+                                tolower(tostring(r.botId)))
+    | mv-expand Key = Keys to typeof(string)
+    | where isnotempty(Key) and isnotempty(CatalogId)
+    | distinct CatalogId, Key;
 
+'@
+
+# Identifiers a catalog package can be matched on. Display names are excluded: they are not unique.
+function Get-PackageKeys {
+    param([object]$Package)
+    @($Package.id, $Package.appId, $Package.manifestId, $Package.agentIdentityId) |
+        Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() } | Select-Object -Unique
+}
+
+function Invoke-HuntingQuery {
+    param([string]$Query, [string]$Hint)
     try {
         $resp = Invoke-MgGraphRequest -Method POST `
             -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' `
-            -Body (@{ Query = $kql } | ConvertTo-Json) -ContentType 'application/json'
+            -Body (@{ Query = $Query } | ConvertTo-Json) -ContentType 'application/json'
     } catch {
-        throw ("Advanced Hunting query failed ({0}). Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded. Use -By modified to fall back to manifest age." -f $_.Exception.Message)
+        throw ("Advanced Hunting query failed ({0}). {1}" -f $_.Exception.Message, $Hint)
     }
+    @($resp.results)
+}
 
+# Build a lookup of  catalog id (lowercased)  ->  last telemetry timestamp, from Defender
+# Advanced Hunting over the retained window (Defender keeps ~30 days).
+function Get-ActivityIndex {
+    param()
+    $win = 30   # full retention: the index must reach back past the stale cutoff
+    $kql = if ($HuntingQuery) { $HuntingQuery } else { $InventoryKql + @"
+CloudAppEvents
+| where Timestamp > ago(${win}d)
+| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction")
+| extend d = todynamic(RawEventData)
+| extend Keys = pack_array(tolower(tostring(coalesce(d.AgentId, d.agentId))),
+                           tolower(tostring(d.TargetAgentId)), tolower(tostring(d.PlatformTargetAgentId)))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| summarize LastActivity = max(Timestamp) by Key
+| join kind=leftouter inv on Key
+| summarize LastActivity = max(LastActivity) by Key = coalesce(CatalogId, Key)
+"@ }
+
+    $rows = Invoke-HuntingQuery -Query $kql -Hint "Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded. Use -By modified to fall back to manifest age."
     $idx = @{}
-    foreach ($row in $resp.results) {
+    foreach ($row in $rows) {
         $k = [string]$row.Key
         if ([string]::IsNullOrWhiteSpace($k)) { continue }
+        $k = $k.ToLower()
         $ts = [datetimeoffset]$row.LastActivity
         if (-not $idx.ContainsKey($k) -or $ts -gt $idx[$k]) { $idx[$k] = $ts }
     }
@@ -261,12 +294,10 @@ function Get-StalePackages {
     }
 
     # activity
-    $idx = Get-ActivityIndex -Days $Days
+    $idx = Get-ActivityIndex
     $out = foreach ($p in $pkgs) {
-        $keys = @($p.appId, $p.id, $p.displayName) |
-                Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() }
         $last = $null
-        foreach ($k in $keys) {
+        foreach ($k in (Get-PackageKeys $p)) {
             if ($idx.ContainsKey($k) -and ($null -eq $last -or $idx[$k] -gt $last)) { $last = $idx[$k] }
         }
         # Default: stale only if the agent HAS reported telemetry but its last event predates the
@@ -347,42 +378,38 @@ function Show-StalePreview {
 # Query Defender Advanced Hunting for agents with AI-security alerts; return Key -> risk info.
 function Get-RiskyIndex {
     param([int]$Days)
-    $kql = if ($HuntingQuery) { $HuntingQuery } else { @"
+    $kql = if ($HuntingQuery) { $HuntingQuery } else { $InventoryKql + @"
 let win = ${Days}d;
-let inv = AgentsInfo
-    | extend r = todynamic(RawAgentInfo)
-    | project joinKey = tolower(AgentId), TitleId = tostring(r.titleId), AppId = tostring(r.appId);
 AlertInfo
-| where Timestamp > ago(win) and (DetectionSource == "Microsoft Security for AI" or ServiceSource == "Microsoft Security for AI")
-| join kind=inner (AlertEvidence) on AlertId
-| extend af = todynamic(AdditionalFields)
-| extend joinKey = tolower(tostring(coalesce(af.AgentId, af.agentId, EntityId, AccountObjectId)))
-| where isnotempty(joinKey)
-| join kind=leftouter (inv) on joinKey
-| extend Key = tolower(coalesce(TitleId, AppId, joinKey))
+| where Timestamp > ago(win)
+| where DetectionSource in ("Security for AI", "Microsoft Security for AI")
+     or ServiceSource in ("Security for AI", "Microsoft Security for AI")
+| join kind=inner (
+    AlertEvidence
+    | where EntityType == "AIAgent"
+    | extend af = todynamic(AdditionalFields)
+    | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+    | where isnotempty(AgentKey)
+    | distinct AlertId, AgentKey ) on AlertId
+| join kind=leftouter inv on `$left.AgentKey == `$right.Key
+| extend Key = coalesce(CatalogId, AgentKey)
 | extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
 | summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp),
             Reasons = make_set(Title, 8), Categories = make_set(Category, 6) by Key
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 "@ }
-    try {
-        $resp = Invoke-MgGraphRequest -Method POST `
-            -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' `
-            -Body (@{ Query = $kql } | ConvertTo-Json) -ContentType 'application/json'
-    } catch {
-        throw ("Advanced Hunting query failed ({0}). Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded." -f $_.Exception.Message)
-    }
-    # make_set columns come back as arrays (or a JSON string) — normalize to a "; "-joined string.
+    $rows = Invoke-HuntingQuery -Query $kql -Hint "Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded."
+    # make_set columns come back as arrays (or a JSON string); normalize to a "; "-joined string.
     $joinSet = {
         param($v)
         if ($v -is [string]) { try { $v = $v | ConvertFrom-Json } catch {} }
         (@($v) | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join '; '
     }
     $idx = @{}
-    foreach ($row in $resp.results) {
+    foreach ($row in $rows) {
         $k = [string]$row.Key
         if ([string]::IsNullOrWhiteSpace($k)) { continue }
-        $idx[$k] = [pscustomobject]@{
+        $idx[$k.ToLower()] = [pscustomobject]@{
             AlertCount = [int]$row.AlertCount
             Severity   = [string]$row.Severity
             LastAlert  = if ($row.LastAlert) { [datetimeoffset]$row.LastAlert } else { $null }
@@ -403,9 +430,8 @@ function Get-RiskyPackages {
     $idx = Get-RiskyIndex -Days $Days
     $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Get-Packages -AgentsOnly:$AgentsOnly)) {
-        $keys = @($p.appId, $p.id, $p.displayName) | Where-Object { $_ } | ForEach-Object { $_.ToString().ToLower() }
         $hit = $null
-        foreach ($k in $keys) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
+        foreach ($k in (Get-PackageKeys $p)) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
         if ($hit -and $hit.AlertCount -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
             $p | Add-Member -NotePropertyName RiskAlerts     -NotePropertyValue $hit.AlertCount -Force
             $p | Add-Member -NotePropertyName RiskSeverity   -NotePropertyValue $hit.Severity   -Force

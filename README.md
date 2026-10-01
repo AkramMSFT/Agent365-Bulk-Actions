@@ -73,7 +73,9 @@ Two ways to measure staleness, chosen with `-By`:
 By default, activity mode only treats agents that **have** reported telemetry but gone idle as stale — built‑ins/add‑ins that never emit telemetry are skipped. Add `-IncludeNeverSeen` to also flag agents with zero telemetry.
 
 > [!IMPORTANT]
-> Advanced Hunting keeps only about **30 days** of data, so `-By activity` can prove inactivity for at most 30 days. If you set `-StaleDays` greater than 30, "stale" effectively means "no activity in the last 30 days," and the script warns you.
+> Advanced Hunting keeps only about **30 days** of data, so `-By activity` can only detect agents that reported within the last 30 days and then went quiet. Use `-StaleDays` below 30 for that. With `-StaleDays` of 30 or more, the script stops with an explanation unless you add `-IncludeNeverSeen`, in which case "stale" means "no activity in the last 30 days". Use `-By modified` for longer horizons.
+
+Telemetry is matched to catalog packages through `AgentsInfo`: a package `id` equals the agent's `titleId`, and the registry id, Entra agent id, observability id, source id and bot id seen in events all resolve to that `titleId`. Display names are never used for matching.
 
 ## Scenarios
 
@@ -119,11 +121,11 @@ By default, activity mode only treats agents that **have** reported telemetry bu
 `-Risky` finds agents that have **Microsoft Defender "Security for AI" alerts** (jailbreak, prompt injection, credential/secret access, etc.) via Advanced Hunting (`runHuntingQuery`), and enriches each with **`severity` (Informational/Low/Medium/High)**, **`alerts`** (count), **`why`** (the alert titles), **`categories`**, and `lastAlert` — so you can decide by severity what to block. Use `-MinSeverity High` (or Medium/Low) to act only on the worst, and `-MinAlerts` for a count threshold; results are sorted worst-severity-first. Then block with the same preview → confirm/pick flow. Needs `ThreatHunting.Read.All` plus a Defender/E5 license with **Security for AI** onboarded (same prerequisite as `-Stale -By activity`).
 
 > [!NOTE]
-> The correlation from an alert to a catalog package is best-effort (it bridges `AlertEvidence → AgentsInfo.titleId/appId → package`). **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return columns `Key, AlertCount, Severity, LastAlert`). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
+> Alerts are attributed to a package through the `AIAgent` entity in `AlertEvidence`, whose agent id is the package `id`. Only "Security for AI" alerts that carry an agent entity are counted. "Defender for AI Services" alerts name an Azure AI account rather than an agent and are not attributed. **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return columns `Key, AlertCount, Severity, LastAlert`, with `Key` set to the package id). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
 
 ## Parameter reference
 
-Only one primary mode (`List`, `Block`, `Unblock`, `Select`, or `Stale`) is used per run.
+Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`) is used per run.
 
 | Parameter | Values / default | What it does |
 | --- | --- | --- |
@@ -167,25 +169,59 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, or `Stale`) is used
 | Sign‑in / WAM prompt misbehaves | Re‑run with `-DeviceCode`. |
 | `-StaleDays > 30` seems to under‑report | Expected: Advanced Hunting retains ~30 days, so activity can only prove 30 days of inactivity. |
 
-## Appendix — the built‑in hunting query
+## Appendix: the built-in hunting queries
 
-When `-By activity` is used, the script runs this KQL against Defender Advanced Hunting to build each agent's last‑activity timestamp. Override it with `-HuntingQuery`, as long as your query returns the columns `Key` and `LastActivity`.
+Both queries start with the same inventory block, which maps every identifier an agent appears under to its catalog id. Override either query with `-HuntingQuery`. A stale override must return `Key` (catalog id, lowercase) and `LastActivity`.
 
 ```kql
-let win = 30d;
-let ev = CloudAppEvents
-    | where Timestamp > ago(win)
-    | extend d = todynamic(RawEventData);
-ev
-| extend Key = tolower(tostring(coalesce(d.AgentId, d.agentId)))
+let inv = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | project CatalogId = tolower(tostring(r.titleId)),
+              Keys = pack_array(tolower(tostring(AgentId)), tolower(tostring(EntraAgentID)),
+                                tolower(tostring(ObservabilityID)), tolower(tostring(SourceAgentId)),
+                                tolower(tostring(r.botId)))
+    | mv-expand Key = Keys to typeof(string)
+    | where isnotempty(Key) and isnotempty(CatalogId)
+    | distinct CatalogId, Key;
+```
+
+Activity (`-By activity`), always over the full 30 days:
+
+```kql
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction")
+| extend d = todynamic(RawEventData)
+| extend Keys = pack_array(tolower(tostring(coalesce(d.AgentId, d.agentId))),
+                           tolower(tostring(d.TargetAgentId)), tolower(tostring(d.PlatformTargetAgentId)))
+| mv-expand Key = Keys to typeof(string)
 | where isnotempty(Key)
 | summarize LastActivity = max(Timestamp) by Key
-| union (
-    ev
-    | extend Key = tolower(tostring(coalesce(d.AgentName, d.agentName)))
-    | where isnotempty(Key)
-    | summarize LastActivity = max(Timestamp) by Key )
-| summarize LastActivity = max(LastActivity) by Key
+| join kind=leftouter inv on Key
+| summarize LastActivity = max(LastActivity) by Key = coalesce(CatalogId, Key)
+```
+
+Risky (`-Risky`), after the same inventory block:
+
+```kql
+AlertInfo
+| where Timestamp > ago(30d)
+| where DetectionSource in ("Security for AI", "Microsoft Security for AI")
+     or ServiceSource in ("Security for AI", "Microsoft Security for AI")
+| join kind=inner (
+    AlertEvidence
+    | where EntityType == "AIAgent"
+    | extend af = todynamic(AdditionalFields)
+    | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+    | where isnotempty(AgentKey)
+    | distinct AlertId, AgentKey ) on AlertId
+| join kind=leftouter inv on $left.AgentKey == $right.Key
+| extend Key = coalesce(CatalogId, AgentKey)
+| extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
+| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp),
+            Reasons = make_set(Title, 8), Categories = make_set(Category, 6) by Key
+| extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 ```
 
 ## Disclaimer
