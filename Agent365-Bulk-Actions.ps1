@@ -703,30 +703,37 @@ $GuiXaml = @'
               <RadioButton x:Name="FltBlocked" Content="Blocked" GroupName="f" Style="{StaticResource Seg}"/>
             </StackPanel>
           </Border>
-          <Button x:Name="BtnClear" Grid.Column="2" Content="Back to all agents" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" Visibility="Collapsed"/>
-          <CheckBox x:Name="AgentsOnlyBox" Grid.Column="3" Content="Copilot agents only" IsChecked="True" VerticalAlignment="Center"/>
+          <Button x:Name="BtnReset" Grid.Column="2" Content="Reset filters" Style="{StaticResource Btn}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" IsEnabled="False"/>
+          <CheckBox x:Name="AgentsOnlyBox" Grid.Column="3" Content="Copilot agents only" VerticalAlignment="Center"/>
         </Grid>
         <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
-          <Grid>
-          <WrapPanel Grid.Column="0" VerticalAlignment="Center">
-            <TextBlock Text="FIND" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
-            <TextBlock Text="Stale by" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="StaleBasis" Width="150" SelectedIndex="0">
-              <ComboBoxItem Content="Activity (idle)"/><ComboBoxItem Content="Manifest age"/>
+          <WrapPanel VerticalAlignment="Center">
+            <TextBlock Text="FILTER BY" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
+            <TextBlock Text="Stale" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="StaleBox" Width="230" SelectedIndex="0">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="No activity for 7+ days" Tag="activity:7"/>
+              <ComboBoxItem Content="No activity for 14+ days" Tag="activity:14"/>
+              <ComboBoxItem Content="No activity for 21+ days" Tag="activity:21"/>
+              <ComboBoxItem Content="No activity for 29+ days" Tag="activity:29"/>
+              <ComboBoxItem Content="Not modified for 30+ days" Tag="modified:30"/>
+              <ComboBoxItem Content="Not modified for 60+ days" Tag="modified:60"/>
+              <ComboBoxItem Content="Not modified for 90+ days" Tag="modified:90"/>
+              <ComboBoxItem Content="Not modified for 180+ days" Tag="modified:180"/>
+              <ComboBoxItem Content="Not modified for 365+ days" Tag="modified:365"/>
             </ComboBox>
-            <TextBlock Text="older than" VerticalAlignment="Center" Margin="10,0,8,0"/>
-            <ComboBox x:Name="StaleDaysBox" Width="90"/>
-            <TextBlock Text="days" VerticalAlignment="Center" Margin="8,0,0,0"/>
-            <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="14,0,0,0" ToolTip="Also flag agents with no telemetry in the last 30 days"/>
-            <Button x:Name="BtnStale" Content="Find stale" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="14,0,0,0"/>
+            <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="12,0,0,0" IsEnabled="False" ToolTip="Activity filters only: also match agents with no telemetry in the last 30 days"/>
             <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
-            <TextBlock Text="Risky, at least" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="RiskSeverityBox" Width="130" SelectedIndex="0">
-              <ComboBoxItem Content="Informational"/><ComboBoxItem Content="Low"/><ComboBoxItem Content="Medium"/><ComboBoxItem Content="High"/>
+            <TextBlock Text="Risk" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="RiskBox" Width="190" SelectedIndex="0">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Informational or above" Tag="Informational"/>
+              <ComboBoxItem Content="Low or above" Tag="Low"/>
+              <ComboBoxItem Content="Medium or above" Tag="Medium"/>
+              <ComboBoxItem Content="High only" Tag="High"/>
             </ComboBox>
-            <Button x:Name="BtnRisky" Content="Find risky" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="14,0,0,0"/>
+            <TextBlock Text="Filters combine: an agent must match every active filter." Foreground="{StaticResource Muted}" FontSize="12" VerticalAlignment="Center" Margin="22,0,0,0"/>
           </WrapPanel>
-          </Grid>
         </Border>
       </Grid>
     </Border>
@@ -851,15 +858,14 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBasis', 'StaleDaysBox', 'NeverSeenBox', 'BtnStale', 'RiskSeverityBox', 'BtnRisky',
-                   'BtnClear', 'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'BtnReset',
+                    'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; Scope = $null; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; StaleSet = $null; RiskSet = $null; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
-    $script:ctx.Scope = $null        # $null = whole catalog; otherwise a HashSet of ids matched by a Find action
 
     $script:ctx.Pump = { $script:w.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
     $script:ctx.Busy = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = [Windows.Input.Cursors]::Wait; & $script:ctx.Pump }
@@ -885,20 +891,25 @@ function New-ConsoleWindow {
         if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
         if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
-        if ($script:ctx.Scope -and -not $script:ctx.Scope.Contains($o.Id)) { return $false }
+        if ($script:ctx.StaleSet -and -not $script:ctx.StaleSet.Contains($o.Id)) { return $false }
+        if ($script:ctx.RiskSet  -and -not $script:ctx.RiskSet.Contains($o.Id))  { return $false }
         $q = $script:ui.Search.Text.Trim()
         if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Id) -join ' ').ToLower().Contains($q.ToLower())) { return $false }
         $true
     }
     $script:ctx.View.Filter = [Predicate[object]]$script:ctx.Filter
 
-    $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary }
+    $script:ctx.FilterActive = {
+        [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
+               $script:ui.AgentsOnlyBox.IsChecked -or $script:ctx.StaleSet -or $script:ctx.RiskSet)
+    }
+    $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
 
     $script:ctx.Load = {
         & $script:ctx.Busy 'Loading the catalog...'
         try {
             $pkgs = @(Get-Packages)
-            $script:ctx.Rows.Clear(); $script:ctx.Scope = $null; $script:ui.BtnClear.Visibility = 'Collapsed'
+            $script:ctx.Rows.Clear(); & $script:ctx.ResetFilters
             foreach ($p in ($pkgs | Sort-Object displayName)) {
                 $r = New-Object AgentRow
                 $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
@@ -916,20 +927,74 @@ function New-ConsoleWindow {
         } catch { & $script:ctx.Idle ('Load failed: ' + $_.Exception.Message); [void][Windows.MessageBox]::Show($_.Exception.Message, 'Could not load the catalog', 'OK', 'Error') }
     }
 
-    # Annotate a found set into the grid and narrow the view to it.
-    $script:ctx.ApplyScope = {
-        param([object[]]$Matches, [scriptblock]$Annotate)
-        foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1; $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }
-        $set = New-Object 'System.Collections.Generic.HashSet[string]'
-        foreach ($m in $Matches) {
-            [void]$set.Add($m.id)
-            $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
-            if ($row) { & $Annotate $row $m }
-        }
-        $script:ctx.Scope = $set; $script:ui.BtnClear.Visibility = 'Visible'
-        & $script:ctx.Refilter
+    $script:ctx.ClearStale = { foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1 }; $script:ctx.StaleSet = $null }
+    $script:ctx.ClearRisk  = { foreach ($r in $script:ctx.Rows) { $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }; $script:ctx.RiskSet = $null }
+
+    # Return every filter control to its neutral value: all agents, nothing narrowed.
+    $script:ctx.ResetFilters = {
+        $script:ctx.Resetting = $true
+        $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
+        $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false
+        & $script:ctx.ClearStale; & $script:ctx.ClearRisk
+        $script:ctx.Resetting = $false
     }
 
+    # Run the stale finder for the current dropdown value (or clear it for "None").
+    $script:ctx.RunStale = {
+        $tag = [string]$script:ui.StaleBox.SelectedItem.Tag
+        $script:ui.NeverSeenBox.IsEnabled = $tag.StartsWith('activity')
+        & $script:ctx.ClearStale
+        if (-not $tag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Stale filter cleared.'; return }
+        $by, $days = $tag -split ':'; $days = [int]$days
+        & $script:ctx.Busy ("Finding agents with no {0} for {1}+ days..." -f $(if ($by -eq 'activity') { 'activity' } else { 'manifest change' }), $days)
+        try {
+            $never = [bool]$script:ui.NeverSeenBox.IsChecked -and $by -eq 'activity'
+            $found = @(Get-StalePackages -Days $days -By $by -IncludeNeverSeen:$never)
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($m in $found) {
+                [void]$set.Add($m.id)
+                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
+                if (-not $row) { continue }
+                if ($m.StaleSince) {
+                    $row.LastActivity = $m.StaleSince.ToString('yyyy-MM-dd')
+                    $row.Idle = [string][int]([datetimeoffset]::UtcNow - $m.StaleSince).TotalDays
+                    $row.IdleSort = [int]$row.Idle
+                } else { $row.LastActivity = 'never seen'; $row.Idle = ''; $row.IdleSort = 99999 }
+            }
+            $script:ctx.StaleSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} agent(s) match the stale filter." -f $found.Count)
+        } catch {
+            $script:ui.StaleBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Stale filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Stale filter', 'OK', 'Error')
+        }
+    }
+
+    # Run the risky finder for the current dropdown value (or clear it for "None").
+    $script:ctx.RunRisk = {
+        $sev = [string]$script:ui.RiskBox.SelectedItem.Tag
+        & $script:ctx.ClearRisk
+        if (-not $sev) { & $script:ctx.Refilter; & $script:ctx.Idle 'Risk filter cleared.'; return }
+        & $script:ctx.Busy "Finding agents with Security for AI alerts at $sev or above..."
+        try {
+            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev)
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($m in $found) {
+                [void]$set.Add($m.id)
+                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
+                if (-not $row) { continue }
+                $row.Risk = $m.RiskSeverity; $row.RiskSort = Get-SevRank $m.RiskSeverity
+                $row.Alerts = [string]$m.RiskAlerts; $row.AlertsSort = [int]$m.RiskAlerts
+                $row.Why = $m.RiskReasons
+            }
+            $script:ctx.RiskSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} agent(s) with alerts at {1} or above (last 30 days)." -f $found.Count, $sev)
+        } catch {
+            $script:ui.RiskBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Risk filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Risk filter', 'OK', 'Error')
+        }
+    }
     $script:ctx.Confirm = {
         param([object[]]$Rows, [string]$Verb)
         $names = ($Rows | Select-Object -First 12 | ForEach-Object { "  - " + $_.Name }) -join "`n"
@@ -964,26 +1029,15 @@ function New-ConsoleWindow {
     }
 
     # ---- wiring ----
-    foreach ($d in 7, 14, 21, 29) { [void]$script:ui.StaleDaysBox.Items.Add($d) }
-    $script:ui.StaleDaysBox.SelectedIndex = 1
-    $script:ui.StaleBasis.Add_SelectionChanged({
-        $script:ui.StaleDaysBox.Items.Clear()
-        $days = if ($script:ui.StaleBasis.SelectedIndex -eq 0) { 7, 14, 21, 29 } else { 30, 60, 90, 180, 365 }
-        foreach ($d in $days) { [void]$script:ui.StaleDaysBox.Items.Add($d) }
-        $script:ui.StaleDaysBox.SelectedIndex = 0
-        $script:ui.NeverSeenBox.IsEnabled = ($script:ui.StaleBasis.SelectedIndex -eq 0)
-    })
 
     $script:ui.BtnRefresh.Add_Click({ & $script:ctx.Load })
     $script:ui.Search.Add_TextChanged({ & $script:ctx.Refilter })
     foreach ($b in 'FltAll', 'FltActive', 'FltBlocked') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
     $script:ui.AgentsOnlyBox.Add_Click({ & $script:ctx.Refilter })
-    $script:ui.BtnClear.Add_Click({
-        $script:ctx.Scope = $null; $script:ui.BtnClear.Visibility = 'Collapsed'
-        foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1; $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }
-        & $script:ctx.Refilter; & $script:ctx.Idle 'Showing all agents.'
-    })
-
+    $script:ui.StaleBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunStale } })
+    $script:ui.NeverSeenBox.Add_Click({ if ($script:ui.StaleBox.SelectedIndex -gt 0) { & $script:ctx.RunStale } })
+    $script:ui.RiskBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunRisk } })
+    $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
     $script:ui.BtnSelectVisible.Add_Click({ foreach ($r in $script:ctx.View) { $r.Checked = $true }; & $script:ctx.Summary })
     $script:ui.BtnClearSel.Add_Click({ foreach ($r in $script:ctx.Rows) { $r.Checked = $false }; & $script:ctx.Summary })
     $script:ui.HeaderCheck.Add_Click({
@@ -991,39 +1045,6 @@ function New-ConsoleWindow {
         foreach ($r in $script:ctx.View) { $r.Checked = $on }; & $script:ctx.Summary
     })
 
-    $script:ui.BtnStale.Add_Click({
-        $by = if ($script:ui.StaleBasis.SelectedIndex -eq 0) { 'activity' } else { 'modified' }
-        $days = [int]$script:ui.StaleDaysBox.SelectedItem
-        & $script:ctx.Busy ("Finding agents idle for more than {0} days ({1})..." -f $days, $by)
-        try {
-            $never = [bool]$script:ui.NeverSeenBox.IsChecked -and $by -eq 'activity'
-            $found = @(Get-StalePackages -Days $days -By $by -AgentsOnly:([bool]$script:ui.AgentsOnlyBox.IsChecked) -IncludeNeverSeen:$never)
-            & $script:ctx.ApplyScope $found {
-                param($row, $m)
-                if ($m.StaleSince) {
-                    $row.LastActivity = $m.StaleSince.ToString('yyyy-MM-dd')
-                    $row.Idle = [string][int]([datetimeoffset]::UtcNow - $m.StaleSince).TotalDays
-                    $row.IdleSort = [int]$row.Idle
-                } else { $row.LastActivity = 'never seen'; $row.Idle = '' ; $row.IdleSort = 99999 }
-            }
-            & $script:ctx.Idle ("{0} agent(s) idle for more than {1} days." -f $found.Count, $days)
-        } catch { & $script:ctx.Idle 'Find stale failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Find stale', 'OK', 'Error') }
-    })
-
-    $script:ui.BtnRisky.Add_Click({
-        $sev = $script:ui.RiskSeverityBox.SelectedItem.Content
-        & $script:ctx.Busy "Finding agents with Security for AI alerts at $sev or above..."
-        try {
-            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev -AgentsOnly:([bool]$script:ui.AgentsOnlyBox.IsChecked))
-            & $script:ctx.ApplyScope $found {
-                param($row, $m)
-                $row.Risk = $m.RiskSeverity; $row.RiskSort = Get-SevRank $m.RiskSeverity
-                $row.Alerts = [string]$m.RiskAlerts; $row.AlertsSort = [int]$m.RiskAlerts
-                $row.Why = $m.RiskReasons
-            }
-            & $script:ctx.Idle ("{0} agent(s) with alerts at {1} or above (last 30 days)." -f $found.Count, $sev)
-        } catch { & $script:ctx.Idle 'Find risky failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Find risky', 'OK', 'Error') }
-    })
 
     $script:ui.BtnBlock.Add_Click({   & $script:ctx.Apply 'Block'   @($script:ctx.Rows | Where-Object { $_.Checked -and -not $_.IsBlocked }) })
     $script:ui.BtnUnblock.Add_Click({ & $script:ctx.Apply 'Unblock' @($script:ctx.Rows | Where-Object { $_.Checked -and $_.IsBlocked }) })
