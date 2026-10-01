@@ -53,7 +53,7 @@
   .\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 90 -By modified -AgentsOnly
 
 .EXAMPLE
-  # List RISKY agents (those with Defender AI-security alerts), then block them
+  # List RISKY agents (Defender AI-security alerts and detections), then block them
   .\Agent365-Bulk-Actions.ps1 -Risky -Action list                    # dry run, shows alert count/severity
   .\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -AgentsOnly
   .\Agent365-Bulk-Actions.ps1 -Risky -Pick                           # choose which risky agents to block
@@ -122,6 +122,10 @@ param(
     [Parameter(ParameterSetName = 'Risky')]
     [ValidateRange(1, 10000)]
     [int]$MinAlerts = 1,                       # minimum alert count for an agent to count as risky
+
+    [Parameter(ParameterSetName = 'Risky')]
+    [ValidateSet('Both', 'Alerts', 'Detections')]
+    [string]$RiskSource = 'Both',             # Alerts = Security for AI alerts; Detections = BehaviorInfo detections that raised no alert
 
     [Parameter(ParameterSetName = 'Risky')]
     [ValidateSet('Informational', 'Low', 'Medium', 'High')]
@@ -277,7 +281,8 @@ function Get-ActivityIndex {
     $kql = if ($HuntingQuery) { $HuntingQuery } else { $InventoryKql + @"
 CloudAppEvents
 | where Timestamp > ago(${win}d)
-| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction")
+| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction",
+                       "CopilotInteraction", "AISpanOutput")
 | extend d = todynamic(RawEventData)
 | extend Keys = pack_array(tolower(tostring(coalesce(d.AgentId, d.agentId))),
                            tolower(tostring(d.TargetAgentId)), tolower(tostring(d.PlatformTargetAgentId)))
@@ -401,34 +406,73 @@ function Show-StalePreview {
         Format-Table -AutoSize | Out-Host
 }
 
-# Query Defender Advanced Hunting for agents with AI-security alerts; return Key -> risk info.
+# Query Defender Advanced Hunting for risk signals per agent and return Key -> risk info.
+# Signals are Security for AI alerts and, because Defender can detect without alerting, the
+# agent-attributed behaviors in BehaviorInfo/BehaviorEntities. Behaviors carry no severity, so one
+# is assigned: a block (an attack was stopped) ranks High, an audit/detect (seen, not stopped) Medium.
 function Get-RiskyIndex {
-    param([int]$Days)
-    $kql = if ($HuntingQuery) { $HuntingQuery } else { $InventoryKql + @"
-let win = ${Days}d;
-AlertInfo
-| where Timestamp > ago(win)
-| where DetectionSource in ("Security for AI", "Microsoft Security for AI")
-     or ServiceSource in ("Security for AI", "Microsoft Security for AI")
-| join kind=inner (
-    AlertEvidence
-    | where EntityType == "AIAgent"
+    param([int]$Days, [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both')
+    $alertLeg = @"
+let alerts = AlertInfo
+    | where Timestamp > ago(win)
+    | where DetectionSource in ("Security for AI", "Microsoft Security for AI")
+         or ServiceSource in ("Security for AI", "Microsoft Security for AI")
+    | join kind=inner (
+        AlertEvidence
+        | where EntityType == "AIAgent"
+        | extend af = todynamic(AdditionalFields)
+        | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+        | where isnotempty(AgentKey)
+        | distinct AlertId, AgentKey ) on AlertId
+    | join kind=leftouter inv on `$left.AgentKey == `$right.Key
+    | project Key = coalesce(CatalogId, AgentKey), Kind = "Alert", SignalId = AlertId, Timestamp,
+              Rank = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0),
+              Reason = Title, Category;
+
+"@
+    $detectionLeg = @"
+let names = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | summarize cnt = count(), CatalogId = take_any(tolower(tostring(r.titleId))) by NameKey = tolower(Name)
+    | where cnt == 1 and isnotempty(CatalogId);
+let rtp = BehaviorEntities
+    | where Timestamp > ago(win)
+    | where EntityType == "AIAgent" and ActionType in ("BehaviorAgentRTPAudit", "BehaviorAgentRTPBlock")
     | extend af = todynamic(AdditionalFields)
-    | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+    | project BehaviorId, ActionType, Timestamp, AgentKey = tolower(tostring(af.AgentId))
     | where isnotempty(AgentKey)
-    | distinct AlertId, AgentKey ) on AlertId
-| join kind=leftouter inv on `$left.AgentKey == `$right.Key
-| extend Key = coalesce(CatalogId, AgentKey)
-| extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
-| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp),
-            Reasons = make_set(Title, 8), Categories = make_set(Category, 6) by Key
+    | join kind=leftouter inv on `$left.AgentKey == `$right.Key
+    | join kind=leftouter (BehaviorInfo | project BehaviorId, Categories, BlockReason = tostring(todynamic(AdditionalFields).BlockReason)) on BehaviorId
+    | project Key = coalesce(CatalogId, AgentKey), Kind = "Detection", SignalId = BehaviorId, Timestamp,
+              Rank = iff(ActionType == "BehaviorAgentRTPBlock", 4, 3),
+              Reason = iff(ActionType == "BehaviorAgentRTPBlock", strcat("Real-time protection blocked: ", coalesce(BlockReason, "interaction")), "Real-time protection detection (audit)"),
+              Category = tostring(todynamic(Categories)[0]);
+let shield = BehaviorInfo
+    | where Timestamp > ago(win) and ActionType startswith "BehaviorPromptShield"
+    | extend NameKey = tolower(tostring(todynamic(AdditionalFields).AgentName))
+    | join kind=inner names on NameKey
+    | project Key = CatalogId, Kind = "Detection", SignalId = BehaviorId, Timestamp,
+              Rank = iff(ActionType endswith "Block", 4, 3),
+              Reason = iff(ActionType endswith "Block", "Prompt Shield blocked a jailbreak attempt", "Prompt Shield detected a jailbreak attempt"),
+              Category = "Jailbreak";
+
+"@
+    $legs = switch ($Source) { 'Alerts' { 'alerts' } 'Detections' { 'rtp, shield' } default { 'alerts, rtp, shield' } }
+    $prefix = $InventoryKql + "let win = ${Days}d;`n" +
+              $(if ($Source -ne 'Detections') { $alertLeg }) + $(if ($Source -ne 'Alerts') { $detectionLeg })
+    $kql = if ($HuntingQuery) { $HuntingQuery } else { $prefix + @"
+union $legs
+| summarize AlertCount = dcountif(SignalId, Kind == "Alert"), DetectionCount = dcountif(SignalId, Kind == "Detection"),
+            SevRank = max(Rank), LastAlert = max(Timestamp),
+            Reasons = make_set(Reason, 8), Categories = make_set(Category, 6) by Key
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 "@ }
     $rows = Invoke-HuntingQuery -Query $kql -Hint "Check ThreatHunting.Read.All consent, an E5/Defender license, and that 'Security for AI' is onboarded."
     # make_set columns come back as arrays (or a JSON string); normalize to a "; "-joined string.
     $joinSet = {
         param($v)
-        if ($v -is [string]) { try { $v = $v | ConvertFrom-Json } catch {} }
+        if ($v -is [string]) { try { $v = $v | ConvertFrom-Json } catch { $null = $_ } }
         (@($v) | ForEach-Object { [string]$_ } | Where-Object { $_ }) -join '; '
     }
     $idx = @{}
@@ -436,11 +480,12 @@ AlertInfo
         $k = [string]$row.Key
         if ([string]::IsNullOrWhiteSpace($k)) { continue }
         $idx[$k.ToLower()] = [pscustomobject]@{
-            AlertCount = [int]$row.AlertCount
-            Severity   = [string]$row.Severity
-            LastAlert  = if ($row.LastAlert) { [datetimeoffset]$row.LastAlert } else { $null }
-            Reasons    = (& $joinSet $row.Reasons)
-            Categories = (& $joinSet $row.Categories)
+            AlertCount     = [int]$row.AlertCount
+            DetectionCount = [int]$row.DetectionCount
+            Severity       = [string]$row.Severity
+            LastAlert      = if ($row.LastAlert) { [datetimeoffset]$row.LastAlert } else { $null }
+            Reasons        = (& $joinSet $row.Reasons)
+            Categories     = (& $joinSet $row.Categories)
         }
     }
     $idx
@@ -452,35 +497,38 @@ function Get-SevRank { param([string]$S)
 
 # Return agent packages with >= MinAlerts alerts at/above MinSeverity, annotated with risk info.
 function Get-RiskyPackages {
-    param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly)
-    $idx = Get-RiskyIndex -Days $Days
+    param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly,
+          [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both')
+    $idx = Get-RiskyIndex -Days $Days -Source $Source
     $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Get-Packages -AgentsOnly:$AgentsOnly)) {
         $hit = $null
         foreach ($k in (Get-PackageKeys $p)) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
-        if ($hit -and $hit.AlertCount -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
-            $p | Add-Member -NotePropertyName RiskAlerts     -NotePropertyValue $hit.AlertCount -Force
-            $p | Add-Member -NotePropertyName RiskSeverity   -NotePropertyValue $hit.Severity   -Force
-            $p | Add-Member -NotePropertyName RiskReasons    -NotePropertyValue $hit.Reasons    -Force
-            $p | Add-Member -NotePropertyName RiskCategories -NotePropertyValue $hit.Categories -Force
-            $p | Add-Member -NotePropertyName RiskLastAlert  -NotePropertyValue $hit.LastAlert  -Force -PassThru
+        if ($hit -and ($hit.AlertCount + $hit.DetectionCount) -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
+            $p | Add-Member -NotePropertyName RiskAlerts     -NotePropertyValue $hit.AlertCount     -Force
+            $p | Add-Member -NotePropertyName RiskDetections -NotePropertyValue $hit.DetectionCount -Force
+            $p | Add-Member -NotePropertyName RiskSeverity   -NotePropertyValue $hit.Severity       -Force
+            $p | Add-Member -NotePropertyName RiskReasons    -NotePropertyValue $hit.Reasons        -Force
+            $p | Add-Member -NotePropertyName RiskCategories -NotePropertyValue $hit.Categories     -Force
+            $p | Add-Member -NotePropertyName RiskLastAlert  -NotePropertyValue $hit.LastAlert      -Force -PassThru
         }
     }
-    # worst first: by severity, then alert count
+    # worst first: by severity, then total signals
     @($out | Sort-Object -Property @{ e = { Get-SevRank $_.RiskSeverity } ; Descending = $true },
-                                   @{ e = { $_.RiskAlerts } ; Descending = $true })
+                                   @{ e = { $_.RiskAlerts + $_.RiskDetections } ; Descending = $true })
 }
 
-# Preview table for a risky set (severity, alert count, and WHY / reasons).
+# Preview table for a risky set (severity, signal counts, and WHY / reasons).
 function Show-RiskyPreview {
     param([object[]]$Packages)
     $Packages | Select-Object `
-        @{ n = 'severity';  e = { $_.RiskSeverity } },
-        @{ n = 'alerts';    e = { $_.RiskAlerts } },
+        @{ n = 'severity';   e = { $_.RiskSeverity } },
+        @{ n = 'alerts';     e = { $_.RiskAlerts } },
+        @{ n = 'detections'; e = { $_.RiskDetections } },
         displayName,
-        @{ n = 'why (alert titles)'; e = { $_.RiskReasons } },
+        @{ n = 'why'; e = { $_.RiskReasons } },
         @{ n = 'categories'; e = { $_.RiskCategories } },
-        @{ n = 'lastAlert'; e = { if ($_.RiskLastAlert) { $_.RiskLastAlert.ToString('yyyy-MM-dd') } else { '-' } } },
+        @{ n = 'lastSignal'; e = { if ($_.RiskLastAlert) { $_.RiskLastAlert.ToString('yyyy-MM-dd') } else { '-' } } },
         isBlocked, id |
         Format-Table -AutoSize -Wrap | Out-Host
 }
@@ -710,7 +758,7 @@ $GuiXaml = @'
           <WrapPanel VerticalAlignment="Center">
             <TextBlock Text="FILTER BY" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
             <TextBlock Text="Stale" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="StaleBox" Width="230" SelectedIndex="0">
+            <ComboBox x:Name="StaleBox" Width="205" SelectedIndex="0">
               <ComboBoxItem Content="None" Tag=""/>
               <ComboBoxItem Content="No activity for 7+ days" Tag="activity:7"/>
               <ComboBoxItem Content="No activity for 14+ days" Tag="activity:14"/>
@@ -725,22 +773,28 @@ $GuiXaml = @'
             <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="12,0,0,0" IsEnabled="False" ToolTip="Activity filters only: also match agents with no telemetry in the last 30 days"/>
             <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
             <TextBlock Text="Risk" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="RiskBox" Width="190" SelectedIndex="0">
+            <ComboBox x:Name="RiskBox" Width="175" SelectedIndex="0">
               <ComboBoxItem Content="None" Tag=""/>
               <ComboBoxItem Content="Informational or above" Tag="Informational"/>
               <ComboBoxItem Content="Low or above" Tag="Low"/>
               <ComboBoxItem Content="Medium or above" Tag="Medium"/>
               <ComboBoxItem Content="High only" Tag="High"/>
             </ComboBox>
+            <TextBlock Text="from" VerticalAlignment="Center" Margin="10,0,8,0"/>
+            <ComboBox x:Name="SignalBox" Width="155" SelectedIndex="0" ToolTip="Alerts come from Security for AI. Detections are BehaviorInfo records (real-time protection, Prompt Shield) that may never raise an alert.">
+              <ComboBoxItem Content="Alerts + detections" Tag="Both"/>
+              <ComboBoxItem Content="Alerts only" Tag="Alerts"/>
+              <ComboBoxItem Content="Detections only" Tag="Detections"/>
+            </ComboBox>
             <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
             <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
             <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
               <StackPanel Orientation="Horizontal">
-                <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter"/>
+                <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter (default)"/>
                 <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
               </StackPanel>
             </Border>
-            <TextBlock x:Name="MatchNote" Foreground="{StaticResource Muted}" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0"/>
+            <TextBlock x:Name="MatchNote" Visibility="Collapsed"/>
           </WrapPanel>
         </Border>
       </Grid>
@@ -800,7 +854,8 @@ $GuiXaml = @'
                 </TextBlock>
               </DataTemplate></DataGridTemplateColumn.CellTemplate>
             </DataGridTemplateColumn>
-            <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="65" SortMemberPath="AlertsSort" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
           </DataGrid.Columns>
         </DataGrid>
@@ -838,7 +893,7 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Why:string'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -914,7 +969,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'BtnReset', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -993,13 +1048,13 @@ function New-ConsoleWindow {
     }
 
     $script:ctx.ClearStale = { foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1 }; $script:ctx.StaleSet = $null }
-    $script:ctx.ClearRisk  = { foreach ($r in $script:ctx.Rows) { $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }; $script:ctx.RiskSet = $null }
+    $script:ctx.ClearRisk  = { foreach ($r in $script:ctx.Rows) { $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Detections = ''; $r.DetectionsSort = 0; $r.Why = '' }; $script:ctx.RiskSet = $null }
 
     # Return every filter control to its neutral value: all agents, nothing narrowed.
     $script:ctx.ResetFilters = {
         $script:ctx.Resetting = $true
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
-        $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
+        $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
         & $script:ctx.ClearStale; & $script:ctx.ClearRisk
         $script:ctx.Resetting = $false
     }
@@ -1040,9 +1095,9 @@ function New-ConsoleWindow {
         $sev = [string]$script:ui.RiskBox.SelectedItem.Tag
         & $script:ctx.ClearRisk
         if (-not $sev) { & $script:ctx.Refilter; & $script:ctx.Idle 'Risk filter cleared.'; return }
-        & $script:ctx.Busy "Finding agents with Security for AI alerts at $sev or above..."
+        & $script:ctx.Busy "Finding agents with risk signals at $sev or above..."
         try {
-            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev)
+            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev -Source ([string]$script:ui.SignalBox.SelectedItem.Tag))
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($m in $found) {
                 [void]$set.Add($m.id)
@@ -1050,11 +1105,12 @@ function New-ConsoleWindow {
                 if (-not $row) { continue }
                 $row.Risk = $m.RiskSeverity; $row.RiskSort = Get-SevRank $m.RiskSeverity
                 $row.Alerts = [string]$m.RiskAlerts; $row.AlertsSort = [int]$m.RiskAlerts
+                $row.Detections = [string]$m.RiskDetections; $row.DetectionsSort = [int]$m.RiskDetections
                 $row.Why = $m.RiskReasons
             }
             $script:ctx.RiskSet = $set
             & $script:ctx.Refilter
-            & $script:ctx.Idle ("{0} agent(s) with alerts at {1} or above (last 30 days)." -f $found.Count, $sev)
+            & $script:ctx.Idle ("{0} agent(s) flagged by {1} at {2} or above (last 30 days)." -f $found.Count, $script:ui.SignalBox.SelectedItem.Content.ToLower(), $sev)
         } catch {
             $script:ui.RiskBox.SelectedIndex = 0; & $script:ctx.Refilter
             & $script:ctx.Idle 'Risk filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Risk filter', 'OK', 'Error')
@@ -1099,6 +1155,7 @@ function New-ConsoleWindow {
     $script:ui.StaleBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunStale } })
     $script:ui.NeverSeenBox.Add_Click({ if ($script:ui.StaleBox.SelectedIndex -gt 0) { & $script:ctx.RunStale } })
     $script:ui.RiskBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunRisk } })
+    $script:ui.SignalBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting -and $script:ui.RiskBox.SelectedIndex -gt 0) { & $script:ctx.RunRisk } })
     $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
     $script:ui.BtnSelectVisible.Add_Click({ foreach ($r in $script:ctx.View) { $r.Checked = $true }; & $script:ctx.Summary })
     $script:ui.BtnClearSel.Add_Click({ foreach ($r in $script:ctx.Rows) { $r.Checked = $false }; & $script:ctx.Summary })
@@ -1123,7 +1180,7 @@ function New-ConsoleWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
         if (-not $dlg.ShowDialog()) { return }
-        $out = @($script:ctx.View | Select-Object Name, Status, Platform, Publisher, Modified, LastActivity, Idle, Risk, Alerts, Why, Id)
+        $out = @($script:ctx.View | Select-Object Name, Status, Platform, Publisher, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -Path $dlg.FileName -Encoding utf8 }
         else { $out | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8 }
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
@@ -1233,13 +1290,13 @@ switch ($PSCmdlet.ParameterSetName) {
         Invoke-PackageAction -Packages $matched -Action $Action
     }
     'Risky'   {
-        $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -MinSeverity $MinSeverity -AgentsOnly:$AgentsOnly)
+        $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -MinSeverity $MinSeverity -AgentsOnly:$AgentsOnly -Source $RiskSource)
         if     ($Action -eq 'block')   { $matched = @($matched | Where-Object { -not $_.isBlocked }) }
         elseif ($Action -eq 'unblock') { $matched = @($matched | Where-Object { $_.isBlocked }) }
 
-        Write-Host ("`nAgents with >= {0} AI-security alert(s) at/above {1} severity in {2} days: {3} match(es){4}." -f
+        Write-Host ("`nAgents with >= {0} risk signal(s) (source: {5}) at/above {1} severity in {2} days: {3} match(es){4}." -f
             $MinAlerts, $MinSeverity, $RiskDays, $matched.Count,
-            $(if ($Action -ne 'list') { " needing $Action" } else { '' })) -ForegroundColor Cyan
+            $(if ($Action -ne 'list') { " needing $Action" } else { '' }), $RiskSource.ToLower()) -ForegroundColor Cyan
         if ($matched.Count -eq 0) { break }
         Show-RiskyPreview -Packages $matched
 

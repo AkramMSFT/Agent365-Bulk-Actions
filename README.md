@@ -133,16 +133,26 @@ pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 Opens a Windows desktop window over the same catalog. It needs Windows and PowerShell 7 (or Windows PowerShell 5.1) in single-threaded mode, which `pwsh` uses by default.
 
 - **Browse**: the window opens on every agent in the catalog with no filter applied. Search by name, publisher, platform or id; filter All / Active / Blocked; optionally limit to Copilot agents.
-- **Filter**: the *Stale* and *Risk* dropdowns default to **None**. Pick a value to narrow the grid (no activity for 7 to 29 days, not modified for 30 to 365 days, or alert severity from Informational up to High); the matching columns fill in. The *Match* toggle controls how Stale and Risk combine: **All** (the default) needs both, **Any** accepts either. Search, status and Copilot-only always narrow on top. **Reset filters** returns everything to the unfiltered view.
+- **Filter**: the *Stale* and *Risk* dropdowns default to **None**. Pick a value to narrow the grid (no activity for 7 to 29 days, not modified for 30 to 365 days, or risk severity from Informational up to High, taken from alerts, detections or both); the matching columns fill in. The *Match* toggle controls how Stale and Risk combine: **All** (the default) needs both, **Any** accepts either. Search, status and Copilot-only always narrow on top. **Reset filters** returns everything to the unfiltered view.
 - **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A "Confirm the action" dialog lists the agents and offers Cancel (the default) or the matching Block or Unblock button. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
 - **Undo last run** reverses the previous action in the window. **Export list** saves what the grid shows as CSV or JSON.
 
 ### Risky agents
 
-`-Risky` finds agents that have **Microsoft Defender "Security for AI" alerts** (jailbreak, prompt injection, credential/secret access, etc.) via Advanced Hunting (`runHuntingQuery`), and enriches each with **`severity` (Informational/Low/Medium/High)**, **`alerts`** (count), **`why`** (the alert titles), **`categories`**, and `lastAlert` — so you can decide by severity what to block. Use `-MinSeverity High` (or Medium/Low) to act only on the worst, and `-MinAlerts` for a count threshold; results are sorted worst-severity-first. Then block with the same preview → confirm/pick flow. Needs `ThreatHunting.Read.All` plus a Defender/E5 license with **Security for AI** onboarded (same prerequisite as `-Stale -By activity`).
+`-Risky` finds agents with Defender **Security for AI** signals and enriches each with **`severity`**, **`alerts`**, **`detections`**, **`why`** (alert titles and detection types), **`categories`** and the date of the last signal. Results are sorted worst-severity-first. Use `-MinSeverity` and `-MinAlerts` to narrow them, then block with the same preview and confirm/pick flow.
+
+Two kinds of signal are read from Advanced Hunting, because Defender can detect something without raising an alert:
+
+| Signal | Source | How it is tied to an agent | Severity |
+| --- | --- | --- | --- |
+| Alert | `AlertInfo` with `AlertEvidence` (entity `AIAgent`) | The agent id in the evidence | The alert's own severity |
+| Real-time protection detection | `BehaviorEntities` (entity `AIAgent`) for `BehaviorAgentRTPAudit` and `BehaviorAgentRTPBlock`, with the block reason from `BehaviorInfo` | The Entra agent id in the entity | Block: High. Audit: Medium |
+| Prompt Shield detection | `BehaviorInfo` for `BehaviorPromptShieldJailbreakBlock` and `BehaviorPromptShieldJailbreakDetect` | The agent name only, matched when the name is unique in `AgentsInfo` | Block: High. Detect: Medium |
+
+Behaviors carry no severity of their own, so the table above is the mapping the script applies (a block means an attack was stopped; an audit or detect means it was seen but not stopped). Choose the signals with `-RiskSource Both|Alerts|Detections`; in the console use the *from* dropdown next to *Risk*.
 
 > [!NOTE]
-> Alerts are attributed to a package through the `AIAgent` entity in `AlertEvidence`, whose agent id is the package `id`. Only "Security for AI" alerts that carry an agent entity are counted. "Defender for AI Services" alerts name an Azure AI account rather than an agent and are not attributed. **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return columns `Key, AlertCount, Severity, LastAlert`, with `Key` set to the package id). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
+> Not every signal can be attributed to a catalog agent. "Defender for AI Services" alerts name an Azure AI account rather than an agent, `BehaviorAIAgentsRealTimeBlock` records carry no agent identity, and a Prompt Shield record whose agent name is missing or duplicated in `AgentsInfo` is skipped. **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
 
 ## Parameter reference
 
@@ -162,7 +172,8 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |
 | `-Risky` | switch | Act on agents with Defender AI‑security alerts (Advanced Hunting). |
 | `-RiskDays` | 1–3650 (default 30) | Alert lookback window (Advanced Hunting retains ~30 days). |
-| `-MinAlerts` | int (default 1) | Minimum alert count for an agent to count as risky. |
+| `-RiskSource` | Both (default) / Alerts / Detections | Which signals make an agent risky: Security for AI alerts, BehaviorInfo detections that raised no alert, or both. |
+| `-MinAlerts` | int (default 1) | Minimum number of signals (alerts plus detections) for an agent to count as risky. |
 | `-MinSeverity` | Informational/Low/Medium/High | Only act on agents at/above this alert severity. |
 | `-HuntingQuery` | KQL (optional) | Custom KQL. Stale: returns `Key,LastActivity`. Risky: returns `Key,AlertCount,Severity,LastAlert`. |
 | `-IncludeNeverSeen` | switch | Activity mode: also treat agents with zero telemetry as stale. |
@@ -220,7 +231,8 @@ Activity (`-By activity`), always over the full 30 days:
 ```kql
 CloudAppEvents
 | where Timestamp > ago(30d)
-| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction")
+| where ActionType in ("InvokeAgent", "InferenceCall", "ExecuteToolBySDK", "ConnectedAIAppInteraction",
+                       "CopilotInteraction", "AISpanOutput")
 | extend d = todynamic(RawEventData)
 | extend Keys = pack_array(tolower(tostring(coalesce(d.AgentId, d.agentId))),
                            tolower(tostring(d.TargetAgentId)), tolower(tostring(d.PlatformTargetAgentId)))
@@ -231,25 +243,54 @@ CloudAppEvents
 | summarize LastActivity = max(LastActivity) by Key = coalesce(CatalogId, Key)
 ```
 
-Risky (`-Risky`), after the same inventory block:
+Risky (`-Risky`), after the same inventory block. `-RiskSource` selects which of the `alerts`, `rtp` and `shield` legs are included:
 
 ```kql
-AlertInfo
-| where Timestamp > ago(30d)
-| where DetectionSource in ("Security for AI", "Microsoft Security for AI")
-     or ServiceSource in ("Security for AI", "Microsoft Security for AI")
-| join kind=inner (
-    AlertEvidence
-    | where EntityType == "AIAgent"
+let win = 30d;
+let alerts = AlertInfo
+    | where Timestamp > ago(win)
+    | where DetectionSource in ("Security for AI", "Microsoft Security for AI")
+         or ServiceSource in ("Security for AI", "Microsoft Security for AI")
+    | join kind=inner (
+        AlertEvidence
+        | where EntityType == "AIAgent"
+        | extend af = todynamic(AdditionalFields)
+        | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+        | where isnotempty(AgentKey)
+        | distinct AlertId, AgentKey ) on AlertId
+    | join kind=leftouter inv on $left.AgentKey == $right.Key
+    | project Key = coalesce(CatalogId, AgentKey), Kind = "Alert", SignalId = AlertId, Timestamp,
+              Rank = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0),
+              Reason = Title, Category;
+let names = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | summarize cnt = count(), CatalogId = take_any(tolower(tostring(r.titleId))) by NameKey = tolower(Name)
+    | where cnt == 1 and isnotempty(CatalogId);
+let rtp = BehaviorEntities
+    | where Timestamp > ago(win)
+    | where EntityType == "AIAgent" and ActionType in ("BehaviorAgentRTPAudit", "BehaviorAgentRTPBlock")
     | extend af = todynamic(AdditionalFields)
-    | project AlertId, AgentKey = tolower(tostring(coalesce(af.AgentId, af.agentId)))
+    | project BehaviorId, ActionType, Timestamp, AgentKey = tolower(tostring(af.AgentId))
     | where isnotempty(AgentKey)
-    | distinct AlertId, AgentKey ) on AlertId
-| join kind=leftouter inv on $left.AgentKey == $right.Key
-| extend Key = coalesce(CatalogId, AgentKey)
-| extend sev = case(Severity == "High", 4, Severity == "Medium", 3, Severity == "Low", 2, Severity == "Informational", 1, 0)
-| summarize AlertCount = dcount(AlertId), SevRank = max(sev), LastAlert = max(Timestamp),
-            Reasons = make_set(Title, 8), Categories = make_set(Category, 6) by Key
+    | join kind=leftouter inv on $left.AgentKey == $right.Key
+    | join kind=leftouter (BehaviorInfo | project BehaviorId, Categories, BlockReason = tostring(todynamic(AdditionalFields).BlockReason)) on BehaviorId
+    | project Key = coalesce(CatalogId, AgentKey), Kind = "Detection", SignalId = BehaviorId, Timestamp,
+              Rank = iff(ActionType == "BehaviorAgentRTPBlock", 4, 3),
+              Reason = iff(ActionType == "BehaviorAgentRTPBlock", strcat("Real-time protection blocked: ", coalesce(BlockReason, "interaction")), "Real-time protection detection (audit)"),
+              Category = tostring(todynamic(Categories)[0]);
+let shield = BehaviorInfo
+    | where Timestamp > ago(win) and ActionType startswith "BehaviorPromptShield"
+    | extend NameKey = tolower(tostring(todynamic(AdditionalFields).AgentName))
+    | join kind=inner names on NameKey
+    | project Key = CatalogId, Kind = "Detection", SignalId = BehaviorId, Timestamp,
+              Rank = iff(ActionType endswith "Block", 4, 3),
+              Reason = iff(ActionType endswith "Block", "Prompt Shield blocked a jailbreak attempt", "Prompt Shield detected a jailbreak attempt"),
+              Category = "Jailbreak";
+union alerts, rtp, shield
+| summarize AlertCount = dcountif(SignalId, Kind == "Alert"), DetectionCount = dcountif(SignalId, Kind == "Detection"),
+            SevRank = max(Rank), LastAlert = max(Timestamp),
+            Reasons = make_set(Reason, 8), Categories = make_set(Category, 6) by Key
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 ```
 
