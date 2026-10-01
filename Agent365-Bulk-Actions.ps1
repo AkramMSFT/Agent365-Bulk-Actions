@@ -215,6 +215,8 @@ function Get-Packages {
         foreach ($v in $resp.value) { $all += [pscustomobject]$v }
         $uri = $resp.'@odata.nextLink'
     } while ($uri)
+    # The service does not apply the supportedHosts filter, so enforce it here.
+    if ($AgentsOnly) { $all = @($all | Where-Object { @($_.supportedHosts) -contains 'Copilot' }) }
     $all
 }
 
@@ -483,6 +485,9 @@ function Show-RiskyPreview {
         Format-Table -AutoSize -Wrap | Out-Host
 }
 
+# Single seam over ShouldProcess so -WhatIf applies to every write.
+function Test-Proceed { param([string]$Target, [string]$Verb) $PSCmdlet.ShouldProcess($Target, $Verb) }
+
 # Ask once before a batch write. -Force and -WhatIf skip the prompt; a picker selection counts as consent.
 function Confirm-Batch {
     param([int]$Count, [string]$Action, [switch]$Implied)
@@ -502,7 +507,7 @@ function Export-ActionLog {
 # Apply block/unblock to each package; skip ones already in the target state, keep going on
 # error, then summarize. Honours -WhatIf and records the outcome per package.
 function Invoke-PackageAction {
-    param([object[]]$Packages, [ValidateSet('block', 'unblock')][string]$Action)
+    param([object[]]$Packages, [ValidateSet('block', 'unblock')][string]$Action, [switch]$PassThru)
     if (-not $Packages -or $Packages.Count -eq 0) { Write-Host 'Nothing selected.'; return }
 
     $want = ($Action -eq 'block')
@@ -518,7 +523,7 @@ function Invoke-PackageAction {
         if ($null -ne $p.isBlocked -and [bool]$p.isBlocked -eq $want) {
             Write-Host ("  SKIP {0}  ({1}) already {2}ed" -f $p.displayName, $p.id, $Action) -ForegroundColor DarkGray
             $rec.Result = 'Skipped'; $skip++
-        } elseif (-not $PSCmdlet.ShouldProcess(("{0} ({1})" -f $p.displayName, $p.id), $verb)) {
+        } elseif (-not (Test-Proceed ("{0} ({1})" -f $p.displayName, $p.id) $verb)) {
             $rec.Result = 'WhatIf'
         } else {
             try {
@@ -534,9 +539,529 @@ function Invoke-PackageAction {
     }
     Write-Host ("Done: {0} {1}ed, {2} skipped, {3} failed." -f $ok, $Action, $skip, $fail) -ForegroundColor Cyan
     Export-ActionLog -Records $log
+    if ($PassThru) { $log }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Graphical console (-Gui): WPF window over the same catalog, stale, risky, block and unblock logic.
+# ---------------------------------------------------------------------------------------------
+$GuiXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Agent 365 Bulk Actions" Width="1280" Height="780" MinWidth="1000" MinHeight="560"
+        WindowStartupLocation="CenterScreen" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13"
+        UseLayoutRounding="True" SnapsToDevicePixels="True">
+  <Window.Resources>
+    <SolidColorBrush x:Key="Accent" Color="#0F6CBD"/>
+    <SolidColorBrush x:Key="Ink" Color="#1F2937"/>
+    <SolidColorBrush x:Key="Muted" Color="#6B7280"/>
+    <SolidColorBrush x:Key="Line" Color="#E5E7EB"/>
+
+    <Style x:Key="Btn" TargetType="Button">
+      <Setter Property="Foreground" Value="{StaticResource Ink}"/>
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="BorderBrush" Value="#D1D5DB"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="16,8"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.88"/></Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="bd" Property="Opacity" Value="0.72"/></Trigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.4"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="BtnDanger" TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="#C42B1C"/><Setter Property="BorderBrush" Value="#C42B1C"/><Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style x:Key="BtnGood" TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="#107C41"/><Setter Property="BorderBrush" Value="#107C41"/><Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style x:Key="BtnAccent" TargetType="Button" BasedOn="{StaticResource Btn}">
+      <Setter Property="Background" Value="#0F6CBD"/><Setter Property="BorderBrush" Value="#0F6CBD"/><Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style x:Key="BtnLink" TargetType="Button">
+      <Setter Property="Foreground" Value="#0F6CBD"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <TextBlock x:Name="t" Text="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}" Padding="4,2"/>
+            <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="t" Property="TextDecorations" Value="Underline"/></Trigger></ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="Seg" TargetType="RadioButton">
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Border x:Name="bd" Background="Transparent" CornerRadius="5" Padding="14,6" Margin="2">
+              <TextBlock x:Name="tx" Text="{TemplateBinding Content}" Foreground="#4B5563" FontWeight="SemiBold"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="White"/>
+                <Setter TargetName="tx" Property="Foreground" Value="#0F6CBD"/>
+              </Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#ECEEF1"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style TargetType="TextBox">
+      <Setter Property="Padding" Value="10,7"/><Setter Property="BorderBrush" Value="#D1D5DB"/><Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style TargetType="ComboBox"><Setter Property="Padding" Value="8,5"/><Setter Property="VerticalContentAlignment" Value="Center"/></Style>
+
+    <Style TargetType="DataGridColumnHeader">
+      <Setter Property="Background" Value="#F9FAFB"/><Setter Property="Foreground" Value="#4B5563"/><Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Padding" Value="12,10"/><Setter Property="BorderBrush" Value="#E5E7EB"/><Setter Property="BorderThickness" Value="0,0,0,1"/>
+    </Style>
+    <Style TargetType="DataGridCell">
+      <Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="12,0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="DataGridCell">
+            <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+              <ContentPresenter VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="DataGridRow">
+      <Setter Property="Background" Value="White"/><Setter Property="MinHeight" Value="40"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#F3F8FD"/></Trigger>
+        <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#E6F0FA"/></Trigger>
+      </Style.Triggers>
+    </Style>
+    <Style x:Key="Cell" TargetType="TextBlock"><Setter Property="TextTrimming" Value="CharacterEllipsis"/></Style>
+    <Style x:Key="Pill" TargetType="Border">
+      <Setter Property="CornerRadius" Value="10"/><Setter Property="Padding" Value="10,2"/><Setter Property="HorizontalAlignment" Value="Left"/>
+    </Style>
+  </Window.Resources>
+
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <!-- header -->
+    <Border Grid.Row="0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="24,16">
+      <Grid>
+        <StackPanel>
+          <TextBlock Text="Agent 365 Bulk Actions" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource Ink}"/>
+          <TextBlock x:Name="Account" Foreground="{StaticResource Muted}" Margin="0,2,0,0"/>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <Border Background="#F3F4F6" CornerRadius="8" Padding="14,6" Margin="0,0,10,0">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="Total " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountTotal" FontWeight="SemiBold" Margin="0,0,16,0"/>
+              <TextBlock Text="Blocked " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountBlocked" FontWeight="SemiBold" Foreground="#C42B1C" Margin="0,0,16,0"/>
+              <TextBlock Text="Showing " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountShown" FontWeight="SemiBold"/>
+            </StackPanel>
+          </Border>
+          <Button x:Name="BtnRefresh" Content="Refresh" Style="{StaticResource Btn}"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- toolbar -->
+    <Border Grid.Row="1" Padding="24,14,24,6">
+      <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Grid Grid.Row="0">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <TextBox x:Name="Search" Grid.Column="0" ToolTip="Search by name, publisher, platform or id"/>
+          <TextBlock Grid.Column="0" Text="Search agents" Foreground="#9CA3AF" IsHitTestVisible="False" Margin="12,0,0,0" VerticalAlignment="Center">
+            <TextBlock.Style>
+              <Style TargetType="TextBlock">
+                <Setter Property="Visibility" Value="Collapsed"/>
+                <Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=Search}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
+              </Style>
+            </TextBlock.Style>
+          </TextBlock>
+          <Border Grid.Column="1" Background="#E5E7EB" CornerRadius="7" Margin="14,0,0,0" Padding="1">
+            <StackPanel Orientation="Horizontal">
+              <RadioButton x:Name="FltAll" Content="All" GroupName="f" IsChecked="True" Style="{StaticResource Seg}"/>
+              <RadioButton x:Name="FltActive" Content="Active" GroupName="f" Style="{StaticResource Seg}"/>
+              <RadioButton x:Name="FltBlocked" Content="Blocked" GroupName="f" Style="{StaticResource Seg}"/>
+            </StackPanel>
+          </Border>
+          <Button x:Name="BtnClear" Grid.Column="2" Content="Back to all agents" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" Visibility="Collapsed"/>
+          <CheckBox x:Name="AgentsOnlyBox" Grid.Column="3" Content="Copilot agents only" IsChecked="True" VerticalAlignment="Center"/>
+        </Grid>
+        <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
+          <Grid>
+          <WrapPanel Grid.Column="0" VerticalAlignment="Center">
+            <TextBlock Text="FIND" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
+            <TextBlock Text="Stale by" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="StaleBasis" Width="150" SelectedIndex="0">
+              <ComboBoxItem Content="Activity (idle)"/><ComboBoxItem Content="Manifest age"/>
+            </ComboBox>
+            <TextBlock Text="older than" VerticalAlignment="Center" Margin="10,0,8,0"/>
+            <ComboBox x:Name="StaleDaysBox" Width="90"/>
+            <TextBlock Text="days" VerticalAlignment="Center" Margin="8,0,0,0"/>
+            <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="14,0,0,0" ToolTip="Also flag agents with no telemetry in the last 30 days"/>
+            <Button x:Name="BtnStale" Content="Find stale" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="14,0,0,0"/>
+            <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
+            <TextBlock Text="Risky, at least" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="RiskSeverityBox" Width="130" SelectedIndex="0">
+              <ComboBoxItem Content="Informational"/><ComboBoxItem Content="Low"/><ComboBoxItem Content="Medium"/><ComboBoxItem Content="High"/>
+            </ComboBox>
+            <Button x:Name="BtnRisky" Content="Find risky" Style="{StaticResource BtnAccent}" Padding="14,6" Margin="14,0,0,0"/>
+          </WrapPanel>
+          </Grid>
+        </Border>
+      </Grid>
+    </Border>
+
+    <!-- grid -->
+    <Border Grid.Row="2" Margin="24,8,24,0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8">
+      <Grid>
+        <DataGrid x:Name="Grid" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" CanUserResizeRows="False"
+                  HeadersVisibility="Column" GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#F0F1F3" BorderThickness="0"
+                  Background="White" SelectionMode="Single" RowHeaderWidth="0" IsReadOnly="False" SelectionUnit="FullRow">
+          <DataGrid.Columns>
+            <DataGridTemplateColumn Width="46" SortMemberPath="Checked">
+              <DataGridTemplateColumn.Header><CheckBox x:Name="HeaderCheck" HorizontalAlignment="Center" ToolTip="Select or clear every visible row"/></DataGridTemplateColumn.Header>
+              <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                <CheckBox IsChecked="{Binding Checked, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </DataTemplate></DataGridTemplateColumn.CellTemplate>
+            </DataGridTemplateColumn>
+            <DataGridTextColumn Header="Agent" Binding="{Binding Name}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTemplateColumn Header="Status" Width="100" SortMemberPath="Status" IsReadOnly="True">
+              <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                <Border>
+                  <Border.Style>
+                    <Style TargetType="Border" BasedOn="{StaticResource Pill}">
+                      <Setter Property="Background" Value="#DFF6DD"/>
+                      <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Background" Value="#FDE7E9"/></DataTrigger></Style.Triggers>
+                    </Style>
+                  </Border.Style>
+                  <TextBlock Text="{Binding Status}" FontWeight="SemiBold" FontSize="12">
+                    <TextBlock.Style>
+                      <Style TargetType="TextBlock">
+                        <Setter Property="Foreground" Value="#0B6A0B"/>
+                        <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger></Style.Triggers>
+                      </Style>
+                    </TextBlock.Style>
+                  </TextBlock>
+                </Border>
+              </DataTemplate></DataGridTemplateColumn.CellTemplate>
+            </DataGridTemplateColumn>
+            <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Idle days" Binding="{Binding Idle}" Width="80" SortMemberPath="IdleSort" IsReadOnly="True"/>
+            <DataGridTemplateColumn Header="Risk" Width="110" SortMemberPath="RiskSort" IsReadOnly="True">
+              <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                <TextBlock Text="{Binding Risk}" FontWeight="SemiBold">
+                  <TextBlock.Style>
+                    <Style TargetType="TextBlock">
+                      <Setter Property="Foreground" Value="#1F2937"/>
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger>
+                        <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </TextBlock.Style>
+                </TextBlock>
+              </DataTemplate></DataGridTemplateColumn.CellTemplate>
+            </DataGridTemplateColumn>
+            <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="65" SortMemberPath="AlertsSort" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+        <StackPanel x:Name="EmptyNote" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed">
+          <TextBlock x:Name="EmptyText" Foreground="{StaticResource Muted}" FontSize="14" HorizontalAlignment="Center"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- action bar -->
+    <Border Grid.Row="3" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,14" Margin="0,12,0,0">
+      <Grid>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock x:Name="SelectedText" FontWeight="SemiBold" VerticalAlignment="Center" MinWidth="110"/>
+          <Button x:Name="BtnSelectVisible" Content="Select visible" Style="{StaticResource BtnLink}" Margin="12,0,0,0"/>
+          <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnExport" Content="Export list" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,22,0" IsEnabled="False"/>
+          <Button x:Name="BtnUnblock" Content="Unblock selected" Style="{StaticResource BtnGood}" Margin="0,0,10,0" MinWidth="150" IsEnabled="False"/>
+          <Button x:Name="BtnBlock" Content="Block selected" Style="{StaticResource BtnDanger}" MinWidth="150" IsEnabled="False"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+
+    <!-- status -->
+    <Border Grid.Row="4" Background="#F9FAFB" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,7">
+      <TextBlock x:Name="Status" Foreground="{StaticResource Muted}" FontSize="12" TextTrimming="CharacterEllipsis"/>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Row model with change notification so checkboxes, status pills and analysis columns update live.
+if (-not ('AgentRow' -as [type])) {
+    $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Why:string'
+    $props = foreach ($np in $notifyProps) {
+        $n, $t = $np -split ':'
+        "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
+    }
+    Add-Type -ReferencedAssemblies System.ObjectModel -TypeDefinition @"
+using System.ComponentModel;
+public class AgentRow : INotifyPropertyChanged {
+    public event PropertyChangedEventHandler PropertyChanged;
+    private void Notify(string p) { if (PropertyChanged != null) PropertyChanged(this, new PropertyChangedEventArgs(p)); }
+    public string Status { get { return IsBlocked ? "Blocked" : "Active"; } }
+    public string Id { get; set; }
+    public string Name { get; set; }
+    public string Platform { get; set; }
+    public string Publisher { get; set; }
+    public string Hosts { get; set; }
+    public string Modified { get; set; }
+    public object Package { get; set; }
+    $($props -join "`n    ")
+}
+"@
+}
+
+function New-ConsoleWindow {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+    $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
+    $script:ui = @{}
+    foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
+                   'AgentsOnlyBox', 'StaleBasis', 'StaleDaysBox', 'NeverSeenBox', 'BtnStale', 'RiskSeverityBox', 'BtnRisky',
+                   'BtnClear', 'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
+                   'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
+
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; Scope = $null; LastRun = @() }
+    $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
+    $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
+    $script:ui.Grid.ItemsSource = $script:ctx.View
+    $script:ctx.Scope = $null        # $null = whole catalog; otherwise a HashSet of ids matched by a Find action
+
+    $script:ctx.Pump = { $script:w.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
+    $script:ctx.Busy = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = [Windows.Input.Cursors]::Wait; & $script:ctx.Pump }
+    $script:ctx.Idle = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = $null }
+
+    $script:ctx.Summary = {
+        $rows = @($script:ctx.Rows)
+        $checked = @($rows | Where-Object { $_.Checked })
+        $script:ui.CountTotal.Text = $rows.Count
+        $script:ui.CountBlocked.Text = @($rows | Where-Object { $_.IsBlocked }).Count
+        $script:ui.CountShown.Text = @($script:ctx.View).Count
+        $script:ui.SelectedText.Text = if ($checked.Count) { "$($checked.Count) selected" } else { 'None selected' }
+        $script:ui.BtnBlock.IsEnabled   = @($checked | Where-Object { -not $_.IsBlocked }).Count -gt 0
+        $script:ui.BtnUnblock.IsEnabled = @($checked | Where-Object { $_.IsBlocked }).Count -gt 0
+        $script:ui.BtnUndo.IsEnabled    = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
+        $shown = [int]$script:ui.CountShown.Text
+        $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
+        $script:ui.EmptyText.Text = if ($rows.Count -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
+    }
+
+    $script:ctx.Filter = {
+        param($o)
+        if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
+        if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
+        if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
+        if ($script:ctx.Scope -and -not $script:ctx.Scope.Contains($o.Id)) { return $false }
+        $q = $script:ui.Search.Text.Trim()
+        if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Id) -join ' ').ToLower().Contains($q.ToLower())) { return $false }
+        $true
+    }
+    $script:ctx.View.Filter = [Predicate[object]]$script:ctx.Filter
+
+    $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary }
+
+    $script:ctx.Load = {
+        & $script:ctx.Busy 'Loading the catalog...'
+        try {
+            $pkgs = @(Get-Packages)
+            $script:ctx.Rows.Clear(); $script:ctx.Scope = $null; $script:ui.BtnClear.Visibility = 'Collapsed'
+            foreach ($p in ($pkgs | Sort-Object displayName)) {
+                $r = New-Object AgentRow
+                $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
+                $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { [string]$p.type }
+                $r.Hosts = ($p.supportedHosts) -join ','
+                $r.IsBlocked = [bool]$p.isBlocked
+                $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
+                $r.Package = $p
+                $r.IdleSort = -1; $r.RiskSort = 0; $r.AlertsSort = 0
+                $r.add_PropertyChanged({ param($s, $e) if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { & $script:ctx.Summary } })
+                $script:ctx.Rows.Add($r)
+            }
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("Loaded {0} packages at {1}." -f $pkgs.Count, (Get-Date).ToString('HH:mm:ss'))
+        } catch { & $script:ctx.Idle ('Load failed: ' + $_.Exception.Message); [void][Windows.MessageBox]::Show($_.Exception.Message, 'Could not load the catalog', 'OK', 'Error') }
+    }
+
+    # Annotate a found set into the grid and narrow the view to it.
+    $script:ctx.ApplyScope = {
+        param([object[]]$Matches, [scriptblock]$Annotate)
+        foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1; $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($m in $Matches) {
+            [void]$set.Add($m.id)
+            $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
+            if ($row) { & $Annotate $row $m }
+        }
+        $script:ctx.Scope = $set; $script:ui.BtnClear.Visibility = 'Visible'
+        & $script:ctx.Refilter
+    }
+
+    $script:ctx.Confirm = {
+        param([object[]]$Rows, [string]$Verb)
+        $names = ($Rows | Select-Object -First 12 | ForEach-Object { "  - " + $_.Name }) -join "`n"
+        if ($Rows.Count -gt 12) { $names += "`n  ... and $($Rows.Count - 12) more" }
+        $answer = [Windows.MessageBox]::Show(("{0} {1} agent(s)?`n`n{2}`n`nThis can be reversed with the opposite action or Undo last run." -f $Verb, $Rows.Count, $names),
+            "Confirm $($Verb.ToLower())", 'YesNo', 'Warning', 'No')
+        $answer -eq 'Yes'
+    }
+
+    $script:ctx.Apply = {
+        param([string]$Verb, [object[]]$Rows)
+        if (-not (& $script:ctx.Confirm $Rows $Verb)) { return }
+        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script:OutFile = Join-Path $dir ('run-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.Busy ("{0}ing {1} agent(s)..." -f $Verb.TrimEnd('e'), $Rows.Count)
+        $recs = @(Invoke-PackageAction -Packages @($Rows | ForEach-Object { $_.Package | Add-Member -NotePropertyName isBlocked -NotePropertyValue $_.IsBlocked -Force -PassThru }) -Action $Verb.ToLower() -PassThru)
+        foreach ($rec in $recs) {
+            if ($rec.Result -eq 'Done') {
+                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $rec.Id } | Select-Object -First 1
+                if ($row) { $row.IsBlocked = ($Verb -eq 'Block'); $row.Package.isBlocked = $row.IsBlocked; $row.Checked = $false }
+            }
+        }
+        $script:ctx.LastRun = $recs
+        $done = @($recs | Where-Object { $_.Result -eq 'Done' }).Count; $failed = @($recs | Where-Object { $_.Result -eq 'Failed' }).Count
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("{0}: {1} done, {2} failed. Log: {3}" -f $Verb, $done, $failed, $script:OutFile)
+        if ($failed) {
+            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some actions failed', 'OK', 'Warning')
+        }
+    }
+
+    # ---- wiring ----
+    foreach ($d in 7, 14, 21, 29) { [void]$script:ui.StaleDaysBox.Items.Add($d) }
+    $script:ui.StaleDaysBox.SelectedIndex = 1
+    $script:ui.StaleBasis.Add_SelectionChanged({
+        $script:ui.StaleDaysBox.Items.Clear()
+        $days = if ($script:ui.StaleBasis.SelectedIndex -eq 0) { 7, 14, 21, 29 } else { 30, 60, 90, 180, 365 }
+        foreach ($d in $days) { [void]$script:ui.StaleDaysBox.Items.Add($d) }
+        $script:ui.StaleDaysBox.SelectedIndex = 0
+        $script:ui.NeverSeenBox.IsEnabled = ($script:ui.StaleBasis.SelectedIndex -eq 0)
+    })
+
+    $script:ui.BtnRefresh.Add_Click({ & $script:ctx.Load })
+    $script:ui.Search.Add_TextChanged({ & $script:ctx.Refilter })
+    foreach ($b in 'FltAll', 'FltActive', 'FltBlocked') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
+    $script:ui.AgentsOnlyBox.Add_Click({ & $script:ctx.Refilter })
+    $script:ui.BtnClear.Add_Click({
+        $script:ctx.Scope = $null; $script:ui.BtnClear.Visibility = 'Collapsed'
+        foreach ($r in $script:ctx.Rows) { $r.LastActivity = ''; $r.Idle = ''; $r.IdleSort = -1; $r.Risk = ''; $r.RiskSort = 0; $r.Alerts = ''; $r.AlertsSort = 0; $r.Why = '' }
+        & $script:ctx.Refilter; & $script:ctx.Idle 'Showing all agents.'
+    })
+
+    $script:ui.BtnSelectVisible.Add_Click({ foreach ($r in $script:ctx.View) { $r.Checked = $true }; & $script:ctx.Summary })
+    $script:ui.BtnClearSel.Add_Click({ foreach ($r in $script:ctx.Rows) { $r.Checked = $false }; & $script:ctx.Summary })
+    $script:ui.HeaderCheck.Add_Click({
+        $on = [bool]$script:ui.HeaderCheck.IsChecked
+        foreach ($r in $script:ctx.View) { $r.Checked = $on }; & $script:ctx.Summary
+    })
+
+    $script:ui.BtnStale.Add_Click({
+        $by = if ($script:ui.StaleBasis.SelectedIndex -eq 0) { 'activity' } else { 'modified' }
+        $days = [int]$script:ui.StaleDaysBox.SelectedItem
+        & $script:ctx.Busy ("Finding agents idle for more than {0} days ({1})..." -f $days, $by)
+        try {
+            $never = [bool]$script:ui.NeverSeenBox.IsChecked -and $by -eq 'activity'
+            $found = @(Get-StalePackages -Days $days -By $by -AgentsOnly:([bool]$script:ui.AgentsOnlyBox.IsChecked) -IncludeNeverSeen:$never)
+            & $script:ctx.ApplyScope $found {
+                param($row, $m)
+                if ($m.StaleSince) {
+                    $row.LastActivity = $m.StaleSince.ToString('yyyy-MM-dd')
+                    $row.Idle = [string][int]([datetimeoffset]::UtcNow - $m.StaleSince).TotalDays
+                    $row.IdleSort = [int]$row.Idle
+                } else { $row.LastActivity = 'never seen'; $row.Idle = '' ; $row.IdleSort = 99999 }
+            }
+            & $script:ctx.Idle ("{0} agent(s) idle for more than {1} days." -f $found.Count, $days)
+        } catch { & $script:ctx.Idle 'Find stale failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Find stale', 'OK', 'Error') }
+    })
+
+    $script:ui.BtnRisky.Add_Click({
+        $sev = $script:ui.RiskSeverityBox.SelectedItem.Content
+        & $script:ctx.Busy "Finding agents with Security for AI alerts at $sev or above..."
+        try {
+            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev -AgentsOnly:([bool]$script:ui.AgentsOnlyBox.IsChecked))
+            & $script:ctx.ApplyScope $found {
+                param($row, $m)
+                $row.Risk = $m.RiskSeverity; $row.RiskSort = Get-SevRank $m.RiskSeverity
+                $row.Alerts = [string]$m.RiskAlerts; $row.AlertsSort = [int]$m.RiskAlerts
+                $row.Why = $m.RiskReasons
+            }
+            & $script:ctx.Idle ("{0} agent(s) with alerts at {1} or above (last 30 days)." -f $found.Count, $sev)
+        } catch { & $script:ctx.Idle 'Find risky failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Find risky', 'OK', 'Error') }
+    })
+
+    $script:ui.BtnBlock.Add_Click({   & $script:ctx.Apply 'Block'   @($script:ctx.Rows | Where-Object { $_.Checked -and -not $_.IsBlocked }) })
+    $script:ui.BtnUnblock.Add_Click({ & $script:ctx.Apply 'Unblock' @($script:ctx.Rows | Where-Object { $_.Checked -and $_.IsBlocked }) })
+
+    $script:ui.BtnUndo.Add_Click({
+        $done = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' })
+        $back = @($done | ForEach-Object { $id = $_.Id; $script:ctx.Rows | Where-Object { $_.Id -eq $id } } | Where-Object { $_ })
+        if ($back.Count -eq 0) { return }
+        $verb = if ($done[0].Action -eq 'block') { 'Unblock' } else { 'Block' }
+        & $script:ctx.Apply $verb $back
+    })
+
+    $script:ui.BtnExport.Add_Click({
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($script:ctx.View | Select-Object Name, Status, Platform, Publisher, Modified, LastActivity, Idle, Risk, Alerts, Why, Id)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -Path $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
+    })
+
+    $script:ctx.Account = { $c = Get-MgContext; $script:ui.Account.Text = if ($c) { "$($c.Account)   |   tenant $($c.TenantId)" } else { '' } }
+    & $script:ctx.Account
+    $script:ctx
+}
+
+function Show-Console {
+    if (($null -ne $IsWindows -and -not $IsWindows) -or [Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+        throw '-Gui needs Windows and a single-threaded apartment. Start it with: pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui'
+    }
+    $script:ctx = New-ConsoleWindow
+    $script:ctx.Window.Add_ContentRendered({ if (-not $script:ctx.Loaded) { $script:ctx.Loaded = $true; & $script:ctx.Load } })
+    [void]$script:ctx.Window.ShowDialog()
 }
 
 switch ($PSCmdlet.ParameterSetName) {
+    'Gui' { Show-Console }
     'List' {
         Get-Packages -AgentsOnly:$AgentsOnly |
             Select-Object displayName, id, isBlocked,

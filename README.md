@@ -116,7 +116,26 @@ Telemetry is matched to catalog packages through `AgentsInfo`: a package `id` eq
 
 # Undo
 .\Agent365-Bulk-Actions.ps1 -Unblock "Contoso HR Agent","Northwind Sales Agent"
+
+# Block every agent listed in a CSV (Id or DisplayName column), keeping a log
+.\Agent365-Bulk-Actions.ps1 -FromCsv .\agents.csv -OutFile .\run.csv
+
+# Reverse that whole run later, using its log
+.\Agent365-Bulk-Actions.ps1 -Undo .\run.csv
 ```
+
+### Graphical console
+
+```powershell
+pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
+```
+
+Opens a Windows desktop window over the same catalog. It needs Windows and PowerShell 7 (or Windows PowerShell 5.1) in single-threaded mode, which `pwsh` uses by default.
+
+- **Browse**: search by name, publisher, platform or id; filter All / Active / Blocked; limit to Copilot agents.
+- **Find**: *Find stale* (by activity or by manifest age, with a day picker) and *Find risky* (minimum severity) narrow the grid to the matches and fill the last-activity, idle-days, risk, alert-count and reason columns. *Back to all agents* clears the result.
+- **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A confirmation lists the agents first. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
+- **Undo last run** reverses the previous action in the window. **Export list** saves what the grid shows as CSV or JSON.
 
 ### Risky agents
 
@@ -135,6 +154,9 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-Block` | names and/or ids | Block one or more packages by display name and/or `P_` id. |
 | `-Unblock` | names and/or ids | Unblock (undo) one or more packages. |
 | `-Select` | switch | Interactive multi‑select picker over the catalog. |
+| `-Gui` | switch | Open the graphical console. |
+| `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent named in a CSV with an `Id` or `DisplayName` column. |
+| `-Undo` | path | Reverse a previous run using its `-OutFile` log: every agent changed in that run returns to its earlier state. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |
