@@ -137,6 +137,33 @@ Opens a Windows desktop window over the same catalog. It needs Windows and Power
 - **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A "Confirm the action" dialog lists the agents and offers Cancel (the default) or the matching Block or Unblock button. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
 - **Undo last run** reverses the previous action in the window. **Export list** saves what the grid shows as CSV or JSON.
 
+### Ownership: ownerless and orphaned agents
+
+```powershell
+# Preview shared agents whose owner is missing or gone, with a proposed replacement (changes nothing)
+.\Agent365-Bulk-Actions.ps1 -Ownerless
+
+# Apply the proposals (asks first; -WhatIf previews, -OutFile keeps a log)
+.\Agent365-Bulk-Actions.ps1 -Ownerless -Action reassign -OutFile .\owners.csv
+
+# Manual assignment for agents the tool flagged for review
+.\Agent365-Bulk-Actions.ps1 -Reassign "HR Policy Assistant","Hesham-TEST" -To alex@contoso.com
+```
+
+For each shared agent the tool decides, in this order:
+
+1. **Keep** the current owner when the account exists and is enabled.
+2. **Agent identity owner**: the person registered as owner of the agent's Entra identity, the closest available record of who created it.
+3. **Manager** of that person, or of the former owner while the account still exists.
+4. **Flag for review.** Nothing is guessed or defaulted; assign these yourself with `-Reassign ... -To ...`.
+
+Notes:
+
+- The package API exposes no creator field, so step 2 is the creator substitute. It only applies to agents that have an Entra identity.
+- Only **shared** agents are considered. Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
+- Reassign is **delegated-only** (the API has no application permission), so it cannot run unattended.
+- The mode needs `User.Read.All` and `AgentIdentity.Read.All` in addition to `CopilotPackages.ReadWrite.All`.
+
 ### Risky agents
 
 `-Risky` finds agents with Defender **Security for AI** signals and enriches each with **`severity`**, **`alerts`**, **`detections`**, **`why`** (alert titles and detection types), **`categories`** and the date of the last signal. Results are sorted worst-severity-first. Use `-MinSeverity` and `-MinAlerts` to narrow them, then block with the same preview and confirm/pick flow.
@@ -167,6 +194,9 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-Gui` | switch | Open the graphical console. |
 | `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent named in a CSV with an `Id` or `DisplayName` column. |
 | `-Undo` | path | Reverse a previous run using its `-OutFile` log: every agent changed in that run returns to its earlier state. |
+| `-Ownerless` | switch | Find shared agents whose owner is missing or gone and propose a replacement. Default is a preview; add `-Action reassign` to apply. |
+| `-Reassign` | names and/or ids | Manually assign the listed agents to the user given by `-To`. |
+| `-To` | UPN or object id | The new owner for `-Reassign`. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |

@@ -89,6 +89,15 @@ param(
     [Parameter(ParameterSetName = 'FromCsv', Mandatory)]
     [string]$FromCsv,                         # CSV with an Id and/or DisplayName column; apply -Action to every row
 
+    [Parameter(ParameterSetName = 'Ownerless', Mandatory)]
+    [switch]$Ownerless,                      # find shared agents whose owner is missing or gone and propose a replacement
+
+    [Parameter(ParameterSetName = 'Reassign', Mandatory)]
+    [string[]]$Reassign,                     # manual assignment: agents (names or ids) to give to -To
+
+    [Parameter(ParameterSetName = 'Reassign', Mandatory)]
+    [string]$To,                             # UPN or object id of the new owner
+
     [Parameter(ParameterSetName = 'Gui', Mandatory)]
     [switch]$Gui,                             # open the graphical console
 
@@ -135,7 +144,8 @@ param(
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
     [Parameter(ParameterSetName = 'FromCsv')]
-    [ValidateSet('block', 'unblock', 'list')]
+    [Parameter(ParameterSetName = 'Ownerless')]
+    [ValidateSet('block', 'unblock', 'list', 'reassign')]
     [string]$Action = 'block',                # what to do with the matched set ('list' = preview only)
 
     [Parameter(ParameterSetName = 'List')]
@@ -158,6 +168,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($PSCmdlet.ParameterSetName -eq 'Ownerless' -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
+if ($Action -eq 'reassign' -and $PSCmdlet.ParameterSetName -ne 'Ownerless') { throw '-Action reassign is only valid with -Ownerless. Use -Reassign <agents> -To <user> for manual assignment.' }
 $Base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
 
 # Advanced Hunting keeps ~30 days, so an agent last seen before the cutoff can only be found when
@@ -178,10 +190,11 @@ Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -eq 'List') -or
-            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv') -and $Action -eq 'list')
+            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -237,6 +250,134 @@ function Resolve-Packages {
         $hit[0]
     }
     @($resolved | Sort-Object id -Unique)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Ownership: find agents whose owner is missing or gone, propose a replacement, reassign.
+# ---------------------------------------------------------------------------------------------
+$script:UserCache = @{}
+
+# Look up a user by object id or UPN. Returns an object with Exists/Enabled, cached per run.
+function Get-UserInfo {
+    param([string]$IdOrUpn)
+    if ([string]::IsNullOrWhiteSpace($IdOrUpn) -or $IdOrUpn -eq '00000000-0000-0000-0000-000000000000') {
+        return [pscustomobject]@{ Id = $IdOrUpn; Upn = ''; Name = ''; Exists = $false; Enabled = $false }
+    }
+    $key = $IdOrUpn.ToLower()
+    if ($script:UserCache.ContainsKey($key)) { return $script:UserCache[$key] }
+    try {
+        $u = Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/users/{0}?`$select=id,displayName,userPrincipalName,accountEnabled" -f [uri]::EscapeDataString($IdOrUpn))
+        $info = [pscustomobject]@{ Id = $u.id; Upn = $u.userPrincipalName; Name = $u.displayName; Exists = $true; Enabled = [bool]$u.accountEnabled }
+    } catch {
+        $info = [pscustomobject]@{ Id = $IdOrUpn; Upn = ''; Name = ''; Exists = $false; Enabled = $false }
+    }
+    $script:UserCache[$key] = $info
+    if ($info.Exists) { $script:UserCache[$info.Id.ToLower()] = $info }
+    $info
+}
+
+# The manager of a user, as a user object, or $null when none is set.
+function Get-ManagerInfo {
+    param([string]$UserId)
+    try {
+        $m = Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/users/{0}/manager?`$select=id" -f $UserId)
+        if ($m.id) { return Get-UserInfo $m.id }
+    } catch { $null = $_ }
+    $null
+}
+
+# People registered as owners of the agent's Entra identity, the nearest thing to a creator.
+function Get-IdentityOwners {
+    param([string]$AgentIdentityId)
+    if (-not $AgentIdentityId) { return @() }
+    try {
+        $r = Invoke-Graph -Uri ("https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/owners?`$select=id" -f $AgentIdentityId)
+        @($r.value | Where-Object { $_.'@odata.type' -match 'user$' } | ForEach-Object { Get-UserInfo $_.id })
+    } catch { @() }
+}
+
+# Decide what to do about one shared agent's ownership. Order of preference:
+#   1. keep a valid current owner, 2. the Entra agent identity owner, 3. that person's manager
+#   (or the former owner's), 4. nobody: flag for a manual decision. Never guesses.
+function Resolve-AgentOwner {
+    param([object]$Package)
+    $current = Get-UserInfo $Package.ownerId
+    $result = [ordered]@{
+        Id = $Package.id; DisplayName = $Package.displayName; Platform = $Package.platform
+        CurrentOwnerId = $Package.ownerId; CurrentOwner = ''; State = ''; ProposedId = ''; Proposed = ''; Source = ''; Reason = ''
+    }
+    if ($current.Exists) { $result.CurrentOwner = $current.Upn }
+    if ($current.Exists -and $current.Enabled) { $result.State = 'OK'; return [pscustomobject]$result }
+
+    $result.Reason = if (-not $Package.ownerId -or $Package.ownerId -eq '00000000-0000-0000-0000-000000000000') { 'no owner' }
+                     elseif (-not $current.Exists) { 'owner account no longer exists' } else { 'owner account is disabled' }
+
+    $identityOwners = @(Get-IdentityOwners $Package.agentIdentityId)
+    $pick = $identityOwners | Where-Object { $_.Enabled } | Select-Object -First 1
+    if ($pick) {
+        $result.State = 'Proposed'; $result.ProposedId = $pick.Id; $result.Proposed = $pick.Upn; $result.Source = 'Agent identity owner'
+        return [pscustomobject]$result
+    }
+    # Manager chain: the identity owner if there is one, else the former owner (only possible while the account exists).
+    foreach ($who in @($identityOwners | Select-Object -First 1) + @($current | Where-Object { $_.Exists })) {
+        $mgr = Get-ManagerInfo $who.Id
+        if ($mgr -and $mgr.Enabled) {
+            $result.State = 'Proposed'; $result.ProposedId = $mgr.Id; $result.Proposed = $mgr.Upn; $result.Source = "Manager of $($who.Upn)"
+            return [pscustomobject]$result
+        }
+    }
+    $result.State = 'Needs review'
+    [pscustomobject]$result
+}
+
+# Scan the catalog. Only shared agents are reassignable through the API; org-published (lob) agents are counted, not acted on.
+function Get-OwnerReport {
+    param([object[]]$Packages)
+    $shared = @($Packages | Where-Object { $_.type -eq 'shared' })
+    $report = foreach ($p in $shared) { Resolve-AgentOwner $p }
+    [pscustomobject]@{
+        Items         = @($report | Where-Object { $_.State -ne 'OK' })
+        OkCount       = @($report | Where-Object { $_.State -eq 'OK' }).Count
+        OrgPublished  = @($Packages | Where-Object { $_.type -eq 'lob' -and -not $_.ownerId }).Count
+    }
+}
+
+function Show-OwnerPreview {
+    param([object[]]$Items)
+    $Items | Select-Object @{ n = 'agent'; e = { $_.DisplayName } }, @{ n = 'platform'; e = { $_.Platform } },
+        @{ n = 'why'; e = { $_.Reason } }, @{ n = 'currentOwner'; e = { $_.CurrentOwner } },
+        @{ n = 'status'; e = { $_.State } }, @{ n = 'proposedOwner'; e = { $_.Proposed } }, @{ n = 'basis'; e = { $_.Source } }, Id |
+        Format-Table -AutoSize -Wrap | Out-Host
+}
+
+# Reassign each item to its NewOwnerId; honours -WhatIf, keeps going on error, and logs the previous owner so it can be undone.
+function Invoke-OwnerReassign {
+    param([object[]]$Items, [switch]$PassThru)
+    if (-not $Items -or $Items.Count -eq 0) { Write-Host 'Nothing to reassign.'; return }
+    $who = (Get-MgContext).Account
+    Write-Host ("`nReassign {0} agent(s):" -f $Items.Count) -ForegroundColor Cyan
+    $log = @(); $ok = 0; $fail = 0
+    foreach ($i in $Items) {
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'reassign'
+            Id = $i.Id; DisplayName = $i.DisplayName; WasOwner = $i.CurrentOwnerId; NewOwner = $i.NewOwnerId; Basis = $i.Source; Result = ''; Error = ''
+        }
+        if (-not (Test-Proceed ("{0} -> {1}" -f $i.DisplayName, $i.NewOwnerUpn) 'Reassign')) { $rec.Result = 'WhatIf' }
+        else {
+            try {
+                Invoke-Graph -Method POST -Uri "$Base/$($i.Id)/reassign" -Body (@{ userId = $i.NewOwnerId } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+                Write-Host ("  OK   {0}  ->  {1}" -f $i.DisplayName, $i.NewOwnerUpn) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            } catch {
+                Write-Host ("  FAIL {0}  -> {1}" -f $i.DisplayName, $_.Exception.Message) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+            }
+        }
+        $log += [pscustomobject]$rec
+    }
+    Write-Host ("Done: {0} reassigned, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
+    if ($PassThru) { $log }
 }
 
 # Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
@@ -1208,6 +1349,33 @@ switch ($PSCmdlet.ParameterSetName) {
                           @{ n = 'hosts'; e = { ($_.supportedHosts) -join ',' } }, type |
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
+    }
+    'Ownerless' {
+        $report = Get-OwnerReport -Packages @(Get-Packages)
+        Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published agent(s) have no owner but cannot be reassigned through the API." -f
+            $report.OkCount, $report.Items.Count, $report.OrgPublished) -ForegroundColor Cyan
+        if ($report.Items.Count -eq 0) { break }
+        Show-OwnerPreview -Items $report.Items
+        $proposed = @($report.Items | Where-Object { $_.State -eq 'Proposed' })
+        $review = @($report.Items | Where-Object { $_.State -eq 'Needs review' })
+        Write-Host ("{0} proposed, {1} flagged for review (no owner could be derived; assign manually with -Reassign <agent> -To <user>)." -f $proposed.Count, $review.Count) -ForegroundColor Cyan
+        if ($Action -ne 'reassign' -or $proposed.Count -eq 0) { break }
+        $items = @($proposed | ForEach-Object { $_ | Add-Member -NotePropertyName NewOwnerId -NotePropertyValue $_.ProposedId -Force -PassThru |
+                                                   Add-Member -NotePropertyName NewOwnerUpn -NotePropertyValue $_.Proposed -Force -PassThru })
+        if (-not (Confirm-Batch -Count $items.Count -Action 'reassign')) { Write-Host 'Cancelled.'; break }
+        Invoke-OwnerReassign -Items $items
+    }
+    'Reassign' {
+        $owner = Get-UserInfo $To
+        if (-not $owner.Exists -or -not $owner.Enabled) { throw "'$To' is not an existing, enabled user." }
+        $items = @(Resolve-Packages $Reassign | Where-Object { $_.ownerId -ne $owner.Id } | ForEach-Object {
+            [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; Platform = $_.platform; CurrentOwnerId = $_.ownerId; CurrentOwner = ''
+                               State = 'Manual'; Reason = ''; Proposed = $owner.Upn; Source = 'Manual'; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn } })
+        Write-Host ("{0} agent(s) will be assigned to {1}." -f $items.Count, $owner.Upn) -ForegroundColor Cyan
+        if ($items.Count -eq 0) { break }
+        Show-OwnerPreview -Items $items
+        if (-not (Confirm-Batch -Count $items.Count -Action 'reassign')) { Write-Host 'Cancelled.'; break }
+        Invoke-OwnerReassign -Items $items
     }
     'Undo' {
         if (-not (Test-Path -LiteralPath $Undo)) { throw "Log not found: $Undo" }
