@@ -732,7 +732,15 @@ $GuiXaml = @'
               <ComboBoxItem Content="Medium or above" Tag="Medium"/>
               <ComboBoxItem Content="High only" Tag="High"/>
             </ComboBox>
-            <TextBlock Text="Filters combine: an agent must match every active filter." Foreground="{StaticResource Muted}" FontSize="12" VerticalAlignment="Center" Margin="22,0,0,0"/>
+            <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
+            <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
+              <StackPanel Orientation="Horizontal">
+                <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter"/>
+                <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
+              </StackPanel>
+            </Border>
+            <TextBlock x:Name="MatchNote" Foreground="{StaticResource Muted}" FontSize="12" VerticalAlignment="Center" Margin="12,0,0,0"/>
           </WrapPanel>
         </Border>
       </Grid>
@@ -858,7 +866,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'BtnReset',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'BtnReset', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -891,8 +899,12 @@ function New-ConsoleWindow {
         if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
         if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
-        if ($script:ctx.StaleSet -and -not $script:ctx.StaleSet.Contains($o.Id)) { return $false }
-        if ($script:ctx.RiskSet  -and -not $script:ctx.RiskSet.Contains($o.Id))  { return $false }
+        $sets = @(); foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $sets += , $s } }
+        if ($sets.Count) {
+            $hits = @($sets | Where-Object { $_.Contains($o.Id) }).Count
+            if ($script:ui.MatchAny.IsChecked) { if ($hits -eq 0) { return $false } }
+            elseif ($hits -ne $sets.Count) { return $false }
+        }
         $q = $script:ui.Search.Text.Trim()
         if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Id) -join ' ').ToLower().Contains($q.ToLower())) { return $false }
         $true
@@ -901,9 +913,14 @@ function New-ConsoleWindow {
 
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
-               $script:ui.AgentsOnlyBox.IsChecked -or $script:ctx.StaleSet -or $script:ctx.RiskSet)
+               $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet)
     }
-    $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
+    $script:ctx.MatchNoteText = {
+        $n = 0; foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $n++ } }
+        $script:ui.MatchNote.Text = if ($n -lt 2) { 'applies when both Stale and Risk are set' }
+                                    elseif ($script:ui.MatchAny.IsChecked) { 'agents matching either Stale or Risk' } else { 'agents matching both Stale and Risk' }
+    }
+    $script:ctx.Refilter = { & $script:ctx.MatchNoteText; $script:ctx.View.Refresh(); & $script:ctx.Summary; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
 
     $script:ctx.Load = {
         & $script:ctx.Busy 'Loading the catalog...'
@@ -934,7 +951,7 @@ function New-ConsoleWindow {
     $script:ctx.ResetFilters = {
         $script:ctx.Resetting = $true
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
-        $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false
+        $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
         & $script:ctx.ClearStale; & $script:ctx.ClearRisk
         $script:ctx.Resetting = $false
     }
@@ -1034,6 +1051,7 @@ function New-ConsoleWindow {
     $script:ui.Search.Add_TextChanged({ & $script:ctx.Refilter })
     foreach ($b in 'FltAll', 'FltActive', 'FltBlocked') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
     $script:ui.AgentsOnlyBox.Add_Click({ & $script:ctx.Refilter })
+    foreach ($b in 'MatchAll', 'MatchAny') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
     $script:ui.StaleBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunStale } })
     $script:ui.NeverSeenBox.Add_Click({ if ($script:ui.StaleBox.SelectedIndex -gt 0) { & $script:ctx.RunStale } })
     $script:ui.RiskBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunRisk } })
