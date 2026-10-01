@@ -379,3 +379,29 @@ Describe 'Snapshots' {
         ($c | Where-Object Change -eq 'Owner changed').Id | Should -Be 'T_a'
     }
 }
+
+Describe 'Find-DirectoryUsers' {
+    BeforeEach {
+        $script:uri = ''
+        Mock Invoke-Graph {
+            $script:uri = $Uri
+            [pscustomobject]@{ value = @(
+                [pscustomobject]@{ id = 'u1'; displayName = 'Zed'; userPrincipalName = 'zed@contoso.com'; accountEnabled = $true },
+                [pscustomobject]@{ id = 'u2'; displayName = 'Ann'; userPrincipalName = 'ann@contoso.com'; accountEnabled = $true },
+                [pscustomobject]@{ id = 'u3'; displayName = 'Off'; userPrincipalName = 'off@contoso.com'; accountEnabled = $false }) }
+        }
+    }
+    It 'returns enabled users only, sorted by name' {
+        (Find-DirectoryUsers -Text '').Name | Should -Be @('Ann', 'Zed')
+    }
+    It 'sends no filter for an empty search and a startswith filter otherwise' {
+        Find-DirectoryUsers -Text '' | Out-Null
+        $script:uri | Should -Not -Match 'filter'
+        Find-DirectoryUsers -Text 'ak' | Out-Null
+        [uri]::UnescapeDataString($script:uri) | Should -Match "startswith\(displayName,'ak'\) or startswith\(userPrincipalName,'ak'\) or startswith\(mail,'ak'\)"
+    }
+    It 'escapes single quotes in the search text' {
+        Find-DirectoryUsers -Text "o'brien" | Out-Null
+        [uri]::UnescapeDataString($script:uri) | Should -Match "'o''brien'"
+    }
+}

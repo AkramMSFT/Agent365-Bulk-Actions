@@ -1438,31 +1438,91 @@ function New-ConfirmDialog {
 $OwnerPromptXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Assign owner" Width="480" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        Title="Assign owner" Width="540" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <StackPanel Margin="28,24,28,22">
     <TextBlock Text="Assign owner" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
     <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
-    <TextBox x:Name="Upn" Padding="10,8" BorderBrush="#D1D5DB" FontSize="14"/>
-    <TextBlock Text="Enter the new owner's user principal name (for example alex@contoso.com). The account must exist and be enabled." Foreground="#6B7280" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"/>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+    <Grid>
+      <TextBox x:Name="Search" Padding="10,8" BorderBrush="#D1D5DB" FontSize="14"/>
+      <TextBlock Text="Search by name or email" Foreground="#9CA3AF" IsHitTestVisible="False" Margin="12,0,0,0" VerticalAlignment="Center" FontSize="14">
+        <TextBlock.Style>
+          <Style TargetType="TextBlock">
+            <Setter Property="Visibility" Value="Collapsed"/>
+            <Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=Search}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
+          </Style>
+        </TextBlock.Style>
+      </TextBlock>
+    </Grid>
+    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Margin="0,10,0,0" Background="#F9FAFB">
+      <ListBox x:Name="Users" Height="230" BorderThickness="0" Background="Transparent" Padding="4" HorizontalContentAlignment="Stretch"/>
+    </Border>
+    <TextBlock x:Name="Note" Foreground="#6B7280" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
       <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" MinWidth="100" Margin="0,0,10,0"/>
-      <Button x:Name="BtnOk" Content="Assign" Style="{DynamicResource BtnAccent}" IsDefault="True" MinWidth="120"/>
+      <Button x:Name="BtnOk" Content="Assign" Style="{DynamicResource BtnAccent}" IsDefault="True" MinWidth="120" IsEnabled="False"/>
     </StackPanel>
   </StackPanel>
 </Window>
 '@
 
-# Ask for the new owner. Returns the entered UPN or $null when cancelled.
-function Read-OwnerPrompt {
+# Enabled users from Entra whose name, sign-in name or email starts with the text (all users, first page, when empty).
+function Find-DirectoryUsers {
+    param([string]$Text, [int]$Top = 40)
+    $uri = "https://graph.microsoft.com/v1.0/users?`$top=$Top&`$select=id,displayName,userPrincipalName,mail,accountEnabled"
+    $q = $Text.Trim()
+    if ($q) {
+        $e = $q.Replace("'", "''")
+        $uri += "&`$filter=" + [uri]::EscapeDataString("startswith(displayName,'$e') or startswith(userPrincipalName,'$e') or startswith(mail,'$e')")
+    }
+    $r = Invoke-Graph -Uri $uri
+    @($r.value | Where-Object { $_.accountEnabled } | Sort-Object displayName |
+        ForEach-Object { [pscustomobject]@{ Id = $_.id; Name = $_.displayName; Upn = $_.userPrincipalName; Enabled = $true } })
+}
+
+# Build the owner picker window: type to search Entra, pick a person, Assign.
+function New-OwnerPicker {
     param([int]$Count, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($OwnerPromptXaml)
     if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
-    $d.FindName('Info').Text = "The selected $Count agent(s) will be assigned to this user."
-    $script:ownerDialog = $d
-    $d.FindName('BtnOk').Add_Click({ $script:ownerDialog.DialogResult = $true })
-    $d.Add_ContentRendered({ $script:ownerDialog.FindName('Upn').Focus() })
-    if ($d.ShowDialog()) { $v = $d.FindName('Upn').Text.Trim(); if ($v) { return $v } }
+    $d.FindName('Info').Text = "The selected $Count agent(s) will be assigned to the person you pick."
+    $script:picker = @{ Window = $d; Search = $d.FindName('Search'); List = $d.FindName('Users'); Ok = $d.FindName('BtnOk'); Note = $d.FindName('Note'); Chosen = $null }
+    $script:picker.Run = {
+        $script:picker.Note.Text = 'Searching...'
+        try {
+            $found = @(Find-DirectoryUsers -Text $script:picker.Search.Text)
+            $script:picker.List.Items.Clear()
+            foreach ($u in $found) {
+                $item = New-Object Windows.Controls.ListBoxItem
+                $item.Content = ('{0}    ({1})' -f $u.Name, $u.Upn); $item.Tag = $u; $item.Padding = '8,6'
+                [void]$script:picker.List.Items.Add($item)
+            }
+            $script:picker.Note.Text = if ($found.Count -eq 0) { 'No matching enabled users.' }
+                                       elseif ($found.Count -ge 40) { 'Showing the first 40. Type more to narrow the list.' }
+                                       else { "$($found.Count) user(s). Select one." }
+        } catch { $script:picker.Note.Text = 'Could not read the directory: ' + $_.Exception.Message }
+    }
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(350)
+    $script:picker.Timer = $timer
+    $timer.Add_Tick({ $script:picker.Timer.Stop(); & $script:picker.Run })
+    $script:picker.Search.Add_TextChanged({ $script:picker.Timer.Stop(); $script:picker.Timer.Start() })
+    $script:picker.List.Add_SelectionChanged({
+        $sel = $script:picker.List.SelectedItem
+        $script:picker.Chosen = if ($sel) { $sel.Tag } else { $null }
+        $script:picker.Ok.IsEnabled = [bool]$script:picker.Chosen
+    })
+    $script:picker.List.Add_MouseDoubleClick({ if ($script:picker.Chosen) { $script:picker.Window.DialogResult = $true } })
+    $script:picker.Ok.Add_Click({ $script:picker.Window.DialogResult = $true })
+    $d.Add_ContentRendered({ $script:picker.Search.Focus(); if ($script:picker.List.Items.Count -eq 0) { & $script:picker.Run } })
+    $d
+}
+
+# Ask who should own the selected agents. Returns the chosen user ({ Id, Name, Upn }) or $null when cancelled.
+function Read-OwnerPrompt {
+    param([int]$Count, [System.Windows.Window]$Owner)
+    $d = New-OwnerPicker -Count $Count -Owner $Owner
+    if ($d.ShowDialog() -and $script:picker.Chosen) { return $script:picker.Chosen }
     $null
 }
 
@@ -1787,10 +1847,8 @@ function New-ConsoleWindow {
     $script:ui.BtnAssign.Add_Click({
         $rows = @($script:ctx.Rows | Where-Object { $_.Checked })
         if ($rows.Count -eq 0) { return }
-        $upn = Read-OwnerPrompt -Count $rows.Count -Owner $script:w
-        if (-not $upn) { return }
-        $owner = Get-UserInfo $upn
-        if (-not $owner.Exists -or -not $owner.Enabled) { [void][Windows.MessageBox]::Show("'$upn' is not an existing, enabled user.", 'Assign owner', 'OK', 'Warning'); return }
+        $owner = Read-OwnerPrompt -Count $rows.Count -Owner $script:w
+        if (-not $owner) { return }
         $items = @($rows | Where-Object { $_.Package.ownerId -ne $owner.Id } | ForEach-Object {
             [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn; Source = 'Manual' } })
         if ($items.Count -eq 0) { & $script:ctx.Idle 'Those agents already belong to that user.'; return }
