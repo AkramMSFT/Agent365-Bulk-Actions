@@ -135,7 +135,9 @@ Opens a Windows desktop window over the same catalog. It needs Windows and Power
 - **Browse**: the window opens on every agent in the catalog with no filter applied. Search by name, publisher, platform or id; filter All / Active / Blocked; optionally limit to Copilot agents.
 - **Filter**: the *Stale* and *Risk* dropdowns default to **None**. Pick a value to narrow the grid (no activity for 7 to 29 days, not modified for 30 to 365 days, or risk severity from Informational up to High, taken from alerts, detections or both); the matching columns fill in. The *Match* toggle controls how Stale and Risk combine: **All** (the default) needs both, **Any** accepts either. Search, status and Copilot-only always narrow on top. **Reset filters** returns everything to the unfiltered view.
 - **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A "Confirm the action" dialog lists the agents and offers Cancel (the default) or the matching Block or Unblock button. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
-- **Undo last run** reverses the previous action in the window. **Export list** saves what the grid shows as CSV or JSON.
+- **Ownership and blocked-for filters**: *Ownership > Needs an owner* lists shared agents with no usable owner, with a suggested replacement. Select rows and use **Apply suggested** or **Assign owner...**. *Blocked* shows how long agents have stayed blocked (delete candidates). The grid shows only the columns relevant to the filters you turned on.
+- **Also disable identity** next to Block and Unblock adds the Entra identity step. The confirmation dialog shows each agent's active users and last use.
+- **Undo last run** reverses the previous block or unblock in the window. **Export** saves what the grid shows as CSV or JSON.
 
 ### Ownership: ownerless and orphaned agents
 
@@ -163,6 +165,23 @@ Notes:
 - Only **shared** agents are considered. Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
 - Reassign is **delegated-only** (the API has no application permission), so it cannot run unattended.
 - The mode needs `User.Read.All` and `AgentIdentity.Read.All` in addition to `CopilotPackages.ReadWrite.All`.
+
+### Containment, impact and clean-up
+
+```powershell
+# Block and also disable the agent's Entra identity (unblock re-enables it). Only agents that have an identity are affected.
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -DisableIdentity -OutFile .\run.csv
+
+# See who would lose each agent before acting: active users, sessions and last use
+.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Impact -Action list
+
+# Blocked agents that have stayed blocked 30+ days (candidates for deletion)
+.\Agent365-Bulk-Actions.ps1 -DeleteCandidates -MinDaysBlocked 30 -OutFile .\delete-candidates.csv
+```
+
+- **`-DisableIdentity`** blocks the package and also disables the agent's Entra identity, so the agent cannot sign in at runtime as well as disappearing from the catalog. Unblock re-enables it. It needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role. The result log records the identity outcome per agent.
+- **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
+- **`-DeleteCandidates`** does not delete anything. The catalog API has no delete, and nothing deletes blocked agents automatically; a block lasts until someone reverses it. The report lists blocked agents that have been blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files, plus the GUI's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add other log files or folders with `-History`) and from the `BlockedAgent` audit events, which Defender keeps for about 30 days. Agents whose block date cannot be determined are skipped unless you add `-IncludeUnknown`. Delete the listed agents in the admin center (**Agents > All agents > Delete**, then **Deleted > Permanently delete**), or for Copilot Studio agents through the Power Platform API.
 
 ### Risky agents
 
@@ -197,6 +216,11 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-Ownerless` | switch | Find shared agents whose owner is missing or gone and propose a replacement. Default is a preview; add `-Action reassign` to apply. |
 | `-Reassign` | names and/or ids | Manually assign the listed agents to the user given by `-To`. |
 | `-To` | UPN or object id | The new owner for `-Reassign`. |
+| `-DisableIdentity` | switch | Block also disables the agent's Entra identity; unblock re-enables it. |
+| `-Impact` | switch | Show active users, sessions and last use for each target before acting. |
+| `-DeleteCandidates` | switch | List agents that have stayed blocked at least `-MinDaysBlocked` days (default 30). Reports only; nothing is deleted. |
+| `-History` | paths | Extra result logs or folders that record when agents were blocked. |
+| `-IncludeUnknown` | switch | With `-DeleteCandidates`, also list blocked agents whose block date is unknown. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |

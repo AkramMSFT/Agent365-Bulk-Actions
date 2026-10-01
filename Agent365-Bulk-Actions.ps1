@@ -841,7 +841,7 @@ function Get-DeleteCandidates {
 $GuiXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Agent 365 Bulk Actions" Width="1280" Height="780" MinWidth="1000" MinHeight="560"
+        Title="Agent 365 Bulk Actions" Width="1380" Height="780" MinWidth="1100" MinHeight="560"
         WindowStartupLocation="CenterScreen" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Window.Resources>
@@ -1000,6 +1000,7 @@ $GuiXaml = @'
           <CheckBox x:Name="AgentsOnlyBox" Grid.Column="3" Content="Copilot agents only" VerticalAlignment="Center"/>
         </Grid>
         <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
+          <StackPanel>
           <WrapPanel VerticalAlignment="Center">
             <TextBlock Text="FILTER BY" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
             <TextBlock Text="Stale" VerticalAlignment="Center" Margin="0,0,8,0"/>
@@ -1031,6 +1032,23 @@ $GuiXaml = @'
               <ComboBoxItem Content="Alerts only" Tag="Alerts"/>
               <ComboBoxItem Content="Detections only" Tag="Detections"/>
             </ComboBox>
+          </WrapPanel>
+          <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
+            <TextBlock Text="" Width="84"/>
+            <TextBlock Text="Ownership" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="OwnerBox" Width="190" SelectedIndex="0" ToolTip="Shared agents whose owner is missing, deleted or disabled, with a suggested replacement">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Needs an owner" Tag="needs"/>
+            </ComboBox>
+            <TextBlock Text="Blocked" VerticalAlignment="Center" Margin="14,0,8,0"/>
+            <ComboBox x:Name="BlockedBox" Width="165" SelectedIndex="0" ToolTip="How long an agent has stayed blocked, from this tool's logs and the 30-day audit trail">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Any time" Tag="0"/>
+              <ComboBoxItem Content="7+ days" Tag="7"/>
+              <ComboBoxItem Content="30+ days" Tag="30"/>
+              <ComboBoxItem Content="60+ days" Tag="60"/>
+              <ComboBoxItem Content="90+ days" Tag="90"/>
+            </ComboBox>
             <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
             <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
             <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
@@ -1041,6 +1059,7 @@ $GuiXaml = @'
             </Border>
             <TextBlock x:Name="MatchNote" Visibility="Collapsed"/>
           </WrapPanel>
+          </StackPanel>
         </Border>
       </Grid>
     </Border>
@@ -1081,7 +1100,9 @@ $GuiXaml = @'
             </DataGridTemplateColumn>
             <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Owner" Binding="{Binding Owner}" Width="1.4*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
+            <DataGridTextColumn Header="Blocked for" Binding="{Binding BlockedFor}" Width="95" SortMemberPath="BlockedForSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
             <DataGridTextColumn Header="Idle days" Binding="{Binding Idle}" Width="80" SortMemberPath="IdleSort" IsReadOnly="True"/>
             <DataGridTemplateColumn Header="Risk" Width="110" SortMemberPath="RiskSort" IsReadOnly="True">
@@ -1102,6 +1123,8 @@ $GuiXaml = @'
             <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Suggested owner" Binding="{Binding Suggested}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Ownership note" Binding="{Binding OwnerNote}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
           </DataGrid.Columns>
         </DataGrid>
         <StackPanel x:Name="EmptyNote" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed">
@@ -1119,8 +1142,11 @@ $GuiXaml = @'
           <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="BtnExport" Content="Export list" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,22,0" IsEnabled="False"/>
+          <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" Visibility="Collapsed"/>
+          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False"/>
+          <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,18,0" IsEnabled="False"/>
+          <CheckBox x:Name="IdentityBox" Content="Also disable identity" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Block disables the agent's Entra identity (so it cannot sign in); Unblock re-enables it. Only agents that have an identity are affected."/>
           <Button x:Name="BtnUnblock" Content="Unblock selected" Style="{StaticResource BtnGood}" Margin="0,0,10,0" MinWidth="150" IsEnabled="False"/>
           <Button x:Name="BtnBlock" Content="Block selected" Style="{StaticResource BtnDanger}" MinWidth="150" IsEnabled="False"/>
         </StackPanel>
@@ -1138,7 +1164,7 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -1197,7 +1223,15 @@ function New-ConfirmDialog {
     $noun = if ($count -eq 1) { 'agent' } else { 'agents' }
     $d.FindName('Message').Text = "You are about to $($Verb.ToLower()) $count $noun."
     $names = $d.FindName('Names')
-    foreach ($r in @($Rows) | Select-Object -First 50) { [void]$names.Items.Add($r.Name) }
+    $usage = @{}
+    if ($count -le 25) {
+        try { $pk = @($Rows | ForEach-Object { $_.Package }); Add-PackageUsage $pk | Out-Null; foreach ($q in $pk) { $usage[$q.id] = $q } } catch { $null = $_ }
+    }
+    foreach ($r in @($Rows) | Select-Object -First 50) {
+        $x = $usage[$r.Id]
+        $label = if ($x -and $null -ne $x.ActiveUsers) { "{0}    ({1} active users, last used {2})" -f $r.Name, $x.ActiveUsers, $x.LastUsed } else { $r.Name }
+        [void]$names.Items.Add($label)
+    }
     if ($count -gt 50) { [void]$names.Items.Add("... and $($count - 50) more") }
     $ok = $d.FindName('BtnOk'); $ok.Content = "$Verb $count $noun"
     if ($Verb -eq 'Unblock') {
@@ -1209,16 +1243,55 @@ function New-ConfirmDialog {
     $d
 }
 
+$OwnerPromptXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Assign owner" Width="480" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <StackPanel Margin="28,24,28,22">
+    <TextBlock Text="Assign owner" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
+    <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
+    <TextBox x:Name="Upn" Padding="10,8" BorderBrush="#D1D5DB" FontSize="14"/>
+    <TextBlock Text="Enter the new owner's user principal name (for example alex@contoso.com). The account must exist and be enabled." Foreground="#6B7280" FontSize="12" Margin="0,8,0,0" TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+      <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" MinWidth="100" Margin="0,0,10,0"/>
+      <Button x:Name="BtnOk" Content="Assign" Style="{DynamicResource BtnAccent}" IsDefault="True" MinWidth="120"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+
+# Ask for the new owner. Returns the entered UPN or $null when cancelled.
+function Read-OwnerPrompt {
+    param([int]$Count, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($OwnerPromptXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $d.FindName('Info').Text = "The selected $Count agent(s) will be assigned to this user."
+    $script:ownerDialog = $d
+    $d.FindName('BtnOk').Add_Click({ $script:ownerDialog.DialogResult = $true })
+    $d.Add_ContentRendered({ $script:ownerDialog.FindName('Upn').Focus() })
+    if ($d.ShowDialog()) { $v = $d.FindName('Upn').Text.Trim(); if ($v) { return $v } }
+    $null
+}
+
+# Owner as shown in the grid: the UPN, a marker when the account is gone, blank when there is no owner.
+function Get-OwnerLabel {
+    param([object]$Package)
+    if (-not $Package.ownerId -or $Package.ownerId -eq '00000000-0000-0000-0000-000000000000') { return '' }
+    $u = Get-UserInfo $Package.ownerId
+    if ($u.Exists) { if ($u.Enabled) { $u.Upn } else { "$($u.Upn) (disabled)" } } else { '(account no longer exists)' }
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; StaleSet = $null; RiskSet = $null; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -1237,6 +1310,8 @@ function New-ConsoleWindow {
         $script:ui.BtnBlock.IsEnabled   = @($checked | Where-Object { -not $_.IsBlocked }).Count -gt 0
         $script:ui.BtnUnblock.IsEnabled = @($checked | Where-Object { $_.IsBlocked }).Count -gt 0
         $script:ui.BtnUndo.IsEnabled    = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
+        $script:ui.BtnAssign.IsEnabled  = $checked.Count -gt 0
+        $script:ui.BtnApplyOwner.IsEnabled = @($checked | Where-Object { $script:ctx.Suggest.ContainsKey($_.Id) }).Count -gt 0
         $shown = [int]$script:ui.CountShown.Text
         $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
         $script:ui.EmptyText.Text = if ($rows.Count -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
@@ -1247,6 +1322,10 @@ function New-ConsoleWindow {
         if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
         if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
+        if ($script:ctx.OwnerSet   -and -not $script:ctx.OwnerSet.Contains($o.Id))   { return $false }
+        if ($script:ctx.BlockedSet -and -not $script:ctx.BlockedSet.Contains($o.Id)) { return $false }
+        if ($null -ne $script:ctx.OwnerSet   -and $script:ctx.OwnerSet.Count -eq 0)   { return $false }
+        if ($null -ne $script:ctx.BlockedSet -and $script:ctx.BlockedSet.Count -eq 0) { return $false }
         $sets = @(); foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $sets += , $s } }
         if ($sets.Count) {
             $hits = @($sets | Where-Object { $_.Contains($o.Id) }).Count
@@ -1261,14 +1340,15 @@ function New-ConsoleWindow {
 
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
-               $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet)
+               $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
+               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet)
     }
     $script:ctx.MatchNoteText = {
         $n = 0; foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $n++ } }
         $script:ui.MatchNote.Text = if ($n -lt 2) { 'applies when both Stale and Risk are set' }
                                     elseif ($script:ui.MatchAny.IsChecked) { 'agents matching either Stale or Risk' } else { 'agents matching both Stale and Risk' }
     }
-    $script:ctx.Refilter = { & $script:ctx.MatchNoteText; $script:ctx.View.Refresh(); & $script:ctx.Summary; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
+    $script:ctx.Refilter = { & $script:ctx.MatchNoteText; $script:ctx.View.Refresh(); & $script:ctx.Summary; & $script:ctx.Columns; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
 
     $script:ctx.Load = {
         & $script:ctx.Busy 'Loading the catalog...'
@@ -1280,6 +1360,7 @@ function New-ConsoleWindow {
                 $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
                 $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { [string]$p.type }
                 $r.Hosts = ($p.supportedHosts) -join ','
+                $r.Owner = Get-OwnerLabel $p
                 $r.IsBlocked = [bool]$p.isBlocked
                 $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
                 $r.Package = $p
@@ -1300,10 +1381,106 @@ function New-ConsoleWindow {
         $script:ctx.Resetting = $true
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
         $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
-        & $script:ctx.ClearStale; & $script:ctx.ClearRisk
+        $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0
+        & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked
         $script:ctx.Resetting = $false
     }
 
+    # Show only the columns that matter for the filters that are on.
+    $script:ctx.Columns = {
+        $on = @{
+            'Last activity' = ($null -ne $script:ctx.StaleSet); 'Idle days' = ($null -ne $script:ctx.StaleSet)
+            'Risk' = ($null -ne $script:ctx.RiskSet); 'Alerts' = ($null -ne $script:ctx.RiskSet); 'Detections' = ($null -ne $script:ctx.RiskSet); 'Why' = ($null -ne $script:ctx.RiskSet)
+            'Suggested owner' = ($null -ne $script:ctx.OwnerSet); 'Ownership note' = ($null -ne $script:ctx.OwnerSet)
+            'Blocked for' = ($null -ne $script:ctx.BlockedSet)
+        }
+        $script:ui.BtnApplyOwner.Visibility = if ($null -ne $script:ctx.OwnerSet) { 'Visible' } else { 'Collapsed' }
+        foreach ($c in $script:ui.Grid.Columns) {
+            if ($c.Header -is [string] -and $on.ContainsKey($c.Header)) { $c.Visibility = if ($on[$c.Header]) { 'Visible' } else { 'Collapsed' } }
+        }
+    }
+
+    $script:ctx.ClearOwner = {
+        foreach ($r in $script:ctx.Rows) { $r.Suggested = ''; $r.OwnerNote = '' }
+        $script:ctx.OwnerSet = $null; $script:ctx.Suggest = @{}
+    }
+    $script:ctx.ClearBlocked = {
+        foreach ($r in $script:ctx.Rows) { $r.BlockedFor = ''; $r.BlockedForSort = -1 }
+        $script:ctx.BlockedSet = $null
+    }
+
+    # Shared agents without a usable owner, each with the replacement the resolver would pick.
+    $script:ctx.RunOwner = {
+        & $script:ctx.ClearOwner
+        if (-not [string]$script:ui.OwnerBox.SelectedItem.Tag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Ownership filter cleared.'; return }
+        & $script:ctx.Busy 'Checking owners of shared agents...'
+        try {
+            $report = Get-OwnerReport -Packages @($script:ctx.Rows | ForEach-Object { $_.Package })
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($i in $report.Items) {
+                [void]$set.Add($i.Id)
+                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $i.Id } | Select-Object -First 1
+                if (-not $row) { continue }
+                $row.OwnerNote = $i.Reason
+                if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
+            }
+            $script:ctx.OwnerSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} shared agent(s) need an owner: {1} with a suggestion, {2} to assign manually. {3} org-published agent(s) have no owner but cannot be reassigned through the API." -f
+                $report.Items.Count, $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.OrgPublished)
+        } catch {
+            $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Ownership check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Ownership', 'OK', 'Error')
+        }
+    }
+
+    # Agents that have stayed blocked for the chosen number of days.
+    $script:ctx.RunBlocked = {
+        & $script:ctx.ClearBlocked
+        $tag = [string]$script:ui.BlockedBox.SelectedItem.Tag
+        if (-not $tag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Blocked filter cleared.'; return }
+        & $script:ctx.Busy 'Looking up when agents were blocked...'
+        try {
+            $days = [int]$tag
+            $found = @(Get-DeleteCandidates -MinDays $days -IncludeUnknown:($days -eq 0))
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($c in $found) {
+                [void]$set.Add($c.Id)
+                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $c.Id } | Select-Object -First 1
+                if (-not $row) { continue }
+                $row.BlockedFor = if ($null -ne $c.DaysBlocked) { "$($c.DaysBlocked) days" } else { 'unknown' }
+                $row.BlockedForSort = if ($null -ne $c.DaysBlocked) { [int]$c.DaysBlocked } else { -1 }
+            }
+            $script:ctx.BlockedSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} agent(s) blocked {1}. Delete them in the admin center (Agents > All agents > Delete); the catalog API has no delete." -f $found.Count, $(if ($days -eq 0) { 'for any time' } else { "$days+ days" }))
+        } catch {
+            $script:ui.BlockedBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Blocked filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Blocked filter', 'OK', 'Error')
+        }
+    }
+
+    # Reassign the given rows through the shared reassign routine and refresh the Owner column.
+    $script:ctx.ReassignRows = {
+        param([object[]]$Items, [string]$Label)
+        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script:OutFile = Join-Path $dir ('owners-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.Busy ("Reassigning {0} agent(s)..." -f $Items.Count)
+        $recs = @(Invoke-OwnerReassign -Items $Items -PassThru)
+        foreach ($rec in $recs) {
+            if ($rec.Result -ne 'Done') { continue }
+            $row = $script:ctx.Rows | Where-Object { $_.Id -eq $rec.Id } | Select-Object -First 1
+            if ($row) { $row.Package.ownerId = $rec.NewOwner; $row.Owner = Get-OwnerLabel $row.Package; $row.Checked = $false }
+        }
+        $done = @($recs | Where-Object { $_.Result -eq 'Done' }).Count; $failed = @($recs | Where-Object { $_.Result -eq 'Failed' }).Count
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("{0}: {1} reassigned, {2} failed. Log: {3}" -f $Label, $done, $failed, $script:OutFile)
+        if ($failed) {
+            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some reassignments failed', 'OK', 'Warning')
+        }
+    }
     # Run the stale finder for the current dropdown value (or clear it for "None").
     $script:ctx.RunStale = {
         $tag = [string]$script:ui.StaleBox.SelectedItem.Tag
@@ -1372,6 +1549,7 @@ function New-ConsoleWindow {
         $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $script:OutFile = Join-Path $dir ('run-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        $script:DisableIdentity = [bool]$script:ui.IdentityBox.IsChecked
         & $script:ctx.Busy ("{0}ing {1} agent(s)..." -f $Verb.TrimEnd('e'), $Rows.Count)
         $recs = @(Invoke-PackageAction -Packages @($Rows | ForEach-Object { $_.Package | Add-Member -NotePropertyName isBlocked -NotePropertyValue $_.IsBlocked -Force -PassThru }) -Action $Verb.ToLower() -PassThru)
         foreach ($rec in $recs) {
@@ -1401,6 +1579,31 @@ function New-ConsoleWindow {
     $script:ui.NeverSeenBox.Add_Click({ if ($script:ui.StaleBox.SelectedIndex -gt 0) { & $script:ctx.RunStale } })
     $script:ui.RiskBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunRisk } })
     $script:ui.SignalBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting -and $script:ui.RiskBox.SelectedIndex -gt 0) { & $script:ctx.RunRisk } })
+    $script:ui.OwnerBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunOwner } })
+    $script:ui.BlockedBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunBlocked } })
+
+    $script:ui.BtnApplyOwner.Add_Click({
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $script:ctx.Suggest.ContainsKey($_.Id) })
+        if ($rows.Count -eq 0) { return }
+        $items = @($rows | ForEach-Object { $s = $script:ctx.Suggest[$_.Id]
+            [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $s.ProposedId; NewOwnerUpn = $s.Proposed; Source = $s.Source } })
+        $names = ($items | Select-Object -First 12 | ForEach-Object { "  - $($_.DisplayName)  ->  $($_.NewOwnerUpn)" }) -join "`n"
+        if ([Windows.MessageBox]::Show("Assign the suggested owner to $($items.Count) agent(s)?`n`n$names", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+        & $script:ctx.ReassignRows $items 'Apply suggested owners'
+    })
+
+    $script:ui.BtnAssign.Add_Click({
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked })
+        if ($rows.Count -eq 0) { return }
+        $upn = Read-OwnerPrompt -Count $rows.Count -Owner $script:w
+        if (-not $upn) { return }
+        $owner = Get-UserInfo $upn
+        if (-not $owner.Exists -or -not $owner.Enabled) { [void][Windows.MessageBox]::Show("'$upn' is not an existing, enabled user.", 'Assign owner', 'OK', 'Warning'); return }
+        $items = @($rows | Where-Object { $_.Package.ownerId -ne $owner.Id } | ForEach-Object {
+            [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn; Source = 'Manual' } })
+        if ($items.Count -eq 0) { & $script:ctx.Idle 'Those agents already belong to that user.'; return }
+        & $script:ctx.ReassignRows $items 'Assign owner'
+    })
     $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
     $script:ui.BtnSelectVisible.Add_Click({ foreach ($r in $script:ctx.View) { $r.Checked = $true }; & $script:ctx.Summary })
     $script:ui.BtnClearSel.Add_Click({ foreach ($r in $script:ctx.Rows) { $r.Checked = $false }; & $script:ctx.Summary })
@@ -1493,8 +1696,18 @@ switch ($PSCmdlet.ParameterSetName) {
         if (-not (Test-Path -LiteralPath $Undo)) { throw "Log not found: $Undo" }
         $rows = if ($Undo -match '\.json$') { @(Get-Content -Raw -LiteralPath $Undo | ConvertFrom-Json) }
                 else { @(Import-Csv -LiteralPath $Undo) }
-        $changed = @($rows | Where-Object { $_.Result -eq 'Done' })
-        if ($changed.Count -eq 0) { Write-Host 'The log has no changes to undo.'; break }
+        $changed = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'unblock' })
+        $ownerChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'reassign' })
+        if ($ownerChanges.Count -gt 0) {
+            $back = foreach ($r in $ownerChanges) {
+                $prev = Get-UserInfo $r.WasOwner
+                if (-not $prev.Exists -or -not $prev.Enabled) { Write-Warning ('Cannot restore the owner of {0}: the previous owner no longer exists or is disabled.' -f $r.DisplayName); continue }
+                [pscustomobject]@{ Id = $r.Id; DisplayName = $r.DisplayName; CurrentOwnerId = $r.NewOwner; NewOwnerId = $prev.Id; NewOwnerUpn = $prev.Upn; Source = 'Undo' }
+            }
+            $back = @($back)
+            if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
+        }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $catalog = @(Get-Packages)
         $restore = @{ block = @(); unblock = @() }
         foreach ($r in $changed) {
