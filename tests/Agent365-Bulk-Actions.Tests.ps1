@@ -92,17 +92,52 @@ Describe 'Invoke-PackageAction' {
         ($log | Where-Object Id -eq 'P_1').Error | Should -Match 'boom'
         ($log | Where-Object Id -eq 'P_2').Result | Should -Be 'Done'
     }
-    It 'disables the agent identity on block and re-enables it on unblock when asked' {
-        $DisableIdentity = $true
-        $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
-        $log.Identity | Should -Be 'Disabled'
-        Should -Invoke Invoke-Graph -ParameterFilter { $Method -eq 'PATCH' -and $Uri -like '*ID-1*' -and $Body -match 'false' }
-        $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -Blocked $true -IdentityId 'ID-1') -Action unblock -PassThru
-        $log.Identity | Should -Be 'Enabled'
-    }
-    It 'leaves identities alone without -DisableIdentity' {
-        Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block | Out-Null
-        Should -Invoke Invoke-Graph -Times 0 -ParameterFilter { $Method -eq 'PATCH' }
+    Context 'identity check with -DisableIdentity' {
+        BeforeEach {
+            Mock Start-Sleep { }
+            Mock Set-AgentIdentityState { }
+            $DisableIdentity = $true
+        }
+        It 'records that the platform disabled the identity and does not call the identity API' {
+            Mock Get-AgentIdentityState { $false }
+            $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
+            $log.Identity | Should -Be 'Disabled (by platform)'
+            Should -Invoke Set-AgentIdentityState -Times 0
+        }
+        It 'waits for the platform and then records an unblock re-enabling the identity' {
+            $script:reads = 0
+            Mock Get-AgentIdentityState { $script:reads++; $script:reads -ge 2 }
+            $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -Blocked $true -IdentityId 'ID-1') -Action unblock -PassThru
+            $log.Identity | Should -Be 'Enabled (by platform)'
+            $script:reads | Should -BeGreaterOrEqual 2
+        }
+        It 'forces the change itself only when the platform left the identity in the wrong state' {
+            Mock Get-AgentIdentityState { $true }
+            $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
+            $log.Identity | Should -Be 'Disabled (by tool)'
+            Should -Invoke Set-AgentIdentityState -Times 1 -ParameterFilter { $AgentIdentityId -eq 'ID-1' -and $Enabled -eq $false }
+        }
+        It 'reports a failed forced change without failing the block' {
+            Mock Get-AgentIdentityState { $true }
+            Mock Set-AgentIdentityState { throw 'Forbidden' }
+            $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
+            $log.Result | Should -Be 'Done'
+            $log.Identity | Should -Be 'Failed'
+            $log.Error | Should -Match 'Forbidden'
+        }
+        It 'reports an unreadable identity without changing it' {
+            Mock Get-AgentIdentityState { $null }
+            $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
+            $log.Identity | Should -Be 'Unreadable'
+            Should -Invoke Set-AgentIdentityState -Times 0
+        }
+        It 'does nothing for identities without -DisableIdentity' {
+            $DisableIdentity = $false
+            Mock Get-AgentIdentityState { $true }
+            Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block | Out-Null
+            Should -Invoke Get-AgentIdentityState -Times 0
+            Should -Invoke Set-AgentIdentityState -Times 0
+        }
     }
 }
 

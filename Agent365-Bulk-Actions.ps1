@@ -181,7 +181,7 @@ param(
 
     [switch]$Force,                           # skip the "proceed?" confirmation for any write
 
-    [switch]$DisableIdentity,                 # block also DISABLES the agent's Entra identity; unblock re-enables it
+    [switch]$DisableIdentity,                 # make sure the agent's Entra identity ends up disabled on block (enabled on unblock): verified, forced only if the platform did not
 
     [switch]$Impact,                          # show active users, sessions and last use for each target before acting
 
@@ -227,7 +227,7 @@ $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackage
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
-if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.EnableDisable.All' }
+if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.Read.All', 'AgentIdentity.EnableDisable.All' }
 if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
@@ -877,6 +877,44 @@ function Set-AgentIdentityState {
         -Body (@{ accountEnabled = $Enabled } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
 }
 
+# Current accountEnabled of an agent identity, or $null when it cannot be read.
+function Get-AgentIdentityState {
+    param([string]$AgentIdentityId)
+    try { [bool](Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$AgentIdentityId/microsoft.graph.agentIdentity?`$select=id,accountEnabled").accountEnabled }
+    catch { $null }
+}
+
+# Blocking a package that has an Agent ID makes the platform disable that identity a few seconds later
+# (and unblock re-enables it). Wait for that, record what happened, and only call the identity API
+# ourselves for agents the platform left in the wrong state.
+function Confirm-AgentIdentityState {
+    param([object[]]$Records, [hashtable]$PackageById, [bool]$WantDisabled, [int]$WaitSeconds = 30)
+    $pending = @($Records | Where-Object { $_.Result -in 'Done', 'Skipped' -and $PackageById[$_.Id].agentIdentityId })
+    if ($pending.Count -eq 0) { return }
+    $wantEnabled = -not $WantDisabled
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ($pending.Count -gt 0) {
+        $still = @()
+        foreach ($rec in $pending) {
+            $state = Get-AgentIdentityState $PackageById[$rec.Id].agentIdentityId
+            if ($state -eq $wantEnabled) { $rec.Identity = if ($WantDisabled) { 'Disabled (by platform)' } else { 'Enabled (by platform)' } }
+            elseif ($null -eq $state) { $rec.Identity = 'Unreadable' }
+            else { $still += $rec }
+        }
+        $pending = $still
+        if ($pending.Count -eq 0 -or (Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds 3
+    }
+    foreach ($rec in $pending) {
+        try {
+            Set-AgentIdentityState -AgentIdentityId $PackageById[$rec.Id].agentIdentityId -Enabled $wantEnabled
+            $rec.Identity = if ($WantDisabled) { 'Disabled (by tool)' } else { 'Enabled (by tool)' }
+        } catch {
+            $rec.Identity = 'Failed'; $rec.Error = ($rec.Error + ' identity: ' + $_.Exception.Message).Trim()
+        }
+    }
+}
+
 # Apply block/unblock to each package; skip ones already in the target state, keep going on
 # error, then summarize. Honours -WhatIf and records the outcome per package. With
 # -DisableIdentity the agent's Entra identity is disabled on block and re-enabled on unblock.
@@ -909,17 +947,12 @@ function Invoke-PackageAction {
                 $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
             }
         }
-        if ($DisableIdentity -and $p.agentIdentityId -and $rec.Result -in 'Done', 'Skipped') {
-            try {
-                Set-AgentIdentityState -AgentIdentityId $p.agentIdentityId -Enabled (-not $want)
-                $rec.Identity = if ($want) { 'Disabled' } else { 'Enabled' }
-                Write-Host ("       identity {0}" -f $rec.Identity.ToLower()) -ForegroundColor DarkGreen
-            } catch {
-                $rec.Identity = 'Failed'; $rec.Error = ($rec.Error + ' identity: ' + $_.Exception.Message).Trim()
-                Write-Host ("       identity change failed -> {0}" -f $_.Exception.Message) -ForegroundColor Red
-            }
-        }
         $log += [pscustomobject]$rec
+    }
+    if ($DisableIdentity) {
+        $byId = @{}; foreach ($p in $Packages) { $byId[$p.id] = $p }
+        Confirm-AgentIdentityState -Records $log -PackageById $byId -WantDisabled $want
+        foreach ($r in ($log | Where-Object { $_.Identity })) { Write-Host ("  identity {0}: {1}" -f $r.Identity.ToLower(), $r.DisplayName) -ForegroundColor DarkGreen }
     }
     Write-Host ("Done: {0} {1}ed, {2} skipped, {3} failed." -f $ok, $Action, $skip, $fail) -ForegroundColor Cyan
     Export-ActionLog -Records $log
@@ -1305,7 +1338,7 @@ $GuiXaml = @'
           <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False"/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,18,0" IsEnabled="False"/>
-          <CheckBox x:Name="IdentityBox" Content="Also disable identity" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Block disables the agent's Entra identity (so it cannot sign in); Unblock re-enables it. Only agents that have an identity are affected."/>
+          <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
           <Button x:Name="BtnUnblock" Content="Unblock selected" Style="{StaticResource BtnGood}" Margin="0,0,10,0" MinWidth="150" IsEnabled="False"/>
           <Button x:Name="BtnBlock" Content="Block selected" Style="{StaticResource BtnDanger}" MinWidth="150" IsEnabled="False"/>
         </StackPanel>

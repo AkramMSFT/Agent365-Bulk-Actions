@@ -175,7 +175,7 @@ Notes:
 ### Containment, impact and clean-up
 
 ```powershell
-# Block and also disable the agent's Entra identity (unblock re-enables it). Only agents that have an identity are affected.
+# Block, then confirm each agent's Entra identity ended up disabled (unblock: enabled). Only agents that have an identity are checked.
 .\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -DisableIdentity -OutFile .\run.csv
 
 # See who would lose each agent before acting: active users, sessions and last use
@@ -185,7 +185,7 @@ Notes:
 .\Agent365-Bulk-Actions.ps1 -DeleteCandidates -MinDaysBlocked 30 -OutFile .\delete-candidates.csv
 ```
 
-- **`-DisableIdentity`** blocks the package and also disables the agent's Entra identity, so the agent cannot sign in at runtime as well as disappearing from the catalog. Unblock re-enables it. It needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role. The result log records the identity outcome per agent.
+- **`-DisableIdentity`** checks the agent's Entra identity after the block. Blocking a package that has an Agent ID already makes the platform disable that identity within about ten seconds, and unblocking re-enables it within seconds (observed on a Foundry agent; confirm for your other platforms). The tool waits up to 30 seconds, records `Disabled (by platform)` or `Enabled (by platform)` in the result log, and calls the identity API itself only if the platform left the identity in the wrong state (`Disabled (by tool)`, or `Failed` with the error). The forced path needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role.
 - **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
 - **`-DeleteCandidates`** does not delete anything. The catalog API has no delete, and nothing deletes blocked agents automatically; a block lasts until someone reverses it. The report lists blocked agents that have been blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files, plus the GUI's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add other log files or folders with `-History`) and from the `BlockedAgent` audit events, which Defender keeps for about 30 days. Agents whose block date cannot be determined are skipped unless you add `-IncludeUnknown`. Delete the listed agents in the admin center (**Agents > All agents > Delete**, then **Deleted > Permanently delete**), or for Copilot Studio agents through the Power Platform API.
 
@@ -268,7 +268,7 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-Ownerless` | switch | Find shared agents whose owner is missing or gone and propose a replacement. Default is a preview; add `-Action reassign` to apply. |
 | `-Reassign` | names and/or ids | Manually assign the listed agents to the user given by `-To`. |
 | `-To` | UPN or object id | The new owner for `-Reassign`. |
-| `-DisableIdentity` | switch | Block also disables the agent's Entra identity; unblock re-enables it. |
+| `-DisableIdentity` | switch | After block, verify the agent's Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
 | `-Impact` | switch | Show active users, sessions and last use for each target before acting. |
 | `-DeleteCandidates` | switch | List agents that have stayed blocked at least `-MinDaysBlocked` days (default 30). Reports only; nothing is deleted. |
 | `-History` | paths | Extra result logs or folders that record when agents were blocked. |
