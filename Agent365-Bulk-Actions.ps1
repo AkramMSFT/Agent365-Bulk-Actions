@@ -98,6 +98,18 @@ param(
     [Parameter(ParameterSetName = 'Reassign', Mandatory)]
     [string]$To,                             # UPN or object id of the new owner
 
+    [Parameter(ParameterSetName = 'Detail', Mandatory)]
+    [string]$Detail,                         # full picture of one agent (name or id): sharing, tools, MCP, permissions, identity, usage
+
+    [Parameter(ParameterSetName = 'Inventory', Mandatory)]
+    [switch]$Inventory,                      # one row per agent with kind, owner, tools, MCP servers, sharing (use -OutFile for csv/json)
+
+    [Parameter(ParameterSetName = 'Inventory')]
+    [switch]$Deep,                           # inventory: also read usage and availability per agent (one call each)
+
+    [Parameter(ParameterSetName = 'Inventory')]
+    [switch]$WithPermissions,                # inventory: also list each agent identity's Entra permissions
+
     [Parameter(ParameterSetName = 'Policy', Mandatory)]
     [string]$Policy,                         # path to a JSON policy file; prints the plan (no changes without -Apply)
 
@@ -177,6 +189,7 @@ param(
     [Parameter(ParameterSetName = 'Select')]
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
+    [Parameter(ParameterSetName = 'Inventory')]
     [switch]$AgentsOnly,                       # filter supportedHosts eq 'Copilot'
 
     [switch]$Force,                           # skip the "proceed?" confirmation for any write
@@ -220,7 +233,7 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
-$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot')) -or
+$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory')) -or
             ($PSCmdlet.ParameterSetName -eq 'Policy' -and -not $Apply) -or
             ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
@@ -228,7 +241,8 @@ if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
 if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.Read.All', 'AgentIdentity.EnableDisable.All' }
-if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
@@ -558,6 +572,220 @@ function Compare-Snapshot {
         if (-not $curById.ContainsKey([string]$o.id)) { $out += [pscustomobject]@{ Change = 'Removed'; Agent = $o.displayName; Id = $o.id; Detail = "$($o.type)" } }
     }
     $out
+}
+
+# ---------------------------------------------------------------------------------------------
+# Agent detail: one model that joins the catalog record, Defender's AgentsInfo and Entra, used by
+# -Detail, -Inventory and the console's details window.
+# ---------------------------------------------------------------------------------------------
+$script:ResourceCache = @{}
+
+# Hunting results arrive as arrays, JSON text, or single objects; normalise to a list of objects.
+function ConvertTo-ObjectList {
+    param($Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) {
+        $s = $Value.Trim()
+        if (-not $s -or $s -eq 'null') { return @() }
+        if ($s.StartsWith('[') -or $s.StartsWith('{')) { try { return @(ConvertFrom-Json $s) } catch { return @($s) } }
+        return @($s)
+    }
+    # Each array element can itself be a JSON document held as text.
+    foreach ($item in @($Value)) {
+        if ($item -is [string] -and ($item.TrimStart().StartsWith('{') -or $item.TrimStart().StartsWith('['))) { try { ConvertFrom-Json $item } catch { $item } }
+        else { $item }
+    }
+}
+
+# A short text for a list of tools, servers or data sources: their names, one per entry.
+function Get-NameText {
+    param($Items, [string]$Property = 'name')
+    $names = foreach ($i in (ConvertTo-ObjectList $Items)) {
+        if ($i -is [string]) { $i } elseif ($i.$Property) { [string]$i.$Property } elseif ($i.Name) { [string]$i.Name } else { ($i | ConvertTo-Json -Compress -Depth 2) }
+    }
+    (@($names | Where-Object { $_ }) -join '; ')
+}
+
+function Get-TypeLabel {
+    param([string]$Type)
+    switch ($Type) { 'firstParty' { 'Microsoft' } 'thirdParty' { 'Partner or store app' } 'lob' { 'Org-published' } 'shared' { 'Shared by a creator' } default { $Type } }
+}
+
+# One query for every agent's declared tools, MCP servers, data sources, channels and sharing, keyed by catalog id.
+function Get-AgentInfoTable {
+    param([string]$TitleId)
+    $where = if ($TitleId) { "| where tolower(tostring(r.titleId)) == '$($TitleId.ToLower().Replace("'", ''))'" } else { '' }
+    $kql = 'AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | extend r = todynamic(RawAgentInfo) ' + $where +
+           ' | project TitleId = tolower(tostring(r.titleId)), Name, Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
+           ' EntraAgentID = tostring(EntraAgentID), EntraBlueprintID = tostring(EntraBlueprintID), Owners, SharedWith, DeclaredTools, McpServers,' +
+           ' DeclaredDataSources, Capabilities, ConnectedAgents, Endpoints, Triggers, Instructions = substring(tostring(Instructions), 0, 1500)'
+    $rows = Invoke-HuntingQuery -Query $kql -Hint 'Detail columns need Defender Advanced Hunting (ThreatHunting.Read.All).'
+    $table = @{}
+    foreach ($row in $rows) {
+        if (-not $row.TitleId) { continue }
+        $table[[string]$row.TitleId] = [pscustomobject]@{
+            Platform = $row.Platform; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
+            Channels = @(ConvertTo-ObjectList $row.Channels | ForEach-Object { "$_".Split(' ') } | Where-Object { $_ })
+            Tools = @(ConvertTo-ObjectList $row.DeclaredTools | ForEach-Object {
+                [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
+            McpServers = @(ConvertTo-ObjectList $row.McpServers | ForEach-Object {
+                [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
+            DataSources = @(ConvertTo-ObjectList $row.DeclaredDataSources | ForEach-Object { "$_" } | Where-Object { $_ })
+            Capabilities = @(ConvertTo-ObjectList $row.Capabilities | ForEach-Object { "$_" } | Where-Object { $_ })
+            ConnectedAgents = @(ConvertTo-ObjectList $row.ConnectedAgents | ForEach-Object { "$_" } | Where-Object { $_ })
+            SharedWith = @(ConvertTo-ObjectList $row.SharedWith | ForEach-Object { "$_" } | Where-Object { $_ })
+            Owners = @(ConvertTo-ObjectList $row.Owners | ForEach-Object { "$_" } | Where-Object { $_ })
+            Endpoints = @(ConvertTo-ObjectList $row.Endpoints | ForEach-Object { if ($_.endpointUrl) { "$($_.endpointType): $($_.endpointUrl)" } else { "$_" } })
+            Triggers = @(ConvertTo-ObjectList $row.Triggers | ForEach-Object { "$_" } | Where-Object { $_ })
+            Instructions = [string]$row.Instructions
+        }
+    }
+    $table
+}
+
+# Display name and application roles of a resource service principal, cached for the run.
+function Get-ResourceInfo {
+    param([string]$ResourceId)
+    if ($script:ResourceCache.ContainsKey($ResourceId)) { return $script:ResourceCache[$ResourceId] }
+    try {
+        $sp = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ResourceId`?`$select=id,displayName,appRoles"
+        $roles = @{}; foreach ($r in @($sp.appRoles)) { $roles[[string]$r.id] = [string]$r.value }
+        $info = [pscustomobject]@{ Name = $sp.displayName; Roles = $roles }
+    } catch { $info = [pscustomobject]@{ Name = $ResourceId; Roles = @{} } }
+    $script:ResourceCache[$ResourceId] = $info
+    $info
+}
+
+# What an identity may do: delegated grants and application roles, directly and inherited from its blueprint.
+function Get-IdentityPermissions {
+    param([string]$ServicePrincipalId, [string]$Source)
+    $out = @()
+    try {
+        $g = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$ServicePrincipalId'"
+        foreach ($grant in @($g.value)) {
+            $res = Get-ResourceInfo $grant.resourceId
+            foreach ($s in ([string]$grant.scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) {
+                $out += [pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = $res.Name; Permission = $s; Consent = $grant.consentType }
+            }
+        }
+    } catch { $null = $_ }
+    try {
+        $a = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignments?`$top=100"
+        foreach ($ra in @($a.value)) {
+            $res = Get-ResourceInfo $ra.resourceId
+            $name = if ($res.Roles.ContainsKey([string]$ra.appRoleId)) { $res.Roles[[string]$ra.appRoleId] } else { [string]$ra.appRoleId }
+            $out += [pscustomobject]@{ Source = $Source; Kind = 'Application'; Resource = $res.Name; Permission = $name; Consent = 'Admin' }
+        }
+    } catch { $null = $_ }
+    $out
+}
+
+# The full picture of one agent. Entra lookups run only when the agent has an identity.
+function Get-AgentDetail {
+    param([object]$Package, [hashtable]$InfoTable, [switch]$SkipEntra)
+    $d = Invoke-Graph -Uri "$Base/$($Package.id)"
+    $info = if ($InfoTable) { $InfoTable[$Package.id.ToLower()] } else { (Get-AgentInfoTable -TitleId $Package.id)[$Package.id.ToLower()] }
+    $owner = Get-UserInfo $d.ownerId
+    $identity = $null; $perms = @(); $owners = @(); $sponsors = @()
+    if ($d.agentIdentityId -and -not $SkipEntra) {
+        try { $identity = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity?`$select=id,displayName,accountEnabled,agentIdentityBlueprintId,createdDateTime" } catch { $null = $_ }
+        $owners = @(Get-IdentityOwners $d.agentIdentityId | ForEach-Object { $_.Upn })
+        try { $sp = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity/sponsors?`$select=id"; $sponsors = @($sp.value | ForEach-Object { (Get-UserInfo $_.id).Upn }) } catch { $null = $_ }
+        $perms += Get-IdentityPermissions -ServicePrincipalId $d.agentIdentityId -Source 'Agent identity'
+        if ($identity -and $identity.agentIdentityBlueprintId) {
+            try {
+                $bp = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$($identity.agentIdentityBlueprintId)'&`$select=id,displayName"
+                foreach ($b in @($bp.value | Select-Object -First 1)) { $perms += Get-IdentityPermissions -ServicePrincipalId $b.id -Source 'Blueprint (inherited)' }
+            } catch { $null = $_ }
+        }
+    }
+    $count = { param($x) @($x).Count }
+    [pscustomobject]@{
+        Id = $d.id; Name = $d.displayName
+        Overview = [ordered]@{
+            Name = $d.displayName; 'Catalog id' = $d.id; Kind = Get-TypeLabel $d.type; Platform = $(if ($info.Platform) { $info.Platform } else { $d.platform })
+            Publisher = $d.publisher; Version = $d.version; Status = $(if ($d.isBlocked) { 'Blocked' } else { 'Active' })
+            Published = $info.PublishedStatus; Lifecycle = $info.LifecycleStatus; Model = $info.Model
+            Created = $(if ($d.createdDateTime) { ([datetimeoffset]$d.createdDateTime).ToString('yyyy-MM-dd') }); Modified = $(if ($d.lastModifiedDateTime) { ([datetimeoffset]$d.lastModifiedDateTime).ToString('yyyy-MM-dd') })
+            Description = $(if ($d.longDescription) { $d.longDescription } else { $d.shortDescription }); Categories = (@($d.categories) -join ', ')
+        }
+        Sharing = [ordered]@{
+            'Who can use it' = $d.availableTo; 'Deployed to' = $d.deployedTo
+            'Allowed users and groups' = (& $count $d.allowedUsersAndGroups); 'Users and groups it can be installed by' = (& $count $d.acquireUsersAndGroups)
+            'Shared with (catalog)' = (& $count $d.sharedWithUsersAndGroups); 'Shared with (agent record)' = $(if ($info) { (& $count $info.SharedWith) } else { 0 })
+            Channels = $(if ($info) { $info.Channels -join ', ' } else { '' })
+        }
+        Tools = @($info.Tools); McpServers = @($info.McpServers)
+        DataSources = @($info.DataSources); Capabilities = @($info.Capabilities); ConnectedAgents = @($info.ConnectedAgents); Endpoints = @($info.Endpoints)
+        Permissions = @($perms)
+        Identity = [ordered]@{
+            Owner = $(if ($owner.Exists) { $owner.Upn } elseif ($d.ownerId) { '(account no longer exists)' } else { '(none)' })
+            'Owners recorded on the agent' = $(if ($info) { $info.Owners -join ', ' } else { '' })
+            'Agent identity' = $d.agentIdentityId; 'Identity enabled' = $(if ($identity) { $identity.accountEnabled } else { '' })
+            'Blueprint id' = $(if ($identity) { $identity.agentIdentityBlueprintId } else { '' })
+            'Identity owners' = ($owners -join ', '); Sponsors = ($sponsors -join ', ')
+        }
+        Usage = [ordered]@{
+            'Active users' = $d.activeUsers; Sessions = $d.totalSessions; 'Last used' = $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' })
+            'Exception rate' = $d.exceptionRate; 'Run time (hours)' = $d.totalRunTimeInHours
+        }
+        Instructions = $(if ($info) { $info.Instructions } else { '' })
+    }
+}
+
+# Text rendering of the detail object for the console.
+function Show-AgentDetail {
+    param([object]$Detail)
+    $section = { param($title, $dict) Write-Host "`n$title" -ForegroundColor Cyan; foreach ($k in $dict.Keys) { if ($null -ne $dict[$k] -and "$($dict[$k])" -ne '') { Write-Host ('  {0,-34} {1}' -f $k, $dict[$k]) } } }
+    & $section 'OVERVIEW' $Detail.Overview
+    & $section 'SHARING AND AVAILABILITY' $Detail.Sharing
+    Write-Host "`nTOOLS ($($Detail.Tools.Count)) AND MCP SERVERS ($($Detail.McpServers.Count))" -ForegroundColor Cyan
+    if ($Detail.Tools.Count -or $Detail.McpServers.Count) { @($Detail.McpServers | Select-Object @{ n = 'kind'; e = { 'MCP server' } }, Name, Type, Authentication, Approval) + @($Detail.Tools | Select-Object @{ n = 'kind'; e = { 'tool' } }, Name, Type, Authentication, Approval) | Format-Table -AutoSize | Out-Host }
+    else { Write-Host '  (none declared)' }
+    if ($Detail.DataSources.Count) { Write-Host "`nDATA SOURCES" -ForegroundColor Cyan; $Detail.DataSources | ForEach-Object { Write-Host "  $_" } }
+    if ($Detail.Capabilities.Count) { Write-Host "`nCAPABILITIES: $($Detail.Capabilities -join ', ')" -ForegroundColor Cyan }
+    Write-Host "`nPERMISSIONS ($($Detail.Permissions.Count))" -ForegroundColor Cyan
+    if ($Detail.Permissions.Count) { $Detail.Permissions | Format-Table -AutoSize | Out-Host } else { Write-Host '  (none found for the agent identity or its blueprint)' }
+    & $section 'IDENTITY AND OWNERSHIP' $Detail.Identity
+    & $section 'USAGE' $Detail.Usage
+}
+
+# One row per agent for -Inventory: the catalog record plus the Defender columns; -Deep adds usage and sharing per agent.
+function Get-InventoryRows {
+    param([object[]]$Packages, [hashtable]$InfoTable, [switch]$Deep, [switch]$WithPermissions)
+    $i = 0
+    foreach ($p in $Packages) {
+        $i++
+        $info = $InfoTable[$p.id.ToLower()]
+        $owner = Get-UserInfo $p.ownerId
+        $row = [ordered]@{
+            Name = $p.displayName; Id = $p.id; Kind = Get-TypeLabel $p.type; Platform = $(if ($info.Platform) { $info.Platform } else { $p.platform })
+            Publisher = $p.publisher; Status = $(if ($p.isBlocked) { 'Blocked' } else { 'Active' })
+            Owner = $(if ($owner.Exists) { $owner.Upn } elseif ($p.ownerId -and $p.ownerId -ne '00000000-0000-0000-0000-000000000000') { '(account no longer exists)' } else { '' })
+            Version = $p.version; Created = $(if ($p.createdDateTime) { ([datetimeoffset]$p.createdDateTime).ToString('yyyy-MM-dd') }); Modified = $(if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') })
+            Published = $info.PublishedStatus; Channels = ($info.Channels -join ', '); Model = $info.Model
+            ToolCount = @($info.Tools).Count; Tools = (Get-NameText $info.Tools); McpServers = (Get-NameText $info.McpServers)
+            DataSources = ($info.DataSources -join '; '); Capabilities = ($info.Capabilities -join '; ')
+            SharedWithCount = @($info.SharedWith).Count; AgentIdentity = $p.agentIdentityId
+        }
+        if ($Deep) {
+            Write-Progress -Activity 'Reading agent details' -Status $p.displayName -PercentComplete (100 * $i / [Math]::Max(1, $Packages.Count))
+            try {
+                $d = Invoke-Graph -Uri "$Base/$($p.id)"
+                $row.AvailableTo = $d.availableTo; $row.DeployedTo = $d.deployedTo
+                $row.CatalogSharedWith = @($d.sharedWithUsersAndGroups).Count
+                $row.ActiveUsers = $d.activeUsers; $row.Sessions = $d.totalSessions
+                $row.LastUsed = if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }
+            } catch { $row.AvailableTo = 'error' }
+        }
+        if ($WithPermissions -and $p.agentIdentityId) {
+            $perms = @(Get-IdentityPermissions -ServicePrincipalId $p.agentIdentityId -Source 'Agent identity')
+            $row.PermissionCount = $perms.Count
+            $row.Permissions = (($perms | ForEach-Object { "$($_.Resource):$($_.Permission)" }) -join '; ')
+        }
+        [pscustomobject]$row
+    }
+    if ($Deep) { Write-Progress -Activity 'Reading agent details' -Completed }
 }
 
 # Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
@@ -1196,7 +1424,10 @@ $GuiXaml = @'
             </StackPanel>
           </Border>
           <Button x:Name="BtnReset" Grid.Column="2" Content="Reset filters" Style="{StaticResource Btn}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" IsEnabled="False"/>
-          <CheckBox x:Name="AgentsOnlyBox" Grid.Column="3" Content="Copilot agents only" VerticalAlignment="Center"/>
+          <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+            <CheckBox x:Name="DetailColsBox" Content="Tools and sharing columns" Margin="0,0,18,0" ToolTip="Adds tools, MCP servers, sharing and channels to the grid (reads Defender agent records once)."/>
+            <CheckBox x:Name="AgentsOnlyBox" Content="Copilot agents only"/>
+          </StackPanel>
         </Grid>
         <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
           <StackPanel>
@@ -1297,9 +1528,14 @@ $GuiXaml = @'
                 </Border>
               </DataTemplate></DataGridTemplateColumn.CellTemplate>
             </DataGridTemplateColumn>
+            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Owner" Binding="{Binding Owner}" Width="1.4*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Tools" Binding="{Binding ToolCount}" Width="62" SortMemberPath="ToolCountSort" IsReadOnly="True" Visibility="Collapsed"/>
+            <DataGridTextColumn Header="MCP servers" Binding="{Binding Mcp}" Width="1.3*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+            <DataGridTextColumn Header="Shared with" Binding="{Binding SharedCount}" Width="105" IsReadOnly="True" Visibility="Collapsed"/>
+            <DataGridTextColumn Header="Channels" Binding="{Binding Channels}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
             <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
             <DataGridTextColumn Header="Blocked for" Binding="{Binding BlockedFor}" Width="95" SortMemberPath="BlockedForSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
@@ -1341,6 +1577,7 @@ $GuiXaml = @'
           <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" Visibility="Collapsed"/>
           <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
@@ -1363,7 +1600,7 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -1541,16 +1778,194 @@ function Get-OwnerLabel {
     if ($u.Exists) { if ($u.Enabled) { $u.Upn } else { "$($u.Upn) (disabled)" } } else { '(account no longer exists)' }
 }
 
+$DetailXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Agent details" Width="1040" Height="700" MinWidth="760" MinHeight="480" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style TargetType="TabItem">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TabItem">
+            <Border x:Name="bd" Padding="14,9" Margin="0,0,2,0" Background="Transparent" BorderBrush="Transparent" BorderThickness="0,0,0,2" Cursor="Hand" TextElement.Foreground="#4B5563" TextElement.FontWeight="SemiBold">
+              <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#EEF2F7"/></Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="bd" Property="BorderBrush" Value="#0F6CBD"/>
+                <Setter TargetName="bd" Property="TextElement.Foreground" Value="#0F6CBD"/>
+                <Setter TargetName="bd" Property="Background" Value="White"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,16">
+      <StackPanel>
+        <TextBlock x:Name="Title" FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Loading..."/>
+        <TextBlock x:Name="Subtitle" Foreground="#6B7280" Margin="0,2,0,0"/>
+      </StackPanel>
+    </Border>
+    <TabControl x:Name="Tabs" Grid.Row="1" Margin="16,12,16,0" Background="White" BorderBrush="#E5E7EB">
+      <TabItem x:Name="TabOverview" Header="Overview">
+        <DataGrid x:Name="OvGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="220" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabSharing" Header="Sharing and availability">
+        <DataGrid x:Name="ShGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="280" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabTools" Header="Tools and MCP">
+        <DataGrid x:Name="ToolGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="100" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Type" Binding="{Binding Type}" Width="110" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Authentication" Binding="{Binding Authentication}" Width="120" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Approval" Binding="{Binding Approval}" Width="90" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="2*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabData" Header="Data and capabilities">
+        <DataGrid x:Name="DataGrid2" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="160" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabPerms" Header="Permissions">
+        <DataGrid x:Name="PermGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Held by" Binding="{Binding Source}" Width="170" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="100" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Resource" Binding="{Binding Resource}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Permission" Binding="{Binding Permission}" Width="1.6*" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Consent" Binding="{Binding Consent}" Width="110" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabIdentity" Header="Identity and ownership">
+        <DataGrid x:Name="IdGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabUsage" Header="Usage">
+        <DataGrid x:Name="UsGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+    </TabControl>
+    <Border Grid.Row="2" Padding="16,12" Margin="0,8,0,0">
+      <Grid>
+        <TextBlock x:Name="Note" Foreground="#6B7280" VerticalAlignment="Center" FontSize="12"/>
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+          <Button x:Name="BtnExport" Content="Export JSON" Style="{DynamicResource Btn}" Margin="0,0,8,0"/>
+          <Button x:Name="BtnClose" Content="Close" Style="{DynamicResource BtnAccent}" IsCancel="True" MinWidth="100"/>
+        </StackPanel>
+      </Grid>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+function ConvertTo-FieldRows {
+    param($Dictionary)
+    @($Dictionary.Keys | ForEach-Object { [pscustomobject]@{ Field = $_; Value = [string]$Dictionary[$_] } } | Where-Object { $_.Value -ne '' })
+}
+
+# Fill the details window from a detail object.
+function Set-DetailWindowContent {
+    param([System.Windows.Window]$Window, [object]$Detail)
+    $f = { param($n) $Window.FindName($n) }
+    (& $f 'Title').Text = $Detail.Name
+    (& $f 'Subtitle').Text = ('{0}   |   {1}   |   {2}' -f $Detail.Overview.Kind, $Detail.Overview.Platform, $Detail.Overview.Status)
+    (& $f 'OvGrid').ItemsSource = ConvertTo-FieldRows $Detail.Overview
+    (& $f 'ShGrid').ItemsSource = ConvertTo-FieldRows $Detail.Sharing
+    $tools = @($Detail.McpServers | ForEach-Object { [pscustomobject]@{ Kind = 'MCP server'; Name = $_.Name; Type = $_.Type; Authentication = $_.Authentication; Approval = $_.Approval; Description = $_.Description } }) +
+             @($Detail.Tools | ForEach-Object { [pscustomobject]@{ Kind = 'Tool'; Name = $_.Name; Type = $_.Type; Authentication = $_.Authentication; Approval = $_.Approval; Description = $_.Description } })
+    (& $f 'ToolGrid').ItemsSource = $tools
+    (& $f 'TabTools').Header = "Tools and MCP ($($tools.Count))"
+    $data = @($Detail.DataSources | ForEach-Object { [pscustomobject]@{ Kind = 'Data source'; Value = $_ } }) +
+            @($Detail.Capabilities | ForEach-Object { [pscustomobject]@{ Kind = 'Capability'; Value = $_ } }) +
+            @($Detail.ConnectedAgents | ForEach-Object { [pscustomobject]@{ Kind = 'Connected agent'; Value = $_ } }) +
+            @($Detail.Endpoints | ForEach-Object { [pscustomobject]@{ Kind = 'Endpoint'; Value = $_ } })
+    (& $f 'DataGrid2').ItemsSource = $data
+    (& $f 'TabData').Header = "Data and capabilities ($($data.Count))"
+    (& $f 'PermGrid').ItemsSource = @($Detail.Permissions)
+    (& $f 'TabPerms').Header = "Permissions ($(@($Detail.Permissions).Count))"
+    (& $f 'IdGrid').ItemsSource = ConvertTo-FieldRows $Detail.Identity
+    (& $f 'UsGrid').ItemsSource = ConvertTo-FieldRows $Detail.Usage
+    $noPerms = if (@($Detail.Permissions).Count -eq 0) { 'No permissions found for the agent identity or its blueprint.' } else { '' }
+    (& $f 'Note').Text = $noPerms
+}
+
+# Build the details window (not yet shown) for one grid row.
+function New-DetailWindow {
+    param([object]$Row, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($DetailXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $d.FindName('Title').Text = $Row.Name
+    $d.FindName('Subtitle').Text = 'Loading the full record...'
+    $script:detailState = @{ Window = $d; Row = $Row; Detail = $null }
+    $d.FindName('BtnExport').Add_Click({
+        if (-not $script:detailState.Detail) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'JSON (*.json)|*.json'; $dlg.FileName = ('{0}.json' -f ($script:detailState.Detail.Name -replace '[^\w\-. ]', '_'))
+        if ($dlg.ShowDialog()) { $script:detailState.Detail | ConvertTo-Json -Depth 8 | Set-Content -Path $dlg.FileName -Encoding utf8 }
+    })
+    $d.Add_ContentRendered({
+        if ($script:detailState.Detail) { return }
+        $w = $script:detailState.Window
+        try {
+            $w.Cursor = [Windows.Input.Cursors]::Wait
+            $table = $script:ctx.InfoTable
+            $script:detailState.Detail = Get-AgentDetail -Package $script:detailState.Row.Package -InfoTable $table
+            Set-DetailWindowContent -Window $w -Detail $script:detailState.Detail
+        } catch {
+            $w.FindName('Subtitle').Text = 'Could not read the record: ' + $_.Exception.Message
+        } finally { $w.Cursor = $null }
+    })
+    $d
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; InfoTable = $null; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -1592,7 +2007,7 @@ function New-ConsoleWindow {
             elseif ($hits -ne $sets.Count) { return $false }
         }
         $q = $script:ui.Search.Text.Trim()
-        if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Id) -join ' ').ToLower().Contains($q.ToLower())) { return $false }
+        if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Kind, $o.ToolsText, $o.Mcp, $o.Id) -join ' ').ToLower().Contains($q.ToLower())) { return $false }
         $true
     }
     $script:ctx.View.Filter = [Predicate[object]]$script:ctx.Filter
@@ -1620,6 +2035,7 @@ function New-ConsoleWindow {
                 $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { [string]$p.type }
                 $r.Hosts = ($p.supportedHosts) -join ','
                 $r.Owner = Get-OwnerLabel $p
+                $r.Kind = Get-TypeLabel $p.type
                 $r.IsBlocked = [bool]$p.isBlocked
                 $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
                 $r.Package = $p
@@ -1627,6 +2043,7 @@ function New-ConsoleWindow {
                 $r.add_PropertyChanged({ param($s, $e) if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { & $script:ctx.Summary } })
                 $script:ctx.Rows.Add($r)
             }
+            & $script:ctx.FillInfo
             & $script:ctx.Refilter
             & $script:ctx.Idle ("Loaded {0} packages at {1}." -f $pkgs.Count, (Get-Date).ToString('HH:mm:ss'))
         } catch { & $script:ctx.Idle ('Load failed: ' + $_.Exception.Message); [void][Windows.MessageBox]::Show($_.Exception.Message, 'Could not load the catalog', 'OK', 'Error') }
@@ -1645,6 +2062,18 @@ function New-ConsoleWindow {
         $script:ctx.Resetting = $false
     }
 
+    # Copy Defender's declared tools, MCP servers, sharing and channels onto the grid rows.
+    $script:ctx.FillInfo = {
+        if (-not $script:ctx.InfoTable) { return }
+        foreach ($r in $script:ctx.Rows) {
+            $i = $script:ctx.InfoTable[$r.Id.ToLower()]
+            if (-not $i) { $r.ToolCount = '0'; $r.ToolCountSort = 0; continue }
+            $r.ToolCount = [string]@($i.Tools).Count; $r.ToolCountSort = @($i.Tools).Count
+            $r.ToolsText = Get-NameText $i.Tools; $r.Mcp = Get-NameText $i.McpServers
+            $r.SharedCount = [string]@($i.SharedWith).Count; $r.Channels = ($i.Channels -join ', ')
+        }
+    }
+
     # Show only the columns that matter for the filters that are on.
     $script:ctx.Columns = {
         $on = @{
@@ -1652,6 +2081,8 @@ function New-ConsoleWindow {
             'Risk' = ($null -ne $script:ctx.RiskSet); 'Alerts' = ($null -ne $script:ctx.RiskSet); 'Detections' = ($null -ne $script:ctx.RiskSet); 'Why' = ($null -ne $script:ctx.RiskSet)
             'Suggested owner' = ($null -ne $script:ctx.OwnerSet); 'Ownership note' = ($null -ne $script:ctx.OwnerSet)
             'Blocked for' = ($null -ne $script:ctx.BlockedSet)
+            'Tools' = [bool]$script:ui.DetailColsBox.IsChecked; 'MCP servers' = [bool]$script:ui.DetailColsBox.IsChecked
+            'Shared with' = [bool]$script:ui.DetailColsBox.IsChecked; 'Channels' = [bool]$script:ui.DetailColsBox.IsChecked
         }
         $script:ui.BtnApplyOwner.Visibility = if ($null -ne $script:ctx.OwnerSet) { 'Visible' } else { 'Collapsed' }
         foreach ($c in $script:ui.Grid.Columns) {
@@ -1838,6 +2269,22 @@ function New-ConsoleWindow {
     $script:ui.NeverSeenBox.Add_Click({ if ($script:ui.StaleBox.SelectedIndex -gt 0) { & $script:ctx.RunStale } })
     $script:ui.RiskBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunRisk } })
     $script:ui.SignalBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting -and $script:ui.RiskBox.SelectedIndex -gt 0) { & $script:ctx.RunRisk } })
+    $script:ui.DetailColsBox.Add_Click({
+        if ($script:ui.DetailColsBox.IsChecked -and -not $script:ctx.InfoTable) {
+            & $script:ctx.Busy 'Reading Defender agent records...'
+            try { $script:ctx.InfoTable = Get-AgentInfoTable; & $script:ctx.FillInfo; & $script:ctx.Idle 'Tools and sharing columns loaded.' }
+            catch { $script:ui.DetailColsBox.IsChecked = $false; & $script:ctx.Idle 'Could not read agent records.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Tools and sharing columns', 'OK', 'Error') }
+        }
+        & $script:ctx.Refilter
+    })
+    $script:ctx.ShowDetails = {
+        $row = $script:ui.Grid.SelectedItem
+        if (-not $row) { return }
+        (New-DetailWindow -Row $row -Owner $script:w).ShowDialog() | Out-Null
+    }
+    $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
+    $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
+    $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
     $script:ui.OwnerBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunOwner } })
     $script:ui.BlockedBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunBlocked } })
 
@@ -1889,7 +2336,7 @@ function New-ConsoleWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
         if (-not $dlg.ShowDialog()) { return }
-        $out = @($script:ctx.View | Select-Object Name, Status, Platform, Publisher, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
+        $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -Path $dlg.FileName -Encoding utf8 }
         else { $out | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8 }
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
@@ -1919,6 +2366,23 @@ switch ($PSCmdlet.ParameterSetName) {
                           @{ n = 'hosts'; e = { ($_.supportedHosts) -join ',' } }, type |
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
+    }
+    'Detail' {
+        $pkg = @(Resolve-Packages $Detail)[0]
+        Write-Host ("Reading {0}..." -f $pkg.displayName) -ForegroundColor DarkGray
+        $det = Get-AgentDetail -Package $pkg
+        Show-AgentDetail -Detail $det
+        if ($OutFile) { $det | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding utf8; Write-Host "Saved: $OutFile" -ForegroundColor Cyan }
+    }
+    'Inventory' {
+        $pk = @(Get-Packages -AgentsOnly:$AgentsOnly)
+        Write-Host ("Reading Defender agent records for {0} package(s)..." -f $pk.Count) -ForegroundColor DarkGray
+        $rows = @(Get-InventoryRows -Packages $pk -InfoTable (Get-AgentInfoTable) -Deep:$Deep -WithPermissions:$WithPermissions)
+        Write-Host ("`n{0} agent(s): {1} shared by a creator, {2} org-published, {3} with declared tools, {4} using MCP servers, {5} blocked." -f
+            $rows.Count, @($rows | Where-Object { $_.Kind -eq 'Shared by a creator' }).Count, @($rows | Where-Object { $_.Kind -eq 'Org-published' }).Count,
+            @($rows | Where-Object { $_.ToolCount -gt 0 }).Count, @($rows | Where-Object { $_.McpServers }).Count, @($rows | Where-Object { $_.Status -eq 'Blocked' }).Count) -ForegroundColor Cyan
+        $rows | Select-Object Name, Kind, Platform, Status, Owner, ToolCount, McpServers | Format-Table -AutoSize | Out-Host
+        Export-ActionLog -Records $rows
     }
     'Policy' {
         if (-not (Test-Path -LiteralPath $Policy)) { throw "Policy file not found: $Policy" }

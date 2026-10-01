@@ -414,3 +414,43 @@ Describe 'Test-Reassignable' {
         Test-Reassignable (New-Pkg 'P_4' 'd' -Type 'firstParty') | Should -BeFalse
     }
 }
+
+Describe 'Agent detail helpers' {
+    It 'parses array elements that are JSON text, as Defender returns declared tools' {
+        $raw = @('{"name":"search_web","type":"capability"}', '{"name":"Send mail","type":"api_action"}')
+        $items = @(ConvertTo-ObjectList $raw)
+        $items.Count | Should -Be 2
+        $items[0].name | Should -Be 'search_web'
+        (Get-NameText $raw) | Should -Be 'search_web; Send mail'
+    }
+    It 'accepts a JSON array in one string, plain strings, and empty values' {
+        @(ConvertTo-ObjectList '[{"name":"a"},{"name":"b"}]').name | Should -Be @('a', 'b')
+        @(ConvertTo-ObjectList 'MsTeams').Count | Should -Be 1
+        @(ConvertTo-ObjectList $null).Count | Should -Be 0
+        @(ConvertTo-ObjectList '[]').Count | Should -Be 0
+    }
+    It 'labels agent kinds in plain words' {
+        Get-TypeLabel 'shared' | Should -Be 'Shared by a creator'
+        Get-TypeLabel 'lob' | Should -Be 'Org-published'
+        Get-TypeLabel 'firstParty' | Should -Be 'Microsoft'
+        Get-TypeLabel 'thirdParty' | Should -Be 'Partner or store app'
+    }
+}
+
+Describe 'Get-AgentInfoTable' {
+    It 'turns Defender rows into per-agent tools, MCP servers, sharing and channels' {
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{
+            TitleId = 't_abc'; Platform = 'Copilot Studio'; Model = 'M'; PublishedStatus = 'Published'; LifecycleStatus = 'Active'
+            Channels = 'MsTeams Microsoft365Copilot'
+            DeclaredTools = @('{"type":"capability","name":"search_web","authenticationUsed":{"type":"Invoker"}}')
+            McpServers = @('{"name":"Work IQ Mail","type":"api_action","approvalModeKind":"never"}')
+            DeclaredDataSources = @('https://example.com'); Capabilities = @('Public sites'); SharedWith = @('grp'); Owners = @('u1')
+            ConnectedAgents = $null; Endpoints = $null; Triggers = $null; Instructions = 'be helpful' }) }
+        $i = (Get-AgentInfoTable)['t_abc']
+        $i.Tools[0].Name | Should -Be 'search_web'
+        $i.Tools[0].Authentication | Should -Be 'Invoker'
+        $i.McpServers[0].Name | Should -Be 'Work IQ Mail'
+        $i.Channels | Should -Be @('MsTeams', 'Microsoft365Copilot')
+        $i.SharedWith.Count | Should -Be 1
+    }
+}

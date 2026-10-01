@@ -21,6 +21,7 @@ Beyond one‑off actions, it can bulk‑block **stale** agents — those that ha
 - **Contain** agents by also disabling their Entra identity, and see each agent's blast radius first.
 - Track **delete candidates** (agents that stayed blocked) for clean-up in the admin center.
 - Run a repeatable **policy file**, keep **snapshots**, and **undo** a run from its log.
+- See the **full record of any agent** (sharing, tools, MCP servers, permissions, identity) and export an inventory.
 - Use the **graphical console** (`-Gui`) for all of the above.
 
 > Blocking is fully reversible — the same tool re‑enables an agent with `-Unblock`.
@@ -235,6 +236,30 @@ A rule must have at least one condition, so a typo can never match the whole cat
 
 The report lists agents that are new or removed, newly blocked or unblocked, and those whose owner or version changed.
 
+### Agent inventory and details
+
+```powershell
+# Everything about one agent: sharing, tools, MCP servers, data sources, permissions, identity, usage
+.\Agent365-Bulk-Actions.ps1 -Detail "T_0d710c64-ab02-2686-9121-43a34b806ecd"
+.\Agent365-Bulk-Actions.ps1 -Detail "Contoso HR Agent" -OutFile .\agent.json
+
+# One row per agent, ready for Excel or a dashboard
+.\Agent365-Bulk-Actions.ps1 -Inventory -OutFile .\inventory.csv
+.\Agent365-Bulk-Actions.ps1 -Inventory -Deep -WithPermissions -OutFile .\inventory-full.csv
+```
+
+The picture is assembled from three places, because no single API has all of it:
+
+| Source | What it provides |
+| --- | --- |
+| Catalog package | Kind (shared by a creator, org-published, Microsoft, partner), publisher, version, dates, owner, who can use it, deployment, sharing lists, usage |
+| Defender `AgentsInfo` | Declared tools (with type, authentication and approval mode), MCP servers, data sources, capabilities, channels, model, sharing, published and lifecycle status |
+| Entra | The agent identity, its owners and sponsors, and the delegated and application permissions held by the identity and inherited from its blueprint |
+
+`-Inventory` makes one catalog call and one Defender query. `-Deep` adds one call per agent for usage and availability, and `-WithPermissions` adds the identity's permissions (agents with an identity only), so both take longer on a large catalog. Fields a tenant does not populate (for example `AgentsInfo.Permissions`, skills and guardrails were empty in the tenant used for testing) are simply blank.
+
+In the console, **Details...** (or a double-click on a row) opens a tabbed window: Overview, Sharing and availability, Tools and MCP, Data and capabilities, Permissions, Identity and ownership, and Usage, with **Export JSON**. The grid shows each agent's **Kind** by default, and the **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels (it reads the Defender records once).
+
 ### Risky agents
 
 `-Risky` finds agents with Defender **Security for AI** signals and enriches each with **`severity`**, **`alerts`**, **`detections`**, **`why`** (alert titles and detection types), **`categories`** and the date of the last signal. Results are sorted worst-severity-first. Use `-MinSeverity` and `-MinAlerts` to narrow them, then block with the same preview and confirm/pick flow.
@@ -276,6 +301,8 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-Policy` | path | Evaluate a JSON policy file and print the plan. Nothing changes without `-Apply`. |
 | `-Apply` | switch | With `-Policy`, run the plan. |
 | `-Snapshot` | path | Save the inventory to a JSON file. |
+| `-Detail` | name or id | Print the full record of one agent (sharing, tools, MCP servers, permissions, identity, usage); `-OutFile` saves it as JSON. |
+| `-Inventory` | switch | One row per agent with kind, owner, tools, MCP servers and sharing. Add `-Deep` for usage and availability, `-WithPermissions` for Entra permissions. |
 | `-CompareTo` | path | With `-Snapshot`, list changes since an earlier snapshot. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
