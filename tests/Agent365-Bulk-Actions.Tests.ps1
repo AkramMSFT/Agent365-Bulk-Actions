@@ -454,3 +454,36 @@ Describe 'Get-AgentInfoTable' {
         $i.SharedWith.Count | Should -Be 1
     }
 }
+
+Describe 'Permission and risk helpers' {
+    BeforeEach {
+        $script:perms = @(
+            [pscustomobject]@{ Source = 'Agent identity'; Kind = 'Delegated'; Resource = 'Azure API Connections'; Permission = 'Runtime.All'; Consent = 'AllPrincipals' },
+            [pscustomobject]@{ Source = 'Blueprint (inherited)'; Kind = 'Application'; Resource = 'Microsoft Graph'; Permission = 'AgentIdentity.CreateAsManager'; Consent = 'Admin' },
+            [pscustomobject]@{ Source = 'Agent identity'; Kind = 'Delegated'; Resource = 'Agent Tools'; Permission = 'McpServers.Mail.All'; Consent = 'AllPrincipals' })
+    }
+    It 'matches any permission, Graph application permissions and MCP permissions' {
+        Test-PermissionMatch -Perms $script:perms -Mode 'any' | Should -BeTrue
+        Test-PermissionMatch -Perms @() -Mode 'any' | Should -BeFalse
+        Test-PermissionMatch -Perms $script:perms -Mode 'graphapp' | Should -BeTrue
+        Test-PermissionMatch -Perms @($script:perms[0]) -Mode 'graphapp' | Should -BeFalse
+        Test-PermissionMatch -Perms $script:perms -Mode 'mcp' | Should -BeTrue
+        Test-PermissionMatch -Perms @($script:perms[0], $script:perms[1]) -Mode 'mcp' | Should -BeFalse
+    }
+    It 'combines identity and blueprint permissions and looks the blueprint up once' {
+        $script:script_bpCalls = 0
+        $script:BlueprintPermCache = @{}
+        Mock Get-IdentityPermissions { param($ServicePrincipalId, $Source) @([pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = 'R'; Permission = "p-$ServicePrincipalId"; Consent = 'x' }) }
+        Mock Invoke-Graph { $script:script_bpCalls++; [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-sp'; displayName = 'BP' }) } }
+        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'bp-app')
+        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'bp-app')
+        $first.Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
+        $second.Count | Should -Be 2
+        $script:script_bpCalls | Should -Be 1
+    }
+    It 'finds an agent''s risk entry by any of its identifiers' {
+        Mock Get-RiskCached { @{ 't_abc' = [pscustomobject]@{ Severity = 'High'; AlertCount = 2; DetectionCount = 1 } } }
+        (Get-AgentRisk (New-Pkg 'T_ABC' 'x')).Severity | Should -Be 'High'
+        Get-AgentRisk (New-Pkg 'T_other' 'y') | Should -BeNullOrEmpty
+    }
+}

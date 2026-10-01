@@ -624,7 +624,7 @@ function Get-AgentInfoTable {
     foreach ($row in $rows) {
         if (-not $row.TitleId) { continue }
         $table[[string]$row.TitleId] = [pscustomobject]@{
-            Platform = $row.Platform; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
+            Platform = $row.Platform; BlueprintId = [string]$row.EntraBlueprintID; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
             Channels = @(ConvertTo-ObjectList $row.Channels | ForEach-Object { "$_".Split(' ') } | Where-Object { $_ })
             Tools = @(ConvertTo-ObjectList $row.DeclaredTools | ForEach-Object {
                 [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
@@ -682,7 +682,7 @@ function Get-IdentityPermissions {
 
 # The full picture of one agent. Entra lookups run only when the agent has an identity.
 function Get-AgentDetail {
-    param([object]$Package, [hashtable]$InfoTable, [switch]$SkipEntra)
+    param([object]$Package, [hashtable]$InfoTable, [switch]$SkipEntra, [switch]$SkipRisk)
     $d = Invoke-Graph -Uri "$Base/$($Package.id)"
     $info = if ($InfoTable) { $InfoTable[$Package.id.ToLower()] } else { (Get-AgentInfoTable -TitleId $Package.id)[$Package.id.ToLower()] }
     $owner = Get-UserInfo $d.ownerId
@@ -691,15 +691,16 @@ function Get-AgentDetail {
         try { $identity = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity?`$select=id,displayName,accountEnabled,agentIdentityBlueprintId,createdDateTime" } catch { $null = $_ }
         $owners = @(Get-IdentityOwners $d.agentIdentityId | ForEach-Object { $_.Upn })
         try { $sp = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity/sponsors?`$select=id"; $sponsors = @($sp.value | ForEach-Object { (Get-UserInfo $_.id).Upn }) } catch { $null = $_ }
-        $perms += Get-IdentityPermissions -ServicePrincipalId $d.agentIdentityId -Source 'Agent identity'
-        if ($identity -and $identity.agentIdentityBlueprintId) {
-            try {
-                $bp = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$($identity.agentIdentityBlueprintId)'&`$select=id,displayName"
-                foreach ($b in @($bp.value | Select-Object -First 1)) { $perms += Get-IdentityPermissions -ServicePrincipalId $b.id -Source 'Blueprint (inherited)' }
-            } catch { $null = $_ }
-        }
+        $perms = @(Get-AgentPermissionList -AgentIdentityId $d.agentIdentityId -BlueprintAppId $(if ($identity) { $identity.agentIdentityBlueprintId }))
     }
     $count = { param($x) @($x).Count }
+    $riskEntry = if ($SkipRisk) { $null } else { try { Get-AgentRisk $Package } catch { $null } }
+    $riskInfo = [ordered]@{}
+    if ($riskEntry) {
+        $riskInfo['Severity'] = $riskEntry.Severity; $riskInfo['Alerts (30 days)'] = $riskEntry.AlertCount; $riskInfo['Detections (30 days)'] = $riskEntry.DetectionCount
+        $riskInfo['Last signal'] = $(if ($riskEntry.LastAlert) { $riskEntry.LastAlert.ToString('yyyy-MM-dd') })
+        $n = 0; foreach ($s in ([string]$riskEntry.Reasons -split '; ')) { if ($s) { $n++; $riskInfo["Signal $n"] = $s } }
+    } else { $riskInfo['Security signals (30 days)'] = $(if ($SkipRisk) { 'not checked' } else { 'none found' }) }
     [pscustomobject]@{
         Id = $d.id; Name = $d.displayName
         Overview = [ordered]@{
@@ -729,7 +730,58 @@ function Get-AgentDetail {
             'Active users' = $d.activeUsers; Sessions = $d.totalSessions; 'Last used' = $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' })
             'Exception rate' = $d.exceptionRate; 'Run time (hours)' = $d.totalRunTimeInHours
         }
+        Risk = $riskInfo
         Instructions = $(if ($info) { $info.Instructions } else { '' })
+    }
+}
+
+# Risk signals per agent come from one hunting run, cached for ten minutes so the details window is quick.
+$script:RiskCache = $null
+$script:RiskCacheAt = [datetime]::MinValue
+function Get-RiskCached {
+    if (-not $script:RiskCache -or ((Get-Date) - $script:RiskCacheAt).TotalMinutes -gt 10) {
+        $script:RiskCache = Get-RiskyIndex -Days 30
+        $script:RiskCacheAt = Get-Date
+    }
+    $script:RiskCache
+}
+
+# The risk entry for one package (severity, alert and detection counts, reasons), or $null when it has none.
+function Get-AgentRisk {
+    param([object]$Package)
+    $idx = Get-RiskCached
+    foreach ($k in (Get-PackageKeys $Package)) { if ($idx.ContainsKey($k)) { return $idx[$k] } }
+    $null
+}
+
+# Permissions of an agent identity plus what it inherits from its blueprint. Blueprint lookups are cached per run.
+$script:BlueprintPermCache = @{}
+function Get-AgentPermissionList {
+    param([string]$AgentIdentityId, [string]$BlueprintAppId)
+    $perms = @(Get-IdentityPermissions -ServicePrincipalId $AgentIdentityId -Source 'Agent identity')
+    if ($BlueprintAppId) {
+        if (-not $script:BlueprintPermCache.ContainsKey($BlueprintAppId)) {
+            $inherited = @()
+            try {
+                $bp = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$BlueprintAppId'&`$select=id,displayName"
+                foreach ($b in @($bp.value | Select-Object -First 1)) { $inherited = @(Get-IdentityPermissions -ServicePrincipalId $b.id -Source 'Blueprint (inherited)') }
+            } catch { $null = $_ }
+            $script:BlueprintPermCache[$BlueprintAppId] = $inherited
+        }
+        $perms += $script:BlueprintPermCache[$BlueprintAppId]
+    }
+    $perms
+}
+
+# Does a permission list satisfy the filter: any permission, a Microsoft Graph application permission, or an MCP server permission?
+function Test-PermissionMatch {
+    param([object[]]$Perms, [string]$Mode)
+    $p = @($Perms)
+    switch ($Mode) {
+        'any'      { $p.Count -gt 0 }
+        'graphapp' { @($p | Where-Object { $_.Kind -eq 'Application' -and $_.Resource -eq 'Microsoft Graph' }).Count -gt 0 }
+        'mcp'      { @($p | Where-Object { $_.Permission -like 'McpServers.*' -or $_.Resource -like '*MCP*' -or $_.Resource -eq 'Agent Tools' }).Count -gt 0 }
+        default    { $true }
     }
 }
 
@@ -746,6 +798,7 @@ function Show-AgentDetail {
     if ($Detail.Capabilities.Count) { Write-Host "`nCAPABILITIES: $($Detail.Capabilities -join ', ')" -ForegroundColor Cyan }
     Write-Host "`nPERMISSIONS ($($Detail.Permissions.Count))" -ForegroundColor Cyan
     if ($Detail.Permissions.Count) { $Detail.Permissions | Format-Table -AutoSize | Out-Host } else { Write-Host '  (none found for the agent identity or its blueprint)' }
+    & $section 'RISK SIGNALS' $Detail.Risk
     & $section 'IDENTITY AND OWNERSHIP' $Detail.Identity
     & $section 'USAGE' $Detail.Usage
 }
@@ -1489,6 +1542,23 @@ $GuiXaml = @'
             </Border>
             <TextBlock x:Name="MatchNote" Visibility="Collapsed"/>
           </WrapPanel>
+          <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
+            <TextBlock Text="" Width="84"/>
+            <TextBlock Text="Tools" VerticalAlignment="Center" Margin="0,0,8,0" Width="64" TextAlignment="Right"/>
+            <ComboBox x:Name="ToolsBox" Width="190" SelectedIndex="0" ToolTip="Reads Defender's declared tools and MCP servers for each agent">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Uses an MCP server" Tag="mcp"/>
+              <ComboBoxItem Content="Has declared tools" Tag="tools"/>
+              <ComboBoxItem Content="Has no declared tools" Tag="none"/>
+            </ComboBox>
+            <TextBlock Text="Permissions" VerticalAlignment="Center" Margin="22,0,8,0"/>
+            <ComboBox x:Name="PermBox" Width="250" SelectedIndex="0" ToolTip="Scans the Entra permissions of every agent that has an identity (a few minutes the first time)">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Holds any Entra permission" Tag="any"/>
+              <ComboBoxItem Content="Holds a Microsoft Graph application permission" Tag="graphapp"/>
+              <ComboBoxItem Content="Holds an MCP server permission" Tag="mcp"/>
+            </ComboBox>
+          </WrapPanel>
           </StackPanel>
         </Border>
       </Grid>
@@ -1536,6 +1606,7 @@ $GuiXaml = @'
             <DataGridTextColumn Header="MCP servers" Binding="{Binding Mcp}" Width="1.3*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
             <DataGridTextColumn Header="Shared with" Binding="{Binding SharedCount}" Width="105" IsReadOnly="True" Visibility="Collapsed"/>
             <DataGridTextColumn Header="Channels" Binding="{Binding Channels}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+            <DataGridTextColumn Header="Permissions held" Binding="{Binding PermNote}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
             <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
             <DataGridTextColumn Header="Blocked for" Binding="{Binding BlockedFor}" Width="95" SortMemberPath="BlockedForSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
@@ -1600,7 +1671,7 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -1788,7 +1859,7 @@ $DetailXaml = @'
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TabItem">
-            <Border x:Name="bd" Padding="14,9" Margin="0,0,2,0" Background="Transparent" BorderBrush="Transparent" BorderThickness="0,0,0,2" Cursor="Hand" TextElement.Foreground="#4B5563" TextElement.FontWeight="SemiBold">
+            <Border x:Name="bd" Padding="12,9" Margin="0,0,2,0" Background="Transparent" BorderBrush="Transparent" BorderThickness="0,0,0,2" Cursor="Hand" TextElement.Foreground="#4B5563" TextElement.FontWeight="SemiBold">
               <ContentPresenter ContentSource="Header" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
             <ControlTemplate.Triggers>
@@ -1827,7 +1898,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabSharing" Header="Sharing and availability">
+      <TabItem x:Name="TabSharing" Header="Sharing">
         <DataGrid x:Name="ShGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="280" ElementStyle="{StaticResource Wrap}"/>
@@ -1847,7 +1918,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabData" Header="Data and capabilities">
+      <TabItem x:Name="TabData" Header="Data">
         <DataGrid x:Name="DataGrid2" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="160" ElementStyle="{StaticResource Wrap}"/>
@@ -1866,7 +1937,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabIdentity" Header="Identity and ownership">
+      <TabItem x:Name="TabIdentity" Header="Identity">
         <DataGrid x:Name="IdGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
@@ -1876,6 +1947,14 @@ $DetailXaml = @'
       </TabItem>
       <TabItem x:Name="TabUsage" Header="Usage">
         <DataGrid x:Name="UsGrid" Style="{StaticResource Grid}">
+          <DataGrid.Columns>
+            <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
+            <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
+          </DataGrid.Columns>
+        </DataGrid>
+      </TabItem>
+      <TabItem x:Name="TabRisk" Header="Risk">
+        <DataGrid x:Name="RiskGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
             <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="*" ElementStyle="{StaticResource Wrap}"/>
@@ -1918,11 +1997,14 @@ function Set-DetailWindowContent {
             @($Detail.ConnectedAgents | ForEach-Object { [pscustomobject]@{ Kind = 'Connected agent'; Value = $_ } }) +
             @($Detail.Endpoints | ForEach-Object { [pscustomobject]@{ Kind = 'Endpoint'; Value = $_ } })
     (& $f 'DataGrid2').ItemsSource = $data
-    (& $f 'TabData').Header = "Data and capabilities ($($data.Count))"
+    (& $f 'TabData').Header = "Data ($($data.Count))"
     (& $f 'PermGrid').ItemsSource = @($Detail.Permissions)
     (& $f 'TabPerms').Header = "Permissions ($(@($Detail.Permissions).Count))"
     (& $f 'IdGrid').ItemsSource = ConvertTo-FieldRows $Detail.Identity
     (& $f 'UsGrid').ItemsSource = ConvertTo-FieldRows $Detail.Usage
+    (& $f 'RiskGrid').ItemsSource = ConvertTo-FieldRows $Detail.Risk
+    $riskSeverity = $Detail.Risk['Severity']
+    (& $f 'TabRisk').Header = if ($riskSeverity) { "Risk ($riskSeverity)" } else { 'Risk' }
     $noPerms = if (@($Detail.Permissions).Count -eq 0) { 'No permissions found for the agent identity or its blueprint.' } else { '' }
     (& $f 'Note').Text = $noPerms
 }
@@ -1961,11 +2043,11 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; InfoTable = $null; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; InfoTable = $null; ToolsSet = $null; PermSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -1998,6 +2080,8 @@ function New-ConsoleWindow {
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
         if ($script:ctx.OwnerSet   -and -not $script:ctx.OwnerSet.Contains($o.Id))   { return $false }
         if ($script:ctx.BlockedSet -and -not $script:ctx.BlockedSet.Contains($o.Id)) { return $false }
+        if ($null -ne $script:ctx.ToolsSet -and -not $script:ctx.ToolsSet.Contains($o.Id)) { return $false }
+        if ($null -ne $script:ctx.PermSet  -and -not $script:ctx.PermSet.Contains($o.Id))  { return $false }
         if ($null -ne $script:ctx.OwnerSet   -and $script:ctx.OwnerSet.Count -eq 0)   { return $false }
         if ($null -ne $script:ctx.BlockedSet -and $script:ctx.BlockedSet.Count -eq 0) { return $false }
         $sets = @(); foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $sets += , $s } }
@@ -2015,7 +2099,7 @@ function New-ConsoleWindow {
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
                $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
-               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet)
+               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet)
     }
     $script:ctx.MatchNoteText = {
         $n = 0; foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $n++ } }
@@ -2057,11 +2141,73 @@ function New-ConsoleWindow {
         $script:ctx.Resetting = $true
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
         $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
-        $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0
-        & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked
+        $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0; $script:ui.ToolsBox.SelectedIndex = 0; $script:ui.PermBox.SelectedIndex = 0
+        & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm
         $script:ctx.Resetting = $false
     }
 
+    $script:ctx.ClearTools = { $script:ctx.ToolsSet = $null }
+    $script:ctx.ClearPerm  = { foreach ($r in $script:ctx.Rows) { $r.PermNote = '' }; $script:ctx.PermSet = $null }
+
+    # Make sure Defender's per-agent tool records are loaded (once per refresh).
+    $script:ctx.EnsureInfo = {
+        if ($script:ctx.InfoTable) { return $true }
+        & $script:ctx.Busy 'Reading Defender agent records...'
+        try { $script:ctx.InfoTable = Get-AgentInfoTable; & $script:ctx.FillInfo; return $true }
+        catch { & $script:ctx.Idle 'Could not read agent records.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Agent records', 'OK', 'Error'); return $false }
+    }
+
+    # Agents by what they declare: an MCP server, any tools, or none.
+    $script:ctx.RunTools = {
+        & $script:ctx.ClearTools
+        $mode = [string]$script:ui.ToolsBox.SelectedItem.Tag
+        if (-not $mode) { & $script:ctx.Refilter; & $script:ctx.Idle 'Tools filter cleared.'; return }
+        if (-not (& $script:ctx.EnsureInfo)) { $script:ui.ToolsBox.SelectedIndex = 0; return }
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($r in $script:ctx.Rows) {
+            $i = $script:ctx.InfoTable[$r.Id.ToLower()]
+            $tools = @($i.Tools).Count; $mcp = @($i.McpServers).Count
+            $hit = switch ($mode) { 'mcp' { $mcp -gt 0 } 'tools' { $tools -gt 0 -or $mcp -gt 0 } 'none' { $tools -eq 0 -and $mcp -eq 0 } }
+            if ($hit) { [void]$set.Add($r.Id) }
+        }
+        $script:ctx.ToolsSet = $set
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("{0} agent(s) match: {1}." -f $set.Count, $script:ui.ToolsBox.SelectedItem.Content.ToLower())
+    }
+
+    # Agents by the Entra permissions their identity holds. Scans every agent that has an identity; results are cached.
+    $script:ctx.RunPerm = {
+        & $script:ctx.ClearPerm
+        $mode = [string]$script:ui.PermBox.SelectedItem.Tag
+        if (-not $mode) { & $script:ctx.Refilter; & $script:ctx.Idle 'Permissions filter cleared.'; return }
+        if (-not (& $script:ctx.EnsureInfo)) { $script:ui.PermBox.SelectedIndex = 0; return }
+        try {
+            $withIdentity = @($script:ctx.Rows | Where-Object { $_.Package.agentIdentityId })
+            $n = 0
+            foreach ($r in $withIdentity) {
+                $n++
+                if (-not $script:ctx.PermCache.ContainsKey($r.Id)) {
+                    & $script:ctx.Busy ("Reading Entra permissions {0} of {1}: {2}" -f $n, $withIdentity.Count, $r.Name)
+                    $bp = $script:ctx.InfoTable[$r.Id.ToLower()].BlueprintId
+                    $script:ctx.PermCache[$r.Id] = @(Get-AgentPermissionList -AgentIdentityId $r.Package.agentIdentityId -BlueprintAppId $bp)
+                }
+            }
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($r in $withIdentity) {
+                $p = @($script:ctx.PermCache[$r.Id])
+                if (Test-PermissionMatch -Perms $p -Mode $mode) {
+                    [void]$set.Add($r.Id)
+                    $r.PermNote = (($p | Select-Object -First 4 | ForEach-Object { "$($_.Resource): $($_.Permission)" }) -join '; ') + $(if ($p.Count -gt 4) { " (+$($p.Count - 4) more)" } else { '' })
+                }
+            }
+            $script:ctx.PermSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} agent(s): {1}. Only agents with an Entra identity were checked ({2})." -f $set.Count, $script:ui.PermBox.SelectedItem.Content.ToLower(), $withIdentity.Count)
+        } catch {
+            $script:ui.PermBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Permissions scan failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Permissions', 'OK', 'Error')
+        }
+    }
     # Copy Defender's declared tools, MCP servers, sharing and channels onto the grid rows.
     $script:ctx.FillInfo = {
         if (-not $script:ctx.InfoTable) { return }
@@ -2081,8 +2227,9 @@ function New-ConsoleWindow {
             'Risk' = ($null -ne $script:ctx.RiskSet); 'Alerts' = ($null -ne $script:ctx.RiskSet); 'Detections' = ($null -ne $script:ctx.RiskSet); 'Why' = ($null -ne $script:ctx.RiskSet)
             'Suggested owner' = ($null -ne $script:ctx.OwnerSet); 'Ownership note' = ($null -ne $script:ctx.OwnerSet)
             'Blocked for' = ($null -ne $script:ctx.BlockedSet)
-            'Tools' = [bool]$script:ui.DetailColsBox.IsChecked; 'MCP servers' = [bool]$script:ui.DetailColsBox.IsChecked
+            'Tools' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.ToolsSet); 'MCP servers' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.ToolsSet)
             'Shared with' = [bool]$script:ui.DetailColsBox.IsChecked; 'Channels' = [bool]$script:ui.DetailColsBox.IsChecked
+            'Permissions held' = ($null -ne $script:ctx.PermSet)
         }
         $script:ui.BtnApplyOwner.Visibility = if ($null -ne $script:ctx.OwnerSet) { 'Visible' } else { 'Collapsed' }
         foreach ($c in $script:ui.Grid.Columns) {
@@ -2285,6 +2432,8 @@ function New-ConsoleWindow {
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
+    $script:ui.ToolsBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunTools } })
+    $script:ui.PermBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunPerm } })
     $script:ui.OwnerBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunOwner } })
     $script:ui.BlockedBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunBlocked } })
 

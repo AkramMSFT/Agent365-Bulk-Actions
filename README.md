@@ -255,10 +255,13 @@ The picture is assembled from three places, because no single API has all of it:
 | Catalog package | Kind (shared by a creator, org-published, Microsoft, partner), publisher, version, dates, owner, who can use it, deployment, sharing lists, usage |
 | Defender `AgentsInfo` | Declared tools (with type, authentication and approval mode), MCP servers, data sources, capabilities, channels, model, sharing, published and lifecycle status |
 | Entra | The agent identity, its owners and sponsors, and the delegated and application permissions held by the identity and inherited from its blueprint |
+| Defender alerts and detections | The agent's risk signals for the last 30 days (severity, alert and detection counts, and each signal), the same ones `-Risky` uses |
 
 `-Inventory` makes one catalog call and one Defender query. `-Deep` adds one call per agent for usage and availability, and `-WithPermissions` adds the identity's permissions (agents with an identity only), so both take longer on a large catalog. Fields a tenant does not populate (for example `AgentsInfo.Permissions`, skills and guardrails were empty in the tenant used for testing) are simply blank.
 
-In the console, **Details...** (or a double-click on a row) opens a tabbed window: Overview, Sharing and availability, Tools and MCP, Data and capabilities, Permissions, Identity and ownership, and Usage, with **Export JSON**. The grid shows each agent's **Kind** by default, and the **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels (it reads the Defender records once).
+In the console, **Details...** (or a double-click on a row) opens a tabbed window: Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage and Risk, with **Export JSON**. The grid shows each agent's **Kind** by default, and the **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels (it reads the Defender records once).
+
+Two more filters answer questions about what agents can do. **Tools** lists agents that use an MCP server, have declared tools, or have none. **Permissions** lists agents whose Entra identity (or its blueprint) holds any permission, a Microsoft Graph application permission, or an MCP server permission, and adds a *Permissions held* column. The permission scan reads every agent that has an identity (94 in the test tenant, about a minute and a half the first time) and is cached until you refresh. Both combine with the other filters.
 
 ### Risky agents
 
