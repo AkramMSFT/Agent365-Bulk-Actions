@@ -83,10 +83,10 @@ Telemetry is matched to catalog packages through `AgentsInfo`: a package `id` eq
 # List all Copilot agents and their blocked state
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
-# Block specific agents by name and/or package id (P_ or T_) (comma-separated)
+# Block specific agents by name and/or package id (P_ or T_), comma-separated
 .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent","Northwind Sales Agent","P_19ae1zz1-..."
-.Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf                   # preview, changes nothing
-.Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -Force -OutFile .blocked.csv   # no prompt, keep a log
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf                   # preview, changes nothing
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -Force -OutFile .\blocked.csv   # no prompt, keep a log
 
 # Pick agents from a list (grid or numbered menu). Default action = block.
 .\Agent365-Bulk-Actions.ps1 -Select -AgentsOnly
