@@ -861,6 +861,54 @@ public class AgentRow : INotifyPropertyChanged {
 "@
 }
 
+$ConfirmXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Confirm the action" Width="500" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Grid Margin="28,24,28,22">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <StackPanel Orientation="Horizontal">
+      <Border x:Name="Badge" Width="40" Height="40" CornerRadius="20" Background="#FDE7E9">
+        <TextBlock x:Name="BadgeText" Text="!" FontSize="22" FontWeight="Bold" Foreground="#C42B1C" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
+        <TextBlock Text="Confirm the action" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
+        <TextBlock x:Name="Message" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap"/>
+      </StackPanel>
+    </StackPanel>
+    <Border Grid.Row="1" Margin="0,18,0,0" BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB">
+      <ListBox x:Name="Names" MaxHeight="190" BorderThickness="0" Background="Transparent" Padding="6,4"/>
+    </Border>
+    <TextBlock Grid.Row="2" Text="You can reverse this with the opposite action or Undo last run." Foreground="#6B7280" FontSize="12" Margin="0,12,0,0"/>
+    <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,22,0,0">
+      <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" IsDefault="True" MinWidth="100" Margin="0,0,10,0"/>
+      <Button x:Name="BtnOk" Style="{DynamicResource BtnDanger}" MinWidth="160"/>
+    </StackPanel>
+  </Grid>
+</Window>
+'@
+
+function New-ConfirmDialog {
+    param([object[]]$Rows, [string]$Verb, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($ConfirmXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $count = @($Rows).Count
+    $noun = if ($count -eq 1) { 'agent' } else { 'agents' }
+    $d.FindName('Message').Text = "You are about to $($Verb.ToLower()) $count $noun."
+    $names = $d.FindName('Names')
+    foreach ($r in @($Rows) | Select-Object -First 50) { [void]$names.Items.Add($r.Name) }
+    if ($count -gt 50) { [void]$names.Items.Add("... and $($count - 50) more") }
+    $ok = $d.FindName('BtnOk'); $ok.Content = "$Verb $count $noun"
+    if ($Verb -eq 'Unblock') {
+        $ok.SetResourceReference([Windows.Controls.Control]::StyleProperty, 'BtnGood')
+        $d.FindName('Badge').Background = '#DFF6DD'; $d.FindName('BadgeText').Foreground = '#0B6A0B'; $d.FindName('BadgeText').Text = 'i'
+    }
+    $script:confirmDialog = $d
+    $ok.Add_Click({ $script:confirmDialog.DialogResult = $true })
+    $d
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
@@ -1014,11 +1062,7 @@ function New-ConsoleWindow {
     }
     $script:ctx.Confirm = {
         param([object[]]$Rows, [string]$Verb)
-        $names = ($Rows | Select-Object -First 12 | ForEach-Object { "  - " + $_.Name }) -join "`n"
-        if ($Rows.Count -gt 12) { $names += "`n  ... and $($Rows.Count - 12) more" }
-        $answer = [Windows.MessageBox]::Show(("{0} {1} agent(s)?`n`n{2}`n`nThis can be reversed with the opposite action or Undo last run." -f $Verb, $Rows.Count, $names),
-            "Confirm $($Verb.ToLower())", 'YesNo', 'Warning', 'No')
-        $answer -eq 'Yes'
+        [bool](New-ConfirmDialog -Rows $Rows -Verb $Verb -Owner $script:w).ShowDialog()
     }
 
     $script:ctx.Apply = {

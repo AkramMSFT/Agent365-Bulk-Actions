@@ -134,7 +134,7 @@ Opens a Windows desktop window over the same catalog. It needs Windows and Power
 
 - **Browse**: the window opens on every agent in the catalog with no filter applied. Search by name, publisher, platform or id; filter All / Active / Blocked; optionally limit to Copilot agents.
 - **Filter**: the *Stale* and *Risk* dropdowns default to **None**. Pick a value to narrow the grid (no activity for 7 to 29 days, not modified for 30 to 365 days, or alert severity from Informational up to High); the matching columns fill in. The *Match* toggle controls how Stale and Risk combine: **All** (the default) needs both, **Any** accepts either. Search, status and Copilot-only always narrow on top. **Reset filters** returns everything to the unfiltered view.
-- **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A confirmation lists the agents first. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
+- **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A "Confirm the action" dialog lists the agents and offers Cancel (the default) or the matching Block or Unblock button. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
 - **Undo last run** reverses the previous action in the window. **Export list** saves what the grid shows as CSV or JSON.
 
 ### Risky agents
