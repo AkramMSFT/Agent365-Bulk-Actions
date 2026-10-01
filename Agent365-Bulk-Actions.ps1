@@ -83,6 +83,15 @@ param(
     [Parameter(ParameterSetName = 'Select', Mandatory)]
     [switch]$Select,                          # interactive multi-select picker
 
+    [Parameter(ParameterSetName = 'Undo', Mandatory)]
+    [string]$Undo,                            # reverse a previous run using its -OutFile log (.csv or .json)
+
+    [Parameter(ParameterSetName = 'FromCsv', Mandatory)]
+    [string]$FromCsv,                         # CSV with an Id and/or DisplayName column; apply -Action to every row
+
+    [Parameter(ParameterSetName = 'Gui', Mandatory)]
+    [switch]$Gui,                             # open the graphical console
+
     [Parameter(ParameterSetName = 'Stale', Mandatory)]
     [switch]$Stale,                           # act on agents stale > StaleDays
 
@@ -121,6 +130,7 @@ param(
     [Parameter(ParameterSetName = 'Select')]
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
+    [Parameter(ParameterSetName = 'FromCsv')]
     [ValidateSet('block', 'unblock', 'list')]
     [string]$Action = 'block',                # what to do with the matched set ('list' = preview only)
 
@@ -164,10 +174,10 @@ Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -eq 'List') -or
-            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky') -and $Action -eq 'list')
+            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
-    $PSCmdlet.ParameterSetName -eq 'Risky') { $scopes += 'ThreatHunting.Read.All' }
+    $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -533,6 +543,44 @@ switch ($PSCmdlet.ParameterSetName) {
                           @{ n = 'hosts'; e = { ($_.supportedHosts) -join ',' } }, type |
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
+    }
+    'Undo' {
+        if (-not (Test-Path -LiteralPath $Undo)) { throw "Log not found: $Undo" }
+        $rows = if ($Undo -match '\.json$') { @(Get-Content -Raw -LiteralPath $Undo | ConvertFrom-Json) }
+                else { @(Import-Csv -LiteralPath $Undo) }
+        $changed = @($rows | Where-Object { $_.Result -eq 'Done' })
+        if ($changed.Count -eq 0) { Write-Host 'The log has no changes to undo.'; break }
+        $catalog = @(Get-Packages)
+        $restore = @{ block = @(); unblock = @() }
+        foreach ($r in $changed) {
+            $pkg = $catalog | Where-Object { $_.id -eq $r.Id } | Select-Object -First 1
+            if (-not $pkg) { Write-Warning "Package $($r.Id) no longer exists; skipped."; continue }
+            $wasBlocked = [string]$r.WasBlocked -eq 'True'
+            $restore[$(if ($wasBlocked) { 'block' } else { 'unblock' })] += $pkg
+        }
+        Write-Host ("Undo restores {0} package(s) to their state before the logged run." -f ($restore.block.Count + $restore.unblock.Count)) -ForegroundColor Cyan
+        foreach ($verb in 'block', 'unblock') {
+            if ($restore[$verb].Count -eq 0) { continue }
+            $restore[$verb] | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host
+            if (-not (Confirm-Batch -Count $restore[$verb].Count -Action $verb)) { Write-Host 'Cancelled.'; continue }
+            Invoke-PackageAction -Packages $restore[$verb] -Action $verb
+        }
+    }
+    'FromCsv' {
+        if (-not (Test-Path -LiteralPath $FromCsv)) { throw "File not found: $FromCsv" }
+        $names = foreach ($row in Import-Csv -LiteralPath $FromCsv) {
+            $v = foreach ($c in 'Id', 'DisplayName', 'Name', 'Package') { if ($row.$c) { $row.$c; break } }
+            if ($v) { $v.Trim() }
+        }
+        if (-not $names) { throw "No Id or DisplayName values found in $FromCsv." }
+        $targets = @(Resolve-Packages @($names))
+        $pending = @($targets | Where-Object { [bool]$_.isBlocked -ne ($Action -eq 'block') })
+        Write-Host ("{0} package(s) from the file{1}." -f $targets.Count,
+            $(if ($Action -ne 'list') { "; $($pending.Count) need $Action" } else { '' })) -ForegroundColor Cyan
+        $targets | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host
+        if ($Action -eq 'list') { break }
+        if (-not (Confirm-Batch -Count $pending.Count -Action $Action)) { Write-Host 'Cancelled.'; break }
+        Invoke-PackageAction -Packages $targets -Action $Action
     }
     { $_ -in 'Block', 'Unblock' } {
         $verb = $_.ToLower()
