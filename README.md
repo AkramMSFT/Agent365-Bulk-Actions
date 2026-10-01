@@ -83,8 +83,10 @@ Telemetry is matched to catalog packages through `AgentsInfo`: a package `id` eq
 # List all Copilot agents and their blocked state
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
-# Block specific agents by name and/or P_ id (comma-separated)
+# Block specific agents by name and/or package id (P_ or T_) (comma-separated)
 .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent","Northwind Sales Agent","P_19ae1zz1-..."
+.Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf                   # preview, changes nothing
+.Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -Force -OutFile .blocked.csv   # no prompt, keep a log
 
 # Pick agents from a list (grid or numbered menu). Default action = block.
 .\Agent365-Bulk-Actions.ps1 -Select -AgentsOnly
@@ -144,14 +146,19 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-IncludeNeverSeen` | switch | Activity mode: also treat agents with zero telemetry as stale. |
 | `-Action` | `block` / `unblock` / `list` | What to do with the matched set. `list` = preview only (dry run). |
 | `-AgentsOnly` | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
-| `-Force` | switch | Skip the "proceed?" confirmation (Stale mode). |
-| `-Pick` | switch | Choose which stale matches to act on via the picker. |
+| `-Force` | switch | Skip the "proceed?" confirmation for any write mode. |
+| `-WhatIf` | switch | Show what would be blocked or unblocked without changing anything. |
+| `-OutFile` | path (.csv or .json) | Write a per-agent result log: timestamp, operator, action, id, name, state before the run, result, error. |
+| `-Pick` | switch | Choose which stale or risky matches to act on via the picker (the selection counts as confirmation). |
 | `-TenantId` | GUID/domain (optional) | Target a specific tenant (default = your home tenant). |
 | `-DeviceCode` | switch | Use device‑code sign‑in when interactive/WAM auth misbehaves. |
 
 ## Safety & good practice
 
-- **Dry run first.** Add `-Action list` to preview before any bulk change.
+- **Dry run first.** Add `-Action list` or `-WhatIf` to preview before any bulk change.
+- **Every write asks once.** `-Block`, `-Unblock`, `-Stale` and `-Risky` show the target set and ask before acting; `-Force` skips the prompt. Agents already in the target state are skipped.
+- **Keep a record.** `-OutFile ./run.csv` logs each agent with the state it had before the run, which is what you need to reverse a batch.
+- **Throttling is handled.** Graph 429 and transient 5xx responses are retried with the `Retry-After` delay.
 - **Everything is reversible.** `-Unblock` restores anything you block.
 - **Start narrow.** Use `-AgentsOnly` and a specific `-StaleDays`; widen only once the preview looks right.
 - **Mind the retention window.** With `-By activity` you can only prove ~30 days of inactivity.

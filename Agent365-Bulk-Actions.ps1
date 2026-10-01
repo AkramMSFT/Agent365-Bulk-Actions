@@ -69,7 +69,7 @@
 
   Project home / license: see the repository README and LICENSE.
 #>
-[CmdletBinding(DefaultParameterSetName = 'List')]
+[CmdletBinding(DefaultParameterSetName = 'List', SupportsShouldProcess)]
 param(
     [Parameter(ParameterSetName = 'List')]
     [switch]$List,
@@ -130,9 +130,9 @@ param(
     [Parameter(ParameterSetName = 'Risky')]
     [switch]$AgentsOnly,                       # filter supportedHosts eq 'Copilot'
 
-    [Parameter(ParameterSetName = 'Stale')]
-    [Parameter(ParameterSetName = 'Risky')]
-    [switch]$Force,                           # skip the "proceed?" confirmation
+    [switch]$Force,                           # skip the "proceed?" confirmation for any write
+
+    [string]$OutFile,                         # write a per-agent result log (.csv or .json)
 
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
@@ -173,6 +173,25 @@ if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
 Connect-MgGraph @connect
 
+# Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
+function Invoke-Graph {
+    param([string]$Method = 'GET', [string]$Uri, [string]$Body, [string]$ContentType)
+    $call = @{ Method = $Method; Uri = $Uri }
+    if ($Body) { $call['Body'] = $Body; $call['ContentType'] = $ContentType }
+    for ($attempt = 1; ; $attempt++) {
+        try { return Invoke-MgGraphRequest @call }
+        catch {
+            $resp = $_.Exception.Response
+            $code = if ($resp -and $resp.StatusCode) { [int]$resp.StatusCode } else { 0 }
+            if ($code -notin 429, 502, 503, 504 -or $attempt -ge 5) { throw }
+            $wait = [Math]::Pow(2, $attempt)
+            try { if ($resp.Headers.RetryAfter.Delta) { $wait = [Math]::Max($wait, $resp.Headers.RetryAfter.Delta.TotalSeconds) } } catch { $null = $_ }
+            Write-Warning ("HTTP {0}; retrying in {1:N0}s (attempt {2}/5)." -f $code, $wait, $attempt)
+            Start-Sleep -Seconds $wait
+        }
+    }
+}
+
 function Get-Packages {
     param([switch]$AgentsOnly)
     $uri = if ($AgentsOnly) {
@@ -180,7 +199,7 @@ function Get-Packages {
     } else { $Base }
     $all = @()
     do {
-        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri
+        $resp = Invoke-Graph -Uri $uri
         # Invoke-MgGraphRequest returns each item as a Hashtable; cast to PSCustomObject so
         # Select-Object / Format-Table can resolve displayName, id, isBlocked as real properties.
         foreach ($v in $resp.value) { $all += [pscustomobject]$v }
@@ -189,23 +208,19 @@ function Get-Packages {
     $all
 }
 
-# Resolve a mix of P_ ids and display names to concrete package objects (fetches list once).
+# Resolve a mix of package ids (P_ or T_) and display names to concrete catalog objects, so every
+# target is validated and carries its current isBlocked state.
 function Resolve-Packages {
     param([string[]]$Names)
-    $catalog = $null
-    $resolved = @()
-    foreach ($n in $Names) {
-        if ($n -like 'P_*') {
-            $resolved += [pscustomobject]@{ id = $n; displayName = $n }
-            continue
-        }
-        if (-not $catalog) { $catalog = Get-Packages }        # lazy: only if a name is used
-        $hit = @($catalog | Where-Object { $_.displayName -eq $n })
-        if ($hit.Count -eq 0) { throw "No package named '$n'. Run -List to see names/ids." }
-        if ($hit.Count -gt 1) { throw "Multiple packages named '$n'. Use the exact P_ id instead." }
-        $resolved += $hit[0]
+    $catalog = @(Get-Packages)
+    $resolved = foreach ($n in $Names) {
+        $hit = if ($n -match '^[PT]_') { @($catalog | Where-Object { $_.id -eq $n }) }
+               else { @($catalog | Where-Object { $_.displayName -eq $n }) }
+        if ($hit.Count -eq 0) { throw "No package matching '$n'. Run -List to see names/ids." }
+        if ($hit.Count -gt 1) { throw "Multiple packages named '$n'. Use the exact package id instead." }
+        $hit[0]
     }
-    $resolved
+    @($resolved | Sort-Object id -Unique)
 }
 
 # Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
@@ -234,8 +249,7 @@ function Get-PackageKeys {
 function Invoke-HuntingQuery {
     param([string]$Query, [string]$Hint)
     try {
-        $resp = Invoke-MgGraphRequest -Method POST `
-            -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' `
+        $resp = Invoke-Graph -Method POST -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' `
             -Body (@{ Query = $Query } | ConvertTo-Json) -ContentType 'application/json'
     } catch {
         throw ("Advanced Hunting query failed ({0}). {1}" -f $_.Exception.Message, $Hint)
@@ -459,25 +473,57 @@ function Show-RiskyPreview {
         Format-Table -AutoSize -Wrap | Out-Host
 }
 
-# Apply block/unblock to each package; keep going on error, then summarize.
+# Ask once before a batch write. -Force and -WhatIf skip the prompt; a picker selection counts as consent.
+function Confirm-Batch {
+    param([int]$Count, [string]$Action, [switch]$Implied)
+    if ($Implied -or $Force -or $WhatIfPreference) { return $true }
+    (Read-Host ("Proceed to {0} {1} package(s)? [y/N]" -f $Action, $Count)) -match '^(y|yes)$'
+}
+
+# Save the per-agent results (and the state each agent had before the run) as CSV or JSON.
+function Export-ActionLog {
+    param([object[]]$Records)
+    if (-not $OutFile -or $Records.Count -eq 0) { return }
+    if ($OutFile -match '\.json$') { $Records | ConvertTo-Json -Depth 3 | Set-Content -Path $OutFile -Encoding utf8 }
+    else { $Records | Export-Csv -Path $OutFile -NoTypeInformation -Encoding utf8 }
+    Write-Host "Result log: $OutFile" -ForegroundColor Cyan
+}
+
+# Apply block/unblock to each package; skip ones already in the target state, keep going on
+# error, then summarize. Honours -WhatIf and records the outcome per package.
 function Invoke-PackageAction {
     param([object[]]$Packages, [ValidateSet('block', 'unblock')][string]$Action)
     if (-not $Packages -or $Packages.Count -eq 0) { Write-Host 'Nothing selected.'; return }
 
+    $want = ($Action -eq 'block')
+    $who = (Get-MgContext).Account
     $verb = $Action.Substring(0,1).ToUpper() + $Action.Substring(1)
     Write-Host ("`n{0} {1} package(s):" -f $verb, $Packages.Count) -ForegroundColor Cyan
-    $ok = 0; $fail = 0
+    $log = @(); $ok = 0; $skip = 0; $fail = 0
     foreach ($p in $Packages) {
-        try {
-            Invoke-MgGraphRequest -Method POST -Uri "$Base/$($p.id)/$Action" | Out-Null   # 204
-            Write-Host ("  OK   {0}  ({1})" -f $p.displayName, $p.id) -ForegroundColor Green
-            $ok++
-        } catch {
-            Write-Host ("  FAIL {0}  ({1}) -> {2}" -f $p.displayName, $p.id, $_.Exception.Message) -ForegroundColor Red
-            $fail++
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action
+            Id = $p.id; DisplayName = $p.displayName; WasBlocked = $p.isBlocked; Result = ''; Error = ''
         }
+        if ($null -ne $p.isBlocked -and [bool]$p.isBlocked -eq $want) {
+            Write-Host ("  SKIP {0}  ({1}) already {2}ed" -f $p.displayName, $p.id, $Action) -ForegroundColor DarkGray
+            $rec.Result = 'Skipped'; $skip++
+        } elseif (-not $PSCmdlet.ShouldProcess(("{0} ({1})" -f $p.displayName, $p.id), $verb)) {
+            $rec.Result = 'WhatIf'
+        } else {
+            try {
+                Invoke-Graph -Method POST -Uri "$Base/$($p.id)/$Action" | Out-Null   # 204
+                Write-Host ("  OK   {0}  ({1})" -f $p.displayName, $p.id) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            } catch {
+                Write-Host ("  FAIL {0}  ({1}) -> {2}" -f $p.displayName, $p.id, $_.Exception.Message) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+            }
+        }
+        $log += [pscustomobject]$rec
     }
-    Write-Host ("Done: {0} {1}ed, {2} failed." -f $ok, $Action, $fail) -ForegroundColor Cyan
+    Write-Host ("Done: {0} {1}ed, {2} skipped, {3} failed." -f $ok, $Action, $skip, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
 }
 
 switch ($PSCmdlet.ParameterSetName) {
@@ -488,8 +534,15 @@ switch ($PSCmdlet.ParameterSetName) {
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
     }
-    'Block'   { Invoke-PackageAction -Packages (Resolve-Packages $Block)   -Action 'block' }
-    'Unblock' { Invoke-PackageAction -Packages (Resolve-Packages $Unblock) -Action 'unblock' }
+    { $_ -in 'Block', 'Unblock' } {
+        $verb = $_.ToLower()
+        $targets = @(Resolve-Packages $(if ($verb -eq 'block') { $Block } else { $Unblock }))
+        $pending = @($targets | Where-Object { [bool]$_.isBlocked -ne ($verb -eq 'block') })
+        Write-Host ("{0} of {1} target(s) need {2}." -f $pending.Count, $targets.Count, $verb) -ForegroundColor Cyan
+        $targets | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host
+        if (-not (Confirm-Batch -Count $pending.Count -Action $verb)) { Write-Host 'Cancelled.'; break }
+        Invoke-PackageAction -Packages $targets -Action $verb
+    }
     'Select'  {
         $catalog = @(Get-Packages -AgentsOnly:$AgentsOnly)
         if ($catalog.Count -eq 0) { throw 'No packages returned (check the Agent 365 license / permissions).' }
@@ -520,10 +573,7 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($matched.Count -eq 0) { Write-Host 'Nothing selected.'; break }
         }
 
-        if (-not $Force -and -not $Pick) {
-            $ans = Read-Host ("Proceed to {0} these {1} agent(s)? [y/N]" -f $Action, $matched.Count)
-            if ($ans -notmatch '^(y|yes)$') { Write-Host 'Cancelled.'; break }
-        }
+        if (-not (Confirm-Batch -Count $matched.Count -Action $Action -Implied:$Pick)) { Write-Host 'Cancelled.'; break }
         Invoke-PackageAction -Packages $matched -Action $Action
     }
     'Risky'   {
@@ -543,10 +593,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $matched = @(Invoke-Picker -Packages $matched -Title "Risky agents to $Action - select which (Ctrl/Shift), then OK")
             if ($matched.Count -eq 0) { Write-Host 'Nothing selected.'; break }
         }
-        if (-not $Force -and -not $Pick) {
-            $ans = Read-Host ("Proceed to {0} these {1} agent(s)? [y/N]" -f $Action, $matched.Count)
-            if ($ans -notmatch '^(y|yes)$') { Write-Host 'Cancelled.'; break }
-        }
+        if (-not (Confirm-Batch -Count $matched.Count -Action $Action -Implied:$Pick)) { Write-Host 'Cancelled.'; break }
         Invoke-PackageAction -Packages $matched -Action $Action
     }
 }
