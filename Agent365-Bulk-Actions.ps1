@@ -98,6 +98,19 @@ param(
     [Parameter(ParameterSetName = 'Reassign', Mandatory)]
     [string]$To,                             # UPN or object id of the new owner
 
+    [Parameter(ParameterSetName = 'DeleteCandidates', Mandatory)]
+    [switch]$DeleteCandidates,               # list blocked agents that have stayed blocked long enough to delete
+
+    [Parameter(ParameterSetName = 'DeleteCandidates')]
+    [ValidateRange(0, 3650)]
+    [int]$MinDaysBlocked = 30,                # delete-candidate threshold
+
+    [Parameter(ParameterSetName = 'DeleteCandidates')]
+    [string[]]$History,                       # extra -OutFile logs or folders that record when agents were blocked
+
+    [Parameter(ParameterSetName = 'DeleteCandidates')]
+    [switch]$IncludeUnknown,                  # also list blocked agents whose block date cannot be determined
+
     [Parameter(ParameterSetName = 'Gui', Mandatory)]
     [switch]$Gui,                             # open the graphical console
 
@@ -156,6 +169,10 @@ param(
 
     [switch]$Force,                           # skip the "proceed?" confirmation for any write
 
+    [switch]$DisableIdentity,                 # block also DISABLES the agent's Entra identity; unblock re-enables it
+
+    [switch]$Impact,                          # show active users, sessions and last use for each target before acting
+
     [string]$OutFile,                         # write a per-agent result log (.csv or .json)
 
     [Parameter(ParameterSetName = 'Stale')]
@@ -195,6 +212,8 @@ $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackage
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
+if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.EnableDisable.All' }
+if ($PSCmdlet.ParameterSetName -eq 'DeleteCandidates') { $scopes += 'ThreatHunting.Read.All' }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -693,8 +712,16 @@ function Export-ActionLog {
     Write-Host "Result log: $OutFile" -ForegroundColor Cyan
 }
 
+# Enable or disable the Entra agent identity behind a package (containment that also stops runtime sign-in).
+function Set-AgentIdentityState {
+    param([string]$AgentIdentityId, [bool]$Enabled)
+    Invoke-Graph -Method PATCH -Uri "https://graph.microsoft.com/beta/servicePrincipals/$AgentIdentityId/microsoft.graph.agentIdentity" `
+        -Body (@{ accountEnabled = $Enabled } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+}
+
 # Apply block/unblock to each package; skip ones already in the target state, keep going on
-# error, then summarize. Honours -WhatIf and records the outcome per package.
+# error, then summarize. Honours -WhatIf and records the outcome per package. With
+# -DisableIdentity the agent's Entra identity is disabled on block and re-enabled on unblock.
 function Invoke-PackageAction {
     param([object[]]$Packages, [ValidateSet('block', 'unblock')][string]$Action, [switch]$PassThru)
     if (-not $Packages -or $Packages.Count -eq 0) { Write-Host 'Nothing selected.'; return }
@@ -707,7 +734,7 @@ function Invoke-PackageAction {
     foreach ($p in $Packages) {
         $rec = [ordered]@{
             Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action
-            Id = $p.id; DisplayName = $p.displayName; WasBlocked = $p.isBlocked; Result = ''; Error = ''
+            Id = $p.id; DisplayName = $p.displayName; WasBlocked = $p.isBlocked; Result = ''; Identity = ''; Error = ''
         }
         if ($null -ne $p.isBlocked -and [bool]$p.isBlocked -eq $want) {
             Write-Host ("  SKIP {0}  ({1}) already {2}ed" -f $p.displayName, $p.id, $Action) -ForegroundColor DarkGray
@@ -724,6 +751,16 @@ function Invoke-PackageAction {
                 $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
             }
         }
+        if ($DisableIdentity -and $p.agentIdentityId -and $rec.Result -in 'Done', 'Skipped') {
+            try {
+                Set-AgentIdentityState -AgentIdentityId $p.agentIdentityId -Enabled (-not $want)
+                $rec.Identity = if ($want) { 'Disabled' } else { 'Enabled' }
+                Write-Host ("       identity {0}" -f $rec.Identity.ToLower()) -ForegroundColor DarkGreen
+            } catch {
+                $rec.Identity = 'Failed'; $rec.Error = ($rec.Error + ' identity: ' + $_.Exception.Message).Trim()
+                Write-Host ("       identity change failed -> {0}" -f $_.Exception.Message) -ForegroundColor Red
+            }
+        }
         $log += [pscustomobject]$rec
     }
     Write-Host ("Done: {0} {1}ed, {2} skipped, {3} failed." -f $ok, $Action, $skip, $fail) -ForegroundColor Cyan
@@ -731,6 +768,73 @@ function Invoke-PackageAction {
     if ($PassThru) { $log }
 }
 
+# Usage figures live only on the per-package detail call, so fetch them for the targets, not the whole catalog.
+function Add-PackageUsage {
+    param([object[]]$Packages)
+    foreach ($p in $Packages) {
+        try {
+            $d = Invoke-Graph -Uri "$Base/$($p.id)"
+            $p | Add-Member -NotePropertyName ActiveUsers -NotePropertyValue $d.activeUsers -Force
+            $p | Add-Member -NotePropertyName Sessions    -NotePropertyValue $d.totalSessions -Force
+            $p | Add-Member -NotePropertyName LastUsed    -NotePropertyValue $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }) -Force
+        } catch { $null = $_ }
+    }
+    $Packages
+}
+
+# Preview of the targets with their blast radius (who would lose the agent).
+function Show-ImpactPreview {
+    param([object[]]$Packages)
+    Add-PackageUsage $Packages | Out-Null
+    $Packages | Select-Object displayName, id, isBlocked, ActiveUsers, Sessions, LastUsed | Format-Table -AutoSize | Out-Host
+}
+
+# Blocked agents that have stayed blocked at least MinDaysBlocked. The block date comes from this
+# tool's own logs and, for the last ~30 days, from the BlockedAgent/UnblockedAgent audit events.
+function Get-DeleteCandidates {
+    param([int]$MinDays, [string[]]$HistoryPaths, [switch]$IncludeUnknown)
+    $logDir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+    $files = @()
+    foreach ($p in @($logDir) + @($HistoryPaths)) {
+        if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
+        $item = Get-Item -LiteralPath $p
+        $files += if ($item.PSIsContainer) { @(Get-ChildItem -LiteralPath $p -File | Where-Object { $_.Extension -in '.csv', '.json' }) } else { $item }
+    }
+    $events = @()
+    foreach ($file in ($files | Sort-Object FullName -Unique)) {
+        $rows = if ($file.Extension -eq '.json') { @(Get-Content -Raw -LiteralPath $file.FullName | ConvertFrom-Json) } else { @(Import-Csv -LiteralPath $file.FullName) }
+        foreach ($r in $rows) {
+            if ($r.Result -eq 'Done' -and $r.Action -in 'block', 'unblock' -and $r.Id -and $r.Timestamp) {
+                $events += [pscustomobject]@{ Id = $r.Id; At = [datetimeoffset]$r.Timestamp; Action = $r.Action; Source = 'kit log' }
+            }
+        }
+    }
+    try {
+        $audit = Invoke-HuntingQuery -Hint 'Audit events unavailable; relying on kit logs.' -Query ('CloudAppEvents | where Timestamp > ago(30d) and ActionType in ("BlockedAgent", "UnblockedAgent")' +
+            ' | extend d = todynamic(RawEventData) | project Timestamp, ActionType, AgentId = tostring(d.AgentId)')
+        foreach ($a in $audit) {
+            $events += [pscustomobject]@{ Id = [string]$a.AgentId; At = [datetimeoffset]$a.Timestamp; Action = $(if ($a.ActionType -eq 'BlockedAgent') { 'block' } else { 'unblock' }); Source = 'audit' }
+        }
+    } catch { Write-Warning $_.Exception.Message }
+
+    $latest = @{}
+    foreach ($e in ($events | Sort-Object At)) { $latest[$e.Id.ToLower()] = $e }
+    $now = [datetimeoffset]::UtcNow
+    $out = foreach ($p in (Get-Packages | Where-Object { $_.isBlocked })) {
+        $e = $latest[$p.id.ToLower()]
+        $since = if ($e -and $e.Action -eq 'block') { $e.At } else { $null }
+        $days = if ($since) { [int]($now - $since).TotalDays } else { $null }
+        if (($null -ne $days -and $days -ge $MinDays) -or ($null -eq $days -and $IncludeUnknown)) {
+            [pscustomobject]@{
+                Agent = $p.displayName; Id = $p.id; Platform = $(if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { $p.type })
+                BlockedSince = $(if ($since) { $since.ToString('yyyy-MM-dd') } else { 'unknown' }); DaysBlocked = $days
+                Evidence = $(if ($e) { $e.Source } else { 'none' })
+                DeleteVia = $(if ($p.platform -match 'Copilot Studio') { 'Admin center, or Power Platform API' } else { 'Admin center' })
+            }
+        }
+    }
+    @($out | Sort-Object @{ e = { $null -eq $_.DaysBlocked } }, @{ e = { $_.DaysBlocked }; Descending = $true })
+}
 # ---------------------------------------------------------------------------------------------
 # Graphical console (-Gui): WPF window over the same catalog, stale, risky, block and unblock logic.
 # ---------------------------------------------------------------------------------------------
@@ -1350,6 +1454,14 @@ switch ($PSCmdlet.ParameterSetName) {
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
     }
+    'DeleteCandidates' {
+        $c = @(Get-DeleteCandidates -MinDays $MinDaysBlocked -HistoryPaths $History -IncludeUnknown:$IncludeUnknown)
+        Write-Host ("`n{0} blocked agent(s) have been blocked {1}+ days{2}." -f $c.Count, $MinDaysBlocked, $(if ($IncludeUnknown) { ' (or for an unknown time)' } else { '' })) -ForegroundColor Cyan
+        if ($c.Count -eq 0) { break }
+        $c | Format-Table -AutoSize | Out-Host
+        Export-ActionLog -Records $c
+        Write-Host 'This tool does not delete agents: the catalog API has no delete. Delete them in the admin center (Agents > All agents > Delete, then Deleted > Permanently delete).' -ForegroundColor Yellow
+    }
     'Ownerless' {
         $report = Get-OwnerReport -Packages @(Get-Packages)
         Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published agent(s) have no owner but cannot be reassigned through the API." -f
@@ -1420,7 +1532,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $targets = @(Resolve-Packages $(if ($verb -eq 'block') { $Block } else { $Unblock }))
         $pending = @($targets | Where-Object { [bool]$_.isBlocked -ne ($verb -eq 'block') })
         Write-Host ("{0} of {1} target(s) need {2}." -f $pending.Count, $targets.Count, $verb) -ForegroundColor Cyan
-        $targets | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host
+        if ($Impact) { Show-ImpactPreview $targets } else { $targets | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host }
         if (-not (Confirm-Batch -Count $pending.Count -Action $verb)) { Write-Host 'Cancelled.'; break }
         Invoke-PackageAction -Packages $targets -Action $verb
     }
@@ -1445,6 +1557,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $(if ($Action -ne 'list') { " needing $Action" } else { '' })) -ForegroundColor Cyan
         if ($matched.Count -eq 0) { break }
         Show-StalePreview -Packages $matched -Basis $By
+        if ($Impact) { Show-ImpactPreview $matched }
 
         if ($Action -eq 'list') { break }        # preview only
 
@@ -1467,6 +1580,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $(if ($Action -ne 'list') { " needing $Action" } else { '' }), $RiskSource.ToLower()) -ForegroundColor Cyan
         if ($matched.Count -eq 0) { break }
         Show-RiskyPreview -Packages $matched
+        if ($Impact) { Show-ImpactPreview $matched }
 
         if ($Action -eq 'list') { break }
 
