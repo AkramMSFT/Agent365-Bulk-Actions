@@ -15,7 +15,13 @@ Beyond one‑off actions, it can bulk‑block **stale** agents — those that ha
 - **Block / unblock** one or many agents by display name and/or `P_` id in a single command.
 - **Pick** agents interactively from a grid or numbered menu — no need to type names.
 - Find and **block stale agents** by inactivity (Defender telemetry) or by manifest age.
-- **Preview everything first** with a dry run before changing anything.
+- **Preview everything first** with a dry run (`-WhatIf` or `-Action list`) before changing anything.
+- Find **risky** agents from alerts and from Defender detections that never raised an alert.
+- Fix **ownership** gaps: propose an owner for orphaned shared agents, or assign one by hand.
+- **Contain** agents by also disabling their Entra identity, and see each agent's blast radius first.
+- Track **delete candidates** (agents that stayed blocked) for clean-up in the admin center.
+- Run a repeatable **policy file**, keep **snapshots**, and **undo** a run from its log.
+- Use the **graphical console** (`-Gui`) for all of the above.
 
 > Blocking is fully reversible — the same tool re‑enables an agent with `-Unblock`.
 
