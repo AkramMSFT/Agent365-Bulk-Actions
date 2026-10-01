@@ -183,6 +183,52 @@ Notes:
 - **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
 - **`-DeleteCandidates`** does not delete anything. The catalog API has no delete, and nothing deletes blocked agents automatically; a block lasts until someone reverses it. The report lists blocked agents that have been blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files, plus the GUI's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add other log files or folders with `-History`) and from the `BlockedAgent` audit events, which Defender keeps for about 30 days. Agents whose block date cannot be determined are skipped unless you add `-IncludeUnknown`. Delete the listed agents in the admin center (**Agents > All agents > Delete**, then **Deleted > Permanently delete**), or for Copilot Studio agents through the Power Platform API.
 
+### Policy file
+
+Declare your governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
+
+```powershell
+# Show what the policy would do (changes nothing)
+.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json
+
+# Run it (one confirmation for the whole plan; -WhatIf previews, -OutFile keeps a log)
+.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json -Apply -OutFile .\policy-run.csv
+```
+
+```json
+{
+  "name": "Agent governance baseline",
+  "exclude": { "publishers": ["Microsoft Corporation"], "types": ["firstParty"], "names": [], "ids": [] },
+  "rules": [
+    { "name": "Contain high-risk agents",
+      "when": { "risky": { "minSeverity": "High", "source": "Both" } },
+      "then": { "action": "block", "disableIdentity": true } }
+  ]
+}
+```
+
+| Part | Values |
+| --- | --- |
+| `when` conditions | `stale` (`by`: activity or modified, `days`, optional `includeNeverSeen`), `risky` (`minSeverity`, `minSignals`, `source`), `blockedDays`, `ownerless` (true), `state` (blocked or active) |
+| `match` | `all` (default, every condition must hold) or `any` |
+| `then.action` | `block`, `unblock`, `reassign` (applies the proposed owners), or `report` (list only, the default) |
+| `then.disableIdentity` | With `block`: also disable the agent's Entra identity |
+| `exclude` | Agents to leave alone, by `ids`, `names`, `publishers` or `types` |
+
+A rule must have at least one condition, so a typo can never match the whole catalog. Rules that would change nothing (an agent already blocked) are shown but not counted. Reassignment, like the other write modes, needs a signed-in administrator and cannot run unattended.
+
+### Snapshots and change reports
+
+```powershell
+# Save today's inventory
+.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-01.json
+
+# Later: save a new one and list what changed since the old one
+.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-08.json -CompareTo .\inventory-2026-10-01.json -OutFile .\changes.csv
+```
+
+The report lists agents that are new or removed, newly blocked or unblocked, and those whose owner or version changed.
+
 ### Risky agents
 
 `-Risky` finds agents with Defender **Security for AI** signals and enriches each with **`severity`**, **`alerts`**, **`detections`**, **`why`** (alert titles and detection types), **`categories`** and the date of the last signal. Results are sorted worst-severity-first. Use `-MinSeverity` and `-MinAlerts` to narrow them, then block with the same preview and confirm/pick flow.
@@ -221,6 +267,10 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-DeleteCandidates` | switch | List agents that have stayed blocked at least `-MinDaysBlocked` days (default 30). Reports only; nothing is deleted. |
 | `-History` | paths | Extra result logs or folders that record when agents were blocked. |
 | `-IncludeUnknown` | switch | With `-DeleteCandidates`, also list blocked agents whose block date is unknown. |
+| `-Policy` | path | Evaluate a JSON policy file and print the plan. Nothing changes without `-Apply`. |
+| `-Apply` | switch | With `-Policy`, run the plan. |
+| `-Snapshot` | path | Save the inventory to a JSON file. |
+| `-CompareTo` | path | With `-Snapshot`, list changes since an earlier snapshot. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
 | `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |
@@ -348,6 +398,16 @@ union alerts, rtp, shield
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 ```
 
+
+## Development
+
+```powershell
+# Tests (Pester 5+) and lint (PSScriptAnalyzer); CI runs the same on every pull request
+Invoke-Pester -Path .\tests
+Invoke-ScriptAnalyzer -Path .\Agent365-Bulk-Actions.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+```
+
+Dot-sourcing the script (`. .\Agent365-Bulk-Actions.ps1`) loads its functions without signing in or running anything, which is how the tests exercise them with mocked Graph calls.
 ## Disclaimer
 
 Provided as‑is, without warranty of any kind. It targets a `/beta` Microsoft Graph API that can change without notice. Not an official Microsoft product. Test in a non‑production tenant first. See [LICENSE](LICENSE).

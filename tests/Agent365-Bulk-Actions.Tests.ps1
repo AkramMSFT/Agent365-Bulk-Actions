@@ -264,3 +264,83 @@ Describe 'Graph retry' {
         $script:calls | Should -Be 3
     }
 }
+
+Describe 'Policy plan' {
+    BeforeEach {
+        $script:catalog = @((New-Pkg 'T_a' 'Alpha'), (New-Pkg 'T_b' 'Beta' -Blocked $true), (New-Pkg 'T_c' 'Gamma'), (New-Pkg 'T_ms' 'Microsoft thing' -Type 'firstParty'))
+        $script:catalog[3] | Add-Member -NotePropertyName publisher -NotePropertyValue 'Microsoft Corporation' -Force
+        Mock Get-Packages { $script:catalog }
+        Mock Get-StalePackages { @($script:catalog[0], $script:catalog[1], $script:catalog[3]) }
+        Mock Get-RiskyPackages { @($script:catalog[0], $script:catalog[2]) }
+        Mock Get-OwnerReport { [pscustomobject]@{ Items = @([pscustomobject]@{ Id = 'T_c'; State = 'Proposed'; ProposedId = 'u1'; Proposed = 'u1@contoso.com'; Source = 'Agent identity owner' }); OkCount = 0; OrgPublished = 0 } }
+        Mock Get-DeleteCandidates { @([pscustomobject]@{ Id = 'T_b' }) }
+        function Doc($json) { $json | ConvertFrom-Json }
+    }
+    It 'combines conditions with AND by default and OR on request' {
+        $and = Doc '{ "rules": [ { "name": "r", "when": { "stale": { "days": 14 }, "risky": { "minSeverity": "High" } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $and).Matched.id | Should -Be @('T_a')
+        $any = Doc '{ "rules": [ { "name": "r", "match": "any", "when": { "stale": { "days": 14 }, "risky": { } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $any).Matched.id | Should -Contain 'T_c'
+        (Get-PolicyPlan $any).Matched.id | Should -Contain 'T_b'
+    }
+    It 'applies exclusions by publisher, type, name and id' {
+        $d = Doc '{ "exclude": { "publishers": ["Microsoft Corporation"], "names": ["Beta"] }, "rules": [ { "name": "r", "when": { "stale": { "days": 14 } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $d).Matched.id | Should -Be @('T_a')
+    }
+    It 'only plans changes that would actually change state' {
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "stale": { "days": 14 } }, "then": { "action": "block" } } ] }'
+        $p = Get-PolicyPlan $d
+        $p.Matched.Count | Should -Be 3
+        $p.Actionable.id | Should -Not -Contain 'T_b'   # already blocked
+    }
+    It 'plans reassignment only where an owner was proposed' {
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "ownerless": true }, "then": { "action": "reassign" } } ] }'
+        (Get-PolicyPlan $d).Actionable.id | Should -Be @('T_c')
+    }
+    It 'rejects a rule without conditions, an unknown action, and unprovable activity windows' {
+        { Get-PolicyPlan (Doc '{ "rules": [ { "name": "x", "then": { "action": "block" } } ] }') } | Should -Throw '*no conditions*'
+        { Get-PolicyPlan (Doc '{ "rules": [ { "name": "x", "when": { "state": "blocked" }, "then": { "action": "explode" } } ] }') } | Should -Throw '*unknown action*'
+        { Get-PolicyPlan (Doc '{ "rules": [ { "name": "x", "when": { "stale": { "days": 60 } }, "then": { "action": "block" } } ] }') } | Should -Throw '*includeNeverSeen*'
+    }
+}
+
+Describe 'Invoke-PolicyPlan' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Invoke-PackageAction { }
+        Mock Invoke-OwnerReassign { }
+        Mock Out-Host { }
+        $pk = New-Pkg 'T_a' 'Alpha'
+        $script:plan = @(
+            [pscustomobject]@{ Rule = 'b'; Action = 'block'; DisableIdentity = $true; Matched = @($pk); Actionable = @($pk); Proposals = @{} },
+            [pscustomobject]@{ Rule = 'r'; Action = 'report'; DisableIdentity = $false; Matched = @($pk); Actionable = @($pk); Proposals = @{} })
+    }
+    It 'changes nothing without -Apply' {
+        Invoke-PolicyPlan -Plan $script:plan
+        Should -Invoke Invoke-PackageAction -Times 0
+    }
+    It 'applies block rules once confirmed and skips report rules' {
+        Mock Confirm-Batch { $true }
+        Invoke-PolicyPlan -Plan $script:plan -Apply
+        Should -Invoke Invoke-PackageAction -Times 1 -ParameterFilter { $Action -eq 'block' }
+    }
+    It 'applies nothing when the confirmation is declined' {
+        Mock Confirm-Batch { $false }
+        Invoke-PolicyPlan -Plan $script:plan -Apply
+        Should -Invoke Invoke-PackageAction -Times 0
+    }
+}
+
+Describe 'Snapshots' {
+    It 'reports new, removed, blocked and owner changes between snapshots' {
+        $path = Join-Path $TestDrive 'snap.json'
+        Save-Snapshot -Path $path -Packages @((New-Pkg 'T_a' 'Alpha' -OwnerId 'u1'), (New-Pkg 'T_b' 'Beta'), (New-Pkg 'T_gone' 'Gone'))
+        $old = Get-Content -Raw $path | ConvertFrom-Json
+        $now = @((New-Pkg 'T_a' 'Alpha' -OwnerId 'u2'), (New-Pkg 'T_b' 'Beta' -Blocked $true), (New-Pkg 'T_new' 'Newcomer'))
+        $c = @(Compare-Snapshot -Old $old -Current $now)
+        ($c | Where-Object Change -eq 'New').Id | Should -Be 'T_new'
+        ($c | Where-Object Change -eq 'Removed').Id | Should -Be 'T_gone'
+        ($c | Where-Object Change -eq 'Blocked').Id | Should -Be 'T_b'
+        ($c | Where-Object Change -eq 'Owner changed').Id | Should -Be 'T_a'
+    }
+}

@@ -98,6 +98,18 @@ param(
     [Parameter(ParameterSetName = 'Reassign', Mandatory)]
     [string]$To,                             # UPN or object id of the new owner
 
+    [Parameter(ParameterSetName = 'Policy', Mandatory)]
+    [string]$Policy,                         # path to a JSON policy file; prints the plan (no changes without -Apply)
+
+    [Parameter(ParameterSetName = 'Policy')]
+    [switch]$Apply,                          # run the policy plan
+
+    [Parameter(ParameterSetName = 'Snapshot', Mandatory)]
+    [string]$Snapshot,                       # save the inventory to this JSON file
+
+    [Parameter(ParameterSetName = 'Snapshot')]
+    [string]$CompareTo,                      # earlier snapshot to compare with (new, removed, blocked, owner, version changes)
+
     [Parameter(ParameterSetName = 'DeleteCandidates', Mandatory)]
     [switch]$DeleteCandidates,               # list blocked agents that have stayed blocked long enough to delete
 
@@ -208,14 +220,16 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
-$readOnly = ($PSCmdlet.ParameterSetName -eq 'List') -or
+$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot')) -or
+            ($PSCmdlet.ParameterSetName -eq 'Policy' -and -not $Apply) -or
             ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
 if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.EnableDisable.All' }
-if ($PSCmdlet.ParameterSetName -eq 'DeleteCandidates') { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -399,6 +413,144 @@ function Invoke-OwnerReassign {
     Write-Host ("Done: {0} reassigned, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
     Export-ActionLog -Records $log
     if ($PassThru) { $log }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Policy file: declare rules once, review the plan, apply it. Conditions inside a rule combine
+# with AND (or OR when "match": "any"). Without -Apply nothing is changed.
+# ---------------------------------------------------------------------------------------------
+
+# Drop catalog packages the policy excludes (by id, name, publisher or type).
+function Test-PolicyExcluded {
+    param([object]$Package, [object]$Exclude)
+    if (-not $Exclude) { return $false }
+    if (@($Exclude.ids) -contains $Package.id) { return $true }
+    if (@($Exclude.names) -contains $Package.displayName) { return $true }
+    if ($Package.publisher -and @($Exclude.publishers) -contains $Package.publisher) { return $true }
+    if (@($Exclude.types) -contains $Package.type) { return $true }
+    $false
+}
+
+# Evaluate every rule against the live tenant and return the plan (no changes made).
+function Get-PolicyPlan {
+    param([object]$PolicyDoc)
+    $catalog = @(Get-Packages)
+    $byId = @{}; foreach ($p in $catalog) { $byId[$p.id] = $p }
+    $ownerReport = $null
+    foreach ($rule in @($PolicyDoc.rules)) {
+        if (-not $rule.when) { throw "Rule '$($rule.name)' has no conditions; a rule without 'when' would match everything." }
+        $sets = @(); $proposals = @{}
+        $w = $rule.when
+        if ($w.stale) {
+            $by = if ($w.stale.by) { [string]$w.stale.by } else { 'activity' }
+            if ($by -eq 'activity' -and [int]$w.stale.days -ge 30 -and -not $w.stale.includeNeverSeen) {
+                throw "Rule '$($rule.name)': activity staleness of 30+ days needs includeNeverSeen (telemetry is kept ~30 days)."
+            }
+            $sets += , @(Get-StalePackages -Days ([int]$w.stale.days) -By $by -IncludeNeverSeen:([bool]$w.stale.includeNeverSeen) | ForEach-Object { $_.id })
+        }
+        if ($w.risky) {
+            $sev = if ($w.risky.minSeverity) { [string]$w.risky.minSeverity } else { 'Informational' }
+            $src = if ($w.risky.source) { [string]$w.risky.source } else { 'Both' }
+            $sets += , @(Get-RiskyPackages -Days 30 -MinAlerts ([Math]::Max(1, [int]$w.risky.minSignals)) -MinSeverity $sev -Source $src | ForEach-Object { $_.id })
+        }
+        if ($null -ne $w.blockedDays) {
+            $sets += , @(Get-DeleteCandidates -MinDays ([int]$w.blockedDays) | ForEach-Object { $_.Id })
+        }
+        if ($w.ownerless) {
+            if (-not $ownerReport) { $ownerReport = Get-OwnerReport -Packages $catalog }
+            foreach ($i in $ownerReport.Items) { $proposals[$i.Id] = $i }
+            $sets += , @($ownerReport.Items | ForEach-Object { $_.Id })
+        }
+        if ($w.state) {
+            $wantBlocked = ([string]$w.state -eq 'blocked')
+            $sets += , @($catalog | Where-Object { [bool]$_.isBlocked -eq $wantBlocked } | ForEach-Object { $_.id })
+        }
+        if ($sets.Count -eq 0) { throw "Rule '$($rule.name)' uses no recognised condition (stale, risky, blockedDays, ownerless, state)." }
+
+        $ids = New-Object 'System.Collections.Generic.HashSet[string]'
+        if ($rule.match -eq 'any') { foreach ($s in $sets) { foreach ($i in $s) { [void]$ids.Add([string]$i) } } }
+        else {
+            foreach ($i in $sets[0]) { [void]$ids.Add([string]$i) }
+            for ($k = 1; $k -lt $sets.Count; $k++) {
+                $other = New-Object 'System.Collections.Generic.HashSet[string]'
+                foreach ($i in $sets[$k]) { [void]$other.Add([string]$i) }
+                $ids.IntersectWith($other)
+            }
+        }
+        $action = if ($rule.then.action) { ([string]$rule.then.action).ToLower() } else { 'report' }
+        if ($action -notin 'block', 'unblock', 'reassign', 'report') { throw "Rule '$($rule.name)': unknown action '$action'." }
+
+        $matched = @($ids | ForEach-Object { $byId[$_] } | Where-Object { $_ -and -not (Test-PolicyExcluded $_ $PolicyDoc.exclude) })
+        $actionable = switch ($action) {
+            'block'    { @($matched | Where-Object { -not $_.isBlocked }) }
+            'unblock'  { @($matched | Where-Object { $_.isBlocked }) }
+            'reassign' { @($matched | Where-Object { $proposals.ContainsKey($_.id) -and $proposals[$_.id].State -eq 'Proposed' }) }
+            default    { @($matched) }
+        }
+        [pscustomobject]@{
+            Rule = [string]$rule.name; Action = $action; DisableIdentity = [bool]$rule.then.disableIdentity
+            Matched = $matched; Actionable = $actionable; Proposals = $proposals
+        }
+    }
+}
+
+# Show the plan, then apply it when asked. One confirmation covers the whole plan.
+function Invoke-PolicyPlan {
+    param([object[]]$Plan, [switch]$Apply)
+    Write-Host ''
+    $Plan | Select-Object Rule, Action, @{ n = 'matched'; e = { $_.Matched.Count } }, @{ n = 'would change'; e = { $_.Actionable.Count } } | Format-Table -AutoSize | Out-Host
+    foreach ($step in $Plan) {
+        if ($step.Matched.Count -gt 0) {
+            Write-Host ("Rule '{0}' ({1}):" -f $step.Rule, $step.Action) -ForegroundColor Cyan
+            $step.Matched | Select-Object displayName, id, isBlocked, type | Format-Table -AutoSize | Out-Host
+        }
+    }
+    $total = ($Plan | Where-Object { $_.Action -ne 'report' } | ForEach-Object { $_.Actionable.Count } | Measure-Object -Sum).Sum
+    if (-not $Apply) { Write-Host ("Plan only: {0} change(s) pending. Add -Apply to run it." -f [int]$total) -ForegroundColor Yellow; return }
+    if (-not $total) { Write-Host 'Nothing to change.'; return }
+    if (-not (Confirm-Batch -Count $total -Action 'apply')) { Write-Host 'Cancelled.'; return }
+    $identityBefore = $script:DisableIdentity
+    foreach ($step in $Plan) {
+        if ($step.Action -eq 'report' -or $step.Actionable.Count -eq 0) { continue }
+        Write-Host ("`nApplying rule '{0}'" -f $step.Rule) -ForegroundColor Cyan
+        if ($step.Action -in 'block', 'unblock') {
+            $script:DisableIdentity = $step.DisableIdentity
+            Invoke-PackageAction -Packages $step.Actionable -Action $step.Action
+        } else {
+            $items = @($step.Actionable | ForEach-Object { $s = $step.Proposals[$_.id]
+                [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; CurrentOwnerId = $_.ownerId; NewOwnerId = $s.ProposedId; NewOwnerUpn = $s.Proposed; Source = $s.Source } })
+            Invoke-OwnerReassign -Items $items
+        }
+    }
+    $script:DisableIdentity = $identityBefore
+}
+
+# ---------------------------------------------------------------------------------------------
+# Snapshots: record the inventory, and report what changed since an earlier snapshot.
+# ---------------------------------------------------------------------------------------------
+function Save-Snapshot {
+    param([string]$Path, [object[]]$Packages)
+    $items = $Packages | Select-Object id, displayName, type, platform, publisher, ownerId, isBlocked, version, lastModifiedDateTime, agentIdentityId
+    [pscustomobject]@{ takenAt = (Get-Date).ToUniversalTime().ToString('o'); count = @($items).Count; items = @($items) } |
+        ConvertTo-Json -Depth 4 | Set-Content -Path $Path -Encoding utf8
+}
+
+function Compare-Snapshot {
+    param([object]$Old, [object[]]$Current)
+    $oldById = @{}; foreach ($o in @($Old.items)) { $oldById[[string]$o.id] = $o }
+    $curById = @{}; foreach ($c in $Current) { $curById[[string]$c.id] = $c }
+    $out = @()
+    foreach ($c in $Current) {
+        $o = $oldById[[string]$c.id]
+        if (-not $o) { $out += [pscustomobject]@{ Change = 'New'; Agent = $c.displayName; Id = $c.id; Detail = "$($c.type), $($c.platform)" }; continue }
+        if ([bool]$o.isBlocked -ne [bool]$c.isBlocked) { $out += [pscustomobject]@{ Change = $(if ($c.isBlocked) { 'Blocked' } else { 'Unblocked' }); Agent = $c.displayName; Id = $c.id; Detail = '' } }
+        if ([string]$o.ownerId -ne [string]$c.ownerId) { $out += [pscustomobject]@{ Change = 'Owner changed'; Agent = $c.displayName; Id = $c.id; Detail = "$($o.ownerId) -> $($c.ownerId)" } }
+        if ([string]$o.version -ne [string]$c.version) { $out += [pscustomobject]@{ Change = 'Version changed'; Agent = $c.displayName; Id = $c.id; Detail = "$($o.version) -> $($c.version)" } }
+    }
+    foreach ($o in @($Old.items)) {
+        if (-not $curById.ContainsKey([string]$o.id)) { $out += [pscustomobject]@{ Change = 'Removed'; Agent = $o.displayName; Id = $o.id; Detail = "$($o.type)" } }
+    }
+    $out
 }
 
 # Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
@@ -1665,6 +1817,25 @@ switch ($PSCmdlet.ParameterSetName) {
                           @{ n = 'hosts'; e = { ($_.supportedHosts) -join ',' } }, type |
             Sort-Object isBlocked, displayName |
             Format-Table -AutoSize
+    }
+    'Policy' {
+        if (-not (Test-Path -LiteralPath $Policy)) { throw "Policy file not found: $Policy" }
+        $doc = Get-Content -Raw -LiteralPath $Policy | ConvertFrom-Json
+        Write-Host ("Policy: {0} ({1} rule(s))" -f $(if ($doc.name) { $doc.name } else { $Policy }), @($doc.rules).Count) -ForegroundColor Cyan
+        Invoke-PolicyPlan -Plan @(Get-PolicyPlan -PolicyDoc $doc) -Apply:$Apply
+    }
+    'Snapshot' {
+        $catalog = @(Get-Packages)
+        if ($CompareTo) {
+            if (-not (Test-Path -LiteralPath $CompareTo)) { throw "Snapshot not found: $CompareTo" }
+            $old = Get-Content -Raw -LiteralPath $CompareTo | ConvertFrom-Json
+            $changes = @(Compare-Snapshot -Old $old -Current $catalog)
+            Write-Host ("`nChanges since {0}: {1}" -f $old.takenAt, $changes.Count) -ForegroundColor Cyan
+            if ($changes.Count) { $changes | Sort-Object Change, Agent | Format-Table -AutoSize -Wrap | Out-Host }
+            if ($OutFile) { Export-ActionLog -Records $changes }
+        }
+        Save-Snapshot -Path $Snapshot -Packages $catalog
+        Write-Host ("Snapshot of {0} package(s) saved to {1}" -f $catalog.Count, $Snapshot) -ForegroundColor Cyan
     }
     'DeleteCandidates' {
         $c = @(Get-DeleteCandidates -MinDays $MinDaysBlocked -HistoryPaths $History -IncludeUnknown:$IncludeUnknown)
