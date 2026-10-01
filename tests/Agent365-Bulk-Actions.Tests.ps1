@@ -405,3 +405,12 @@ Describe 'Find-DirectoryUsers' {
         [uri]::UnescapeDataString($script:uri) | Should -Match "'o''brien'"
     }
 }
+
+Describe 'Test-Reassignable' {
+    It 'allows shared agents only' {
+        Test-Reassignable (New-Pkg 'P_1' 'a' -Type 'shared') | Should -BeTrue
+        Test-Reassignable (New-Pkg 'P_2' 'b' -Type 'thirdParty') | Should -BeFalse
+        Test-Reassignable (New-Pkg 'P_3' 'c' -Type 'lob') | Should -BeFalse
+        Test-Reassignable (New-Pkg 'P_4' 'd' -Type 'firstParty') | Should -BeFalse
+    }
+}

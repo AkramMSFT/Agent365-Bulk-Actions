@@ -331,6 +331,13 @@ function Get-IdentityOwners {
     } catch { @() }
 }
 
+# The reassign API only works for shared agents. Anything else (store apps, org-published packages)
+# makes it answer 500, so those are never sent.
+function Test-Reassignable {
+    param([object]$Package)
+    $Package.type -eq 'shared'
+}
+
 # Decide what to do about one shared agent's ownership. Order of preference:
 #   1. keep a valid current owner, 2. the Entra agent identity owner, 3. that person's manager
 #   (or the former owner's), 4. nobody: flag for a manual decision. Never guesses.
@@ -1335,7 +1342,7 @@ $GuiXaml = @'
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" Visibility="Collapsed"/>
-          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False"/>
+          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,18,0" IsEnabled="False"/>
           <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
@@ -1562,7 +1569,7 @@ function New-ConsoleWindow {
         $script:ui.BtnBlock.IsEnabled   = @($checked | Where-Object { -not $_.IsBlocked }).Count -gt 0
         $script:ui.BtnUnblock.IsEnabled = @($checked | Where-Object { $_.IsBlocked }).Count -gt 0
         $script:ui.BtnUndo.IsEnabled    = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
-        $script:ui.BtnAssign.IsEnabled  = $checked.Count -gt 0
+        $script:ui.BtnAssign.IsEnabled  = @($checked | Where-Object { Test-Reassignable $_.Package }).Count -gt 0
         $script:ui.BtnApplyOwner.IsEnabled = @($checked | Where-Object { $script:ctx.Suggest.ContainsKey($_.Id) }).Count -gt 0
         $shown = [int]$script:ui.CountShown.Text
         $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
@@ -1845,13 +1852,17 @@ function New-ConsoleWindow {
     })
 
     $script:ui.BtnAssign.Add_Click({
-        $rows = @($script:ctx.Rows | Where-Object { $_.Checked })
+        $checked = @($script:ctx.Rows | Where-Object { $_.Checked })
+        $rows = @($checked | Where-Object { Test-Reassignable $_.Package })
         if ($rows.Count -eq 0) { return }
         $owner = Read-OwnerPrompt -Count $rows.Count -Owner $script:w
         if (-not $owner) { return }
         $items = @($rows | Where-Object { $_.Package.ownerId -ne $owner.Id } | ForEach-Object {
             [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn; Source = 'Manual' } })
         if ($items.Count -eq 0) { & $script:ctx.Idle 'Those agents already belong to that user.'; return }
+        if ($checked.Count -gt $rows.Count) {
+            [void][Windows.MessageBox]::Show(("{0} of the {1} selected agents are not shared agents and were left out: only shared agents can be reassigned." -f ($checked.Count - $rows.Count), $checked.Count), 'Assign owner', 'OK', 'Information')
+        }
         & $script:ctx.ReassignRows $items 'Assign owner'
     })
     $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
@@ -1954,7 +1965,12 @@ switch ($PSCmdlet.ParameterSetName) {
     'Reassign' {
         $owner = Get-UserInfo $To
         if (-not $owner.Exists -or -not $owner.Enabled) { throw "'$To' is not an existing, enabled user." }
-        $items = @(Resolve-Packages $Reassign | Where-Object { $_.ownerId -ne $owner.Id } | ForEach-Object {
+        $targets = @(Resolve-Packages $Reassign)
+        $skipped = @($targets | Where-Object { -not (Test-Reassignable $_) })
+        if ($skipped.Count) {
+            Write-Warning ("Only shared agents can be reassigned through the API. Skipped: {0}" -f (($skipped | ForEach-Object { "$($_.displayName) [$($_.type)]" }) -join '; '))
+        }
+        $items = @($targets | Where-Object { (Test-Reassignable $_) -and $_.ownerId -ne $owner.Id } | ForEach-Object {
             [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; Platform = $_.platform; CurrentOwnerId = $_.ownerId; CurrentOwner = ''
                                State = 'Manual'; Reason = ''; Proposed = $owner.Upn; Source = 'Manual'; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn } })
         Write-Host ("{0} agent(s) will be assigned to {1}." -f $items.Count, $owner.Upn) -ForegroundColor Cyan

@@ -168,7 +168,7 @@ For each shared agent the tool decides, in this order:
 Notes:
 
 - The package API exposes no creator field, so step 2 is the creator substitute. It only applies to agents that have an Entra identity.
-- Only **shared** agents are considered. Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
+- Only **shared** agents can be reassigned; `-Reassign` skips anything else with a warning, and the GUI button stays off until a shared agent is selected (the API answers 500 for other package types). Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
 - Reassign is **delegated-only** (the API has no application permission), so it cannot run unattended.
 - The mode needs `User.Read.All` and `AgentIdentity.Read.All` in addition to `CopilotPackages.ReadWrite.All`.
 
