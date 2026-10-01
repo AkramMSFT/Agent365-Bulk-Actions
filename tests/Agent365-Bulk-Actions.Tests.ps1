@@ -487,3 +487,26 @@ Describe 'Permission and risk helpers' {
         Get-AgentRisk (New-Pkg 'T_other' 'y') | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Agents with no Defender record count as having nothing' {
+    It 'Get-ItemList drops nulls so an empty value counts as zero' {
+        @(Get-ItemList $null).Count | Should -Be 0
+        @(Get-ItemList @()).Count | Should -Be 0
+        @(Get-ItemList @($null, 'a')).Count | Should -Be 1
+    }
+    It 'reports zero tools, MCP servers and sharing for an agent missing from the table' {
+        $row = Get-InventoryRows -Packages @(New-Pkg 'P_none' 'Store app' -Type 'thirdParty') -InfoTable @{}
+        $row.ToolCount | Should -Be 0
+        $row.SharedWithCount | Should -Be 0
+        $row.McpServers | Should -BeNullOrEmpty
+    }
+    It 'counts real tools and MCP servers for an agent that has them' {
+        $info = [pscustomobject]@{ Platform = 'Copilot Studio'; Channels = @(); Model = ''; PublishedStatus = ''
+            Tools = @([pscustomobject]@{ Name = 'a' }, [pscustomobject]@{ Name = 'b' }); McpServers = @([pscustomobject]@{ Name = 'Work IQ Mail' })
+            DataSources = @(); Capabilities = @(); SharedWith = @('g1') }
+        $row = Get-InventoryRows -Packages @(New-Pkg 'P_has' 'Agent') -InfoTable @{ 'p_has' = $info }
+        $row.ToolCount | Should -Be 2
+        $row.McpServers | Should -Be 'Work IQ Mail'
+        $row.SharedWithCount | Should -Be 1
+    }
+}

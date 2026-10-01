@@ -597,6 +597,12 @@ function ConvertTo-ObjectList {
     }
 }
 
+# Items as an array with no nulls. (In PowerShell, @($null).Count is 1: agents with no Defender record must count as zero tools.)
+function Get-ItemList {
+    param($Items)
+    @(@($Items) | Where-Object { $null -ne $_ })
+}
+
 # A short text for a list of tools, servers or data sources: their names, one per entry.
 function Get-NameText {
     param($Items, [string]$Property = 'name')
@@ -693,7 +699,7 @@ function Get-AgentDetail {
         try { $sp = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity/sponsors?`$select=id"; $sponsors = @($sp.value | ForEach-Object { (Get-UserInfo $_.id).Upn }) } catch { $null = $_ }
         $perms = @(Get-AgentPermissionList -AgentIdentityId $d.agentIdentityId -BlueprintAppId $(if ($identity) { $identity.agentIdentityBlueprintId }))
     }
-    $count = { param($x) @($x).Count }
+    $count = { param($x) @(Get-ItemList $x).Count }
     $riskEntry = if ($SkipRisk) { $null } else { try { Get-AgentRisk $Package } catch { $null } }
     $riskInfo = [ordered]@{}
     if ($riskEntry) {
@@ -716,8 +722,8 @@ function Get-AgentDetail {
             'Shared with (catalog)' = (& $count $d.sharedWithUsersAndGroups); 'Shared with (agent record)' = $(if ($info) { (& $count $info.SharedWith) } else { 0 })
             Channels = $(if ($info) { $info.Channels -join ', ' } else { '' })
         }
-        Tools = @($info.Tools); McpServers = @($info.McpServers)
-        DataSources = @($info.DataSources); Capabilities = @($info.Capabilities); ConnectedAgents = @($info.ConnectedAgents); Endpoints = @($info.Endpoints)
+        Tools = @(Get-ItemList $info.Tools); McpServers = @(Get-ItemList $info.McpServers)
+        DataSources = @(Get-ItemList $info.DataSources); Capabilities = @(Get-ItemList $info.Capabilities); ConnectedAgents = @(Get-ItemList $info.ConnectedAgents); Endpoints = @(Get-ItemList $info.Endpoints)
         Permissions = @($perms)
         Identity = [ordered]@{
             Owner = $(if ($owner.Exists) { $owner.Upn } elseif ($d.ownerId) { '(account no longer exists)' } else { '(none)' })
@@ -817,9 +823,9 @@ function Get-InventoryRows {
             Owner = $(if ($owner.Exists) { $owner.Upn } elseif ($p.ownerId -and $p.ownerId -ne '00000000-0000-0000-0000-000000000000') { '(account no longer exists)' } else { '' })
             Version = $p.version; Created = $(if ($p.createdDateTime) { ([datetimeoffset]$p.createdDateTime).ToString('yyyy-MM-dd') }); Modified = $(if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') })
             Published = $info.PublishedStatus; Channels = ($info.Channels -join ', '); Model = $info.Model
-            ToolCount = @($info.Tools).Count; Tools = (Get-NameText $info.Tools); McpServers = (Get-NameText $info.McpServers)
+            ToolCount = @(Get-ItemList $info.Tools).Count; Tools = (Get-NameText $info.Tools); McpServers = (Get-NameText $info.McpServers)
             DataSources = ($info.DataSources -join '; '); Capabilities = ($info.Capabilities -join '; ')
-            SharedWithCount = @($info.SharedWith).Count; AgentIdentity = $p.agentIdentityId
+            SharedWithCount = @(Get-ItemList $info.SharedWith).Count; AgentIdentity = $p.agentIdentityId
         }
         if ($Deep) {
             Write-Progress -Activity 'Reading agent details' -Status $p.displayName -PercentComplete (100 * $i / [Math]::Max(1, $Packages.Count))
@@ -2166,7 +2172,7 @@ function New-ConsoleWindow {
         $set = New-Object 'System.Collections.Generic.HashSet[string]'
         foreach ($r in $script:ctx.Rows) {
             $i = $script:ctx.InfoTable[$r.Id.ToLower()]
-            $tools = @($i.Tools).Count; $mcp = @($i.McpServers).Count
+            $tools = @(Get-ItemList $i.Tools).Count; $mcp = @(Get-ItemList $i.McpServers).Count
             $hit = switch ($mode) { 'mcp' { $mcp -gt 0 } 'tools' { $tools -gt 0 -or $mcp -gt 0 } 'none' { $tools -eq 0 -and $mcp -eq 0 } }
             if ($hit) { [void]$set.Add($r.Id) }
         }
@@ -2214,9 +2220,10 @@ function New-ConsoleWindow {
         foreach ($r in $script:ctx.Rows) {
             $i = $script:ctx.InfoTable[$r.Id.ToLower()]
             if (-not $i) { $r.ToolCount = '0'; $r.ToolCountSort = 0; continue }
-            $r.ToolCount = [string]@($i.Tools).Count; $r.ToolCountSort = @($i.Tools).Count
+            $toolCount = @(Get-ItemList $i.Tools).Count
+            $r.ToolCount = [string]$toolCount; $r.ToolCountSort = $toolCount
             $r.ToolsText = Get-NameText $i.Tools; $r.Mcp = Get-NameText $i.McpServers
-            $r.SharedCount = [string]@($i.SharedWith).Count; $r.Channels = ($i.Channels -join ', ')
+            $r.SharedCount = [string]@(Get-ItemList $i.SharedWith).Count; $r.Channels = ($i.Channels -join ', ')
         }
     }
 
