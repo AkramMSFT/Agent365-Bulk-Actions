@@ -259,8 +259,9 @@ function Invoke-Graph {
         catch {
             $resp = $_.Exception.Response
             $code = if ($resp -and $resp.StatusCode) { [int]$resp.StatusCode } else { 0 }
-            if ($code -notin 429, 502, 503, 504 -or $attempt -ge 5) { throw }
-            $wait = [Math]::Pow(2, $attempt)
+            # The package service throttles with 424 "Too Many Requests" instead of 429.
+            if ($code -notin 424, 429, 502, 503, 504 -or $attempt -ge 5) { throw }
+            $wait = if ($code -eq 424) { [Math]::Max(10, 5 * $attempt) } else { [Math]::Pow(2, $attempt) }
             try { if ($resp.Headers.RetryAfter.Delta) { $wait = [Math]::Max($wait, $resp.Headers.RetryAfter.Delta.TotalSeconds) } } catch { $null = $_ }
             Write-Warning ("HTTP {0}; retrying in {1:N0}s (attempt {2}/5)." -f $code, $wait, $attempt)
             Start-Sleep -Seconds $wait
@@ -273,17 +274,21 @@ function Get-Packages {
     $uri = if ($AgentsOnly) {
         "$Base`?`$filter=supportedHosts/any(h:h eq 'Copilot')"
     } else { $Base }
-    $all = @()
+    $all = New-Object 'System.Collections.Generic.List[object]'
+    $pages = 0
     do {
         $resp = Invoke-Graph -Uri $uri
+        $pages++
         # Invoke-MgGraphRequest returns each item as a Hashtable; cast to PSCustomObject so
         # Select-Object / Format-Table can resolve displayName, id, isBlocked as real properties.
-        foreach ($v in $resp.value) { $all += [pscustomobject]$v }
+        foreach ($v in $resp.value) { $all.Add([pscustomobject]$v) }
         $uri = $resp.'@odata.nextLink'
+        if ($uri -and $pages % 5 -eq 0) { Write-Progress -Activity 'Reading the agent catalog' -Status ("{0} packages so far" -f $all.Count) }
     } while ($uri)
+    if ($pages -ge 5) { Write-Progress -Activity 'Reading the agent catalog' -Completed }
     # The service does not apply the supportedHosts filter, so enforce it here.
-    if ($AgentsOnly) { $all = @($all | Where-Object { @($_.supportedHosts) -contains 'Copilot' }) }
-    $all
+    if ($AgentsOnly) { return @($all | Where-Object { @($_.supportedHosts) -contains 'Copilot' }) }
+    $all.ToArray()
 }
 
 # Resolve a mix of package ids (P_ or T_) and display names to concrete catalog objects, so every
@@ -304,6 +309,112 @@ function Resolve-Packages {
 # ---------------------------------------------------------------------------------------------
 # Ownership: find agents whose owner is missing or gone, propose a replacement, reassign.
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# Scale: Graph JSON batching. Per-agent lookups are sent 20 at a time instead of one call each.
+# ---------------------------------------------------------------------------------------------
+$script:GuidPattern = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+
+# Send requests through $batch in groups of 20. Throttled or transiently failed sub-requests are retried with
+# back-off. Returns a hashtable: request id -> { Status, Body }. Requests are { id; method; url [; body; headers] }.
+function Invoke-GraphBatch {
+    param([object[]]$Requests, [ValidateSet('v1.0', 'beta')][string]$Version = 'v1.0', [string]$Activity,
+          [ValidateRange(1, 20)][int]$ChunkSize = 20, [double]$PaceSeconds = 0)
+    $results = @{}
+    $pending = @($Requests)
+    $total = $pending.Count
+    $pace = $PaceSeconds
+    for ($attempt = 1; $pending.Count -gt 0 -and $attempt -le 5; $attempt++) {
+        $retry = @(); $wait = 0
+        for ($i = 0; $i -lt $pending.Count; $i += $ChunkSize) {
+            $chunk = @($pending[$i..([Math]::Min($i + $ChunkSize - 1, $pending.Count - 1))])
+            $started = Get-Date
+            $chunkThrottled = $false
+            if ($Activity -and $total -gt 40) {
+                Write-Progress -Activity $Activity -Status ("{0} of {1}" -f [Math]::Min($results.Count + $i, $total), $total) -PercentComplete ([Math]::Min(100, 100 * ($results.Count + $i) / [Math]::Max(1, $total)))
+            }
+            $resp = Invoke-Graph -Method POST -Uri "https://graph.microsoft.com/$Version/`$batch" -ContentType 'application/json' `
+                -Body (@{ requests = $chunk } | ConvertTo-Json -Depth 8 -Compress)
+            foreach ($r in @($resp.responses)) {
+                $status = [int]$r.status
+                # The package service throttles with 424 "Too Many Requests" rather than 429.
+                $throttled = $status -in 429, 502, 503, 504 -or ($status -eq 424 -and (($r.body | ConvertTo-Json -Compress -Depth 5) -match 'Too Many Requests'))
+                if ($throttled -and $attempt -lt 5) {
+                    $retry += @($chunk | Where-Object { [string]$_.id -eq [string]$r.id } | Select-Object -First 1)
+                    $ra = 0
+                    if ($r.headers) { [void][int]::TryParse([string]$r.headers.'Retry-After', [ref]$ra) }
+                    $backoff = if ($status -eq 424) { 5 * $attempt + 5 } else { [Math]::Pow(2, $attempt) }
+                    $wait = [Math]::Max($wait, [Math]::Max($ra, $backoff))
+                    $chunkThrottled = $true
+                } else {
+                    $results[[string]$r.id] = [pscustomobject]@{ Status = $status; Body = $r.body }
+                }
+            }
+            # Slow down once per throttled chunk (not once per failed request), never beyond two seconds per request.
+            if ($chunkThrottled) { $pace = [Math]::Min([Math]::Max($pace * 1.5, 0.3), 2) }
+            elseif ($pace -gt $PaceSeconds) { $pace = [Math]::Max($PaceSeconds, $pace * 0.9) }   # ease back once clean
+            if ($pace -gt 0) {
+                $target = $pace * $chunk.Count
+                $spent = ((Get-Date) - $started).TotalSeconds
+                if ($spent -lt $target) { Start-Sleep -Milliseconds ([int](($target - $spent) * 1000)) }
+            }
+        }
+        $pending = @($retry)
+        if ($pending.Count -gt 0) { Write-Warning ("{0} request(s) throttled; retrying in {1:N0}s." -f $pending.Count, $wait); Start-Sleep -Seconds $wait }
+    }
+    foreach ($p in $pending) { if (-not $results.ContainsKey([string]$p.id)) { $results[[string]$p.id] = [pscustomobject]@{ Status = 429; Body = $null } } }
+    if ($Activity -and $total -gt 40) { Write-Progress -Activity $Activity -Completed }
+    $results
+}
+
+# Look up many users in a few calls and cache them (404 is cached as "does not exist"; other errors are not cached).
+function Initialize-UserCache {
+    param([string[]]$Ids)
+    $need = @($Ids | Where-Object { $_ -match $script:GuidPattern -and $_ -ne '00000000-0000-0000-0000-000000000000' } |
+              ForEach-Object { $_.ToLower() } | Select-Object -Unique | Where-Object { -not $script:UserCache.ContainsKey($_) })
+    if ($need.Count -eq 0) { return }
+    $reqs = @($need | ForEach-Object { @{ id = $_; method = 'GET'; url = "/users/$_`?`$select=id,displayName,userPrincipalName,accountEnabled" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Activity 'Resolving users'
+    foreach ($id in $need) {
+        $r = $res[$id]
+        if ($r -and $r.Status -eq 200 -and $r.Body.id) {
+            $script:UserCache[$id] = [pscustomobject]@{ Id = $r.Body.id; Upn = $r.Body.userPrincipalName; Name = $r.Body.displayName; Exists = $true; Enabled = [bool]$r.Body.accountEnabled }
+        } elseif ($r -and $r.Status -eq 404) {
+            $script:UserCache[$id] = [pscustomobject]@{ Id = $id; Upn = ''; Name = ''; Exists = $false; Enabled = $false }
+        }
+    }
+}
+
+# Owners of many agent identities in a few calls; their user records are cached too.
+$script:IdentityOwnerCache = @{}
+function Initialize-IdentityOwnerCache {
+    param([string[]]$AgentIdentityIds)
+    $need = @($AgentIdentityIds | Where-Object { $_ } | Select-Object -Unique | Where-Object { -not $script:IdentityOwnerCache.ContainsKey($_) })
+    if ($need.Count -eq 0) { return }
+    $reqs = @($need | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_/microsoft.graph.agentIdentity/owners?`$select=id" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Version beta -Activity 'Reading agent identity owners'
+    foreach ($id in $need) {
+        $r = $res[$id]
+        if ($r -and $r.Status -eq 200) { $script:IdentityOwnerCache[$id] = @(@($r.Body.value) | Where-Object { $_.'@odata.type' -match 'user$' } | ForEach-Object { [string]$_.id }) }
+        elseif ($r -and $r.Status -in 403, 404) { $script:IdentityOwnerCache[$id] = @() }
+    }
+    Initialize-UserCache -Ids @($need | ForEach-Object { $script:IdentityOwnerCache[$_] } | ForEach-Object { $_ })
+}
+
+# Managers of many users in a few calls (404 = no manager).
+$script:ManagerCache = @{}
+function Initialize-ManagerCache {
+    param([string[]]$UserIds)
+    $need = @($UserIds | Where-Object { $_ -match $script:GuidPattern } | ForEach-Object { $_.ToLower() } | Select-Object -Unique | Where-Object { -not $script:ManagerCache.ContainsKey($_) })
+    if ($need.Count -eq 0) { return }
+    $reqs = @($need | ForEach-Object { @{ id = $_; method = 'GET'; url = "/users/$_/manager?`$select=id" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Activity 'Reading managers'
+    foreach ($id in $need) {
+        $r = $res[$id]
+        if ($r -and $r.Status -eq 200 -and $r.Body.id) { $script:ManagerCache[$id] = [string]$r.Body.id } elseif ($r -and $r.Status -eq 404) { $script:ManagerCache[$id] = '' }
+    }
+    Initialize-UserCache -Ids @($need | ForEach-Object { $script:ManagerCache[$_] } | Where-Object { $_ })
+}
+
 $script:UserCache = @{}
 
 # Look up a user by object id or UPN. Returns an object with Exists/Enabled, cached per run.
@@ -328,6 +439,8 @@ function Get-UserInfo {
 # The manager of a user, as a user object, or $null when none is set.
 function Get-ManagerInfo {
     param([string]$UserId)
+    $key = "$UserId".ToLower()
+    if ($script:ManagerCache.ContainsKey($key)) { if ($script:ManagerCache[$key]) { return Get-UserInfo $script:ManagerCache[$key] } else { return $null } }
     try {
         $m = Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/users/{0}/manager?`$select=id" -f $UserId)
         if ($m.id) { return Get-UserInfo $m.id }
@@ -339,6 +452,7 @@ function Get-ManagerInfo {
 function Get-IdentityOwners {
     param([string]$AgentIdentityId)
     if (-not $AgentIdentityId) { return @() }
+    if ($script:IdentityOwnerCache.ContainsKey($AgentIdentityId)) { return @($script:IdentityOwnerCache[$AgentIdentityId] | ForEach-Object { Get-UserInfo $_ }) }
     try {
         $r = Invoke-Graph -Uri ("https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/owners?`$select=id" -f $AgentIdentityId)
         @($r.value | Where-Object { $_.'@odata.type' -match 'user$' } | ForEach-Object { Get-UserInfo $_.id })
@@ -390,6 +504,14 @@ function Resolve-AgentOwner {
 function Get-OwnerReport {
     param([object[]]$Packages)
     $shared = @($Packages | Where-Object { $_.type -eq 'shared' })
+    Initialize-UserCache -Ids @($shared | ForEach-Object { $_.ownerId })
+    $needsOwner = @($shared | Where-Object { $u = Get-UserInfo $_.ownerId; -not ($u.Exists -and $u.Enabled) })
+    Initialize-IdentityOwnerCache -AgentIdentityIds @($needsOwner | ForEach-Object { $_.agentIdentityId })
+    $managerFor = @($needsOwner | ForEach-Object {
+        $io = @(Get-IdentityOwners $_.agentIdentityId | Select-Object -First 1)
+        if ($io.Count -and -not ($io[0].Enabled)) { $io[0].Id } elseif (-not $io.Count) { $_.ownerId }
+    })
+    Initialize-ManagerCache -UserIds @($managerFor | Where-Object { $_ })
     $report = foreach ($p in $shared) { Resolve-AgentOwner $p }
     [pscustomobject]@{
         Items         = @($report | Where-Object { $_.State -ne 'OK' })
@@ -662,28 +784,108 @@ function Get-ResourceInfo {
     $info
 }
 
-# What an identity may do: delegated grants and application roles, directly and inherited from its blueprint.
+# Turn grant and role-assignment responses into permission rows (resource name resolved from the cache).
+function ConvertTo-PermissionRows {
+    param($Grants, $Roles, [string]$Source)
+    $out = @()
+    foreach ($grant in (Get-ItemList $Grants)) {
+        $res = Get-ResourceInfo $grant.resourceId
+        foreach ($s in ([string]$grant.scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) {
+            $out += [pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = $res.Name; Permission = $s; Consent = $grant.consentType }
+        }
+    }
+    foreach ($ra in (Get-ItemList $Roles)) {
+        $res = Get-ResourceInfo $ra.resourceId
+        $name = if ($res.Roles.ContainsKey([string]$ra.appRoleId)) { $res.Roles[[string]$ra.appRoleId] } else { [string]$ra.appRoleId }
+        $out += [pscustomobject]@{ Source = $Source; Kind = 'Application'; Resource = $res.Name; Permission = $name; Consent = 'Admin' }
+    }
+    $out
+}
+
+# What one identity may do: delegated grants and application roles.
 function Get-IdentityPermissions {
     param([string]$ServicePrincipalId, [string]$Source)
-    $out = @()
-    try {
-        $g = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$ServicePrincipalId'"
-        foreach ($grant in @($g.value)) {
-            $res = Get-ResourceInfo $grant.resourceId
-            foreach ($s in ([string]$grant.scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) {
-                $out += [pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = $res.Name; Permission = $s; Consent = $grant.consentType }
-            }
+    $grants = @(); $roles = @()
+    try { $grants = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$ServicePrincipalId'").value) } catch { $null = $_ }
+    try { $roles = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignments?`$top=100").value) } catch { $null = $_ }
+    # resolve every resource in one pass before building rows
+    Initialize-ResourceCache -Ids @(@($grants) + @($roles) | ForEach-Object { $_.resourceId })
+    ConvertTo-PermissionRows -Grants $grants -Roles $roles -Source $Source
+}
+
+# Resource service principals (name and application roles) for many ids in a few calls.
+function Initialize-ResourceCache {
+    param([string[]]$Ids)
+    $need = @($Ids | Where-Object { $_ } | Select-Object -Unique | Where-Object { -not $script:ResourceCache.ContainsKey($_) })
+    if ($need.Count -eq 0) { return }
+    $reqs = @($need | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_`?`$select=id,displayName,appRoles" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Activity 'Reading permission resources'
+    foreach ($id in $need) {
+        $r = $res[$id]
+        if ($r -and $r.Status -eq 200) {
+            $roles = @{}; foreach ($x in @($r.Body.appRoles)) { $roles[[string]$x.id] = [string]$x.value }
+            $script:ResourceCache[$id] = [pscustomobject]@{ Name = $r.Body.displayName; Roles = $roles }
         }
-    } catch { $null = $_ }
-    try {
-        $a = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignments?`$top=100"
-        foreach ($ra in @($a.value)) {
-            $res = Get-ResourceInfo $ra.resourceId
-            $name = if ($res.Roles.ContainsKey([string]$ra.appRoleId)) { $res.Roles[[string]$ra.appRoleId] } else { [string]$ra.appRoleId }
-            $out += [pscustomobject]@{ Source = $Source; Kind = 'Application'; Resource = $res.Name; Permission = $name; Consent = 'Admin' }
-        }
-    } catch { $null = $_ }
+    }
+}
+
+# Permissions of many agents at once. Items are { Key; ServicePrincipalId; BlueprintAppId }. Returns Key -> permission rows
+# (the identity's own plus those inherited from its blueprint). Costs a handful of batched calls, not two per agent.
+function Get-PermissionsBulk {
+    param([object[]]$Items)
+    $out = @{}
+    $Items = @($Items | Where-Object { $_ -and $_.ServicePrincipalId })
+    if ($Items.Count -eq 0) { return $out }
+
+    # blueprint service principals, once per blueprint
+    $bpApps = @($Items | ForEach-Object { $_.BlueprintAppId } | Where-Object { $_ } | Select-Object -Unique | Where-Object { -not $script:BlueprintPermCache.ContainsKey($_) })
+    $bpSp = @{}
+    if ($bpApps.Count) {
+        $res = Invoke-GraphBatch -Requests @($bpApps | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals?`$filter=appId eq '$_'&`$select=id" } }) -Activity 'Reading agent blueprints'
+        foreach ($a in $bpApps) { $r = $res[$a]; if ($r -and $r.Status -eq 200 -and @(Get-ItemList $r.Body.value).Count) { $bpSp[$a] = [string]@(Get-ItemList $r.Body.value)[0].id } else { $script:BlueprintPermCache[$a] = @() } }
+    }
+
+    # grants and role assignments for every identity and blueprint, two requests each
+    $sps = @(@($Items | ForEach-Object { $_.ServicePrincipalId }) + @($bpSp.Values) | Select-Object -Unique)
+    $reqs = @($sps | ForEach-Object { @{ id = "g:$_"; method = 'GET'; url = "/oauth2PermissionGrants?`$filter=clientId eq '$_'" }; @{ id = "r:$_"; method = 'GET'; url = "/servicePrincipals/$_/appRoleAssignments?`$top=100" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Activity 'Reading agent permissions'
+    $grants = @{}; $roles = @{}
+    foreach ($sp in $sps) {
+        $grants[$sp] = if ($res["g:$sp"] -and $res["g:$sp"].Status -eq 200) { ,@(Get-ItemList $res["g:$sp"].Body.value) } else { ,@() }
+        $roles[$sp]  = if ($res["r:$sp"] -and $res["r:$sp"].Status -eq 200) { ,@(Get-ItemList $res["r:$sp"].Body.value) } else { ,@() }
+    }
+    Initialize-ResourceCache -Ids @(@($grants.Values + $roles.Values) | ForEach-Object { $_ } | ForEach-Object { $_.resourceId })
+
+    foreach ($a in $bpSp.Keys) { $script:BlueprintPermCache[$a] = @(ConvertTo-PermissionRows -Grants $grants[$bpSp[$a]] -Roles $roles[$bpSp[$a]] -Source 'Blueprint (inherited)') }
+    foreach ($item in $Items) {
+        $own = @(ConvertTo-PermissionRows -Grants $grants[$item.ServicePrincipalId] -Roles $roles[$item.ServicePrincipalId] -Source 'Agent identity')
+        $inherited = if ($item.BlueprintAppId -and $script:BlueprintPermCache.ContainsKey($item.BlueprintAppId)) { @($script:BlueprintPermCache[$item.BlueprintAppId]) } else { @() }
+        $out[[string]$item.Key] = @($own + $inherited)
+    }
     $out
+}
+
+# Catalog detail records (usage, availability, sharing) for many packages in a few calls. Returns id -> record.
+function Get-PackageDetailMap {
+    param([string[]]$Ids)
+    $map = @{}
+    $ids = @($Ids | Where-Object { $_ } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { return $map }
+    # The package service sustains roughly 1.5 to 2 requests per second (bursts of ~40); faster than that it answers 424.
+    $res = Invoke-GraphBatch -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = "/copilot/admin/catalog/packages/$_" } }) -Version beta -Activity 'Reading agent details' -ChunkSize 10 -PaceSeconds 0.5
+    foreach ($id in $ids) { if ($res[$id] -and $res[$id].Status -eq 200) { $map[$id] = $res[$id].Body } }
+    $map
+}
+
+# accountEnabled of many agent identities in a few calls. Returns identity id -> $true / $false ($null when unreadable).
+function Get-AgentIdentityStateMap {
+    param([string[]]$AgentIdentityIds)
+    $map = @{}
+    $ids = @($AgentIdentityIds | Where-Object { $_ } | Select-Object -Unique)
+    if ($ids.Count -eq 0) { return $map }
+    $res = Invoke-GraphBatch -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_/microsoft.graph.agentIdentity?`$select=id,accountEnabled" } }) -Version beta
+    foreach ($id in $ids) { $map[$id] = if ($res[$id] -and $res[$id].Status -eq 200) { [bool]$res[$id].Body.accountEnabled } else { $null } }
+    $map
 }
 
 # The full picture of one agent. Entra lookups run only when the agent has an identity.
@@ -812,6 +1014,12 @@ function Show-AgentDetail {
 # One row per agent for -Inventory: the catalog record plus the Defender columns; -Deep adds usage and sharing per agent.
 function Get-InventoryRows {
     param([object[]]$Packages, [hashtable]$InfoTable, [switch]$Deep, [switch]$WithPermissions)
+    Initialize-UserCache -Ids @($Packages | ForEach-Object { $_.ownerId })
+    $detailMap = if ($Deep) { Get-PackageDetailMap -Ids @($Packages | ForEach-Object { $_.id }) } else { @{} }
+    $permMap = if ($WithPermissions) {
+        Get-PermissionsBulk -Items @($Packages | Where-Object { $_.agentIdentityId } | ForEach-Object {
+            @{ Key = $_.id; ServicePrincipalId = $_.agentIdentityId; BlueprintAppId = $InfoTable[$_.id.ToLower()].BlueprintId } })
+    } else { @{} }
     $i = 0
     foreach ($p in $Packages) {
         $i++
@@ -828,23 +1036,21 @@ function Get-InventoryRows {
             SharedWithCount = @(Get-ItemList $info.SharedWith).Count; AgentIdentity = $p.agentIdentityId
         }
         if ($Deep) {
-            Write-Progress -Activity 'Reading agent details' -Status $p.displayName -PercentComplete (100 * $i / [Math]::Max(1, $Packages.Count))
-            try {
-                $d = Invoke-Graph -Uri "$Base/$($p.id)"
+            foreach ($c in 'AvailableTo', 'DeployedTo', 'CatalogSharedWith', 'ActiveUsers', 'Sessions', 'LastUsed') { $row[$c] = '' }
+            $d = $detailMap[$p.id]
+            if ($d) {
                 $row.AvailableTo = $d.availableTo; $row.DeployedTo = $d.deployedTo
-                $row.CatalogSharedWith = @($d.sharedWithUsersAndGroups).Count
+                $row.CatalogSharedWith = @(Get-ItemList $d.sharedWithUsersAndGroups).Count
                 $row.ActiveUsers = $d.activeUsers; $row.Sessions = $d.totalSessions
                 $row.LastUsed = if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }
-            } catch { $row.AvailableTo = 'error' }
+            } else { $row.AvailableTo = 'error' }
         }
-        if ($WithPermissions -and $p.agentIdentityId) {
-            $perms = @(Get-IdentityPermissions -ServicePrincipalId $p.agentIdentityId -Source 'Agent identity')
+        if ($WithPermissions) {
+            $perms = @(Get-ItemList $permMap[[string]$p.id])
             $row.PermissionCount = $perms.Count
             $row.Permissions = (($perms | ForEach-Object { "$($_.Resource):$($_.Permission)" }) -join '; ')
-        }
-        [pscustomobject]$row
+        }        [pscustomobject]$row
     }
-    if ($Deep) { Write-Progress -Activity 'Reading agent details' -Completed }
 }
 
 # Maps every identifier an agent can appear under in telemetry (registry id, Entra agent id,
@@ -1171,13 +1377,6 @@ function Set-AgentIdentityState {
         -Body (@{ accountEnabled = $Enabled } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
 }
 
-# Current accountEnabled of an agent identity, or $null when it cannot be read.
-function Get-AgentIdentityState {
-    param([string]$AgentIdentityId)
-    try { [bool](Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$AgentIdentityId/microsoft.graph.agentIdentity?`$select=id,accountEnabled").accountEnabled }
-    catch { $null }
-}
-
 # Blocking a package that has an Agent ID makes the platform disable that identity a few seconds later
 # (and unblock re-enables it). Wait for that, record what happened, and only call the identity API
 # ourselves for agents the platform left in the wrong state.
@@ -1189,8 +1388,9 @@ function Confirm-AgentIdentityState {
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ($pending.Count -gt 0) {
         $still = @()
+        $states = Get-AgentIdentityStateMap -AgentIdentityIds @($pending | ForEach-Object { $PackageById[$_.Id].agentIdentityId })
         foreach ($rec in $pending) {
-            $state = Get-AgentIdentityState $PackageById[$rec.Id].agentIdentityId
+            $state = $states[[string]$PackageById[$rec.Id].agentIdentityId]
             if ($state -eq $wantEnabled) { $rec.Identity = if ($WantDisabled) { 'Disabled (by platform)' } else { 'Enabled (by platform)' } }
             elseif ($null -eq $state) { $rec.Identity = 'Unreadable' }
             else { $still += $rec }
@@ -1256,17 +1456,16 @@ function Invoke-PackageAction {
 # Usage figures live only on the per-package detail call, so fetch them for the targets, not the whole catalog.
 function Add-PackageUsage {
     param([object[]]$Packages)
+    $map = Get-PackageDetailMap -Ids @($Packages | ForEach-Object { $_.id })
     foreach ($p in $Packages) {
-        try {
-            $d = Invoke-Graph -Uri "$Base/$($p.id)"
-            $p | Add-Member -NotePropertyName ActiveUsers -NotePropertyValue $d.activeUsers -Force
-            $p | Add-Member -NotePropertyName Sessions    -NotePropertyValue $d.totalSessions -Force
-            $p | Add-Member -NotePropertyName LastUsed    -NotePropertyValue $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }) -Force
-        } catch { $null = $_ }
+        $d = $map[$p.id]
+        if (-not $d) { continue }
+        $p | Add-Member -NotePropertyName ActiveUsers -NotePropertyValue $d.activeUsers -Force
+        $p | Add-Member -NotePropertyName Sessions    -NotePropertyValue $d.totalSessions -Force
+        $p | Add-Member -NotePropertyName LastUsed    -NotePropertyValue $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }) -Force
     }
     $Packages
 }
-
 # Preview of the targets with their blast radius (who would lose the agent).
 function Show-ImpactPreview {
     param([object[]]$Packages)
@@ -2118,6 +2317,8 @@ function New-ConsoleWindow {
         & $script:ctx.Busy 'Loading the catalog...'
         try {
             $pkgs = @(Get-Packages)
+            & $script:ctx.Busy ("Resolving owners of {0} agents..." -f $pkgs.Count)
+            Initialize-UserCache -Ids @($pkgs | ForEach-Object { $_.ownerId })
             $script:ctx.Rows.Clear(); & $script:ctx.ResetFilters
             foreach ($p in ($pkgs | Sort-Object displayName)) {
                 $r = New-Object AgentRow
@@ -2189,16 +2390,13 @@ function New-ConsoleWindow {
         if (-not (& $script:ctx.EnsureInfo)) { $script:ui.PermBox.SelectedIndex = 0; return }
         try {
             $withIdentity = @($script:ctx.Rows | Where-Object { $_.Package.agentIdentityId })
-            $n = 0
-            foreach ($r in $withIdentity) {
-                $n++
-                if (-not $script:ctx.PermCache.ContainsKey($r.Id)) {
-                    & $script:ctx.Busy ("Reading Entra permissions {0} of {1}: {2}" -f $n, $withIdentity.Count, $r.Name)
-                    $bp = $script:ctx.InfoTable[$r.Id.ToLower()].BlueprintId
-                    $script:ctx.PermCache[$r.Id] = @(Get-AgentPermissionList -AgentIdentityId $r.Package.agentIdentityId -BlueprintAppId $bp)
-                }
-            }
-            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            $todo = @($withIdentity | Where-Object { -not $script:ctx.PermCache.ContainsKey($_.Id) })
+            if ($todo.Count) {
+                & $script:ctx.Busy ("Reading Entra permissions for {0} agents..." -f $todo.Count)
+                $items = @($todo | ForEach-Object { @{ Key = $_.Id; ServicePrincipalId = $_.Package.agentIdentityId; BlueprintAppId = $script:ctx.InfoTable[$_.Id.ToLower()].BlueprintId } })
+                $got = Get-PermissionsBulk -Items $items
+                foreach ($k in $got.Keys) { $script:ctx.PermCache[$k] = $got[$k] }
+            }            $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($r in $withIdentity) {
                 $p = @($script:ctx.PermCache[$r.Id])
                 if (Test-PermissionMatch -Perms $p -Mode $mode) {

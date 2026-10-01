@@ -99,26 +99,26 @@ Describe 'Invoke-PackageAction' {
             $DisableIdentity = $true
         }
         It 'records that the platform disabled the identity and does not call the identity API' {
-            Mock Get-AgentIdentityState { $false }
+            Mock Get-AgentIdentityStateMap { @{ 'ID-1' = $false } }
             $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
             $log.Identity | Should -Be 'Disabled (by platform)'
             Should -Invoke Set-AgentIdentityState -Times 0
         }
         It 'waits for the platform and then records an unblock re-enabling the identity' {
             $script:reads = 0
-            Mock Get-AgentIdentityState { $script:reads++; $script:reads -ge 2 }
+            Mock Get-AgentIdentityStateMap { $script:reads++; @{ 'ID-1' = ($script:reads -ge 2) } }
             $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -Blocked $true -IdentityId 'ID-1') -Action unblock -PassThru
             $log.Identity | Should -Be 'Enabled (by platform)'
             $script:reads | Should -BeGreaterOrEqual 2
         }
         It 'forces the change itself only when the platform left the identity in the wrong state' {
-            Mock Get-AgentIdentityState { $true }
+            Mock Get-AgentIdentityStateMap { @{ 'ID-1' = $true } }
             $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
             $log.Identity | Should -Be 'Disabled (by tool)'
             Should -Invoke Set-AgentIdentityState -Times 1 -ParameterFilter { $AgentIdentityId -eq 'ID-1' -and $Enabled -eq $false }
         }
         It 'reports a failed forced change without failing the block' {
-            Mock Get-AgentIdentityState { $true }
+            Mock Get-AgentIdentityStateMap { @{ 'ID-1' = $true } }
             Mock Set-AgentIdentityState { throw 'Forbidden' }
             $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
             $log.Result | Should -Be 'Done'
@@ -126,16 +126,16 @@ Describe 'Invoke-PackageAction' {
             $log.Error | Should -Match 'Forbidden'
         }
         It 'reports an unreadable identity without changing it' {
-            Mock Get-AgentIdentityState { $null }
+            Mock Get-AgentIdentityStateMap { @{ 'ID-1' = $null } }
             $log = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block -PassThru
             $log.Identity | Should -Be 'Unreadable'
             Should -Invoke Set-AgentIdentityState -Times 0
         }
         It 'does nothing for identities without -DisableIdentity' {
             $DisableIdentity = $false
-            Mock Get-AgentIdentityState { $true }
+            Mock Get-AgentIdentityStateMap { @{ 'ID-1' = $true } }
             Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha' -IdentityId 'ID-1') -Action block | Out-Null
-            Should -Invoke Get-AgentIdentityState -Times 0
+            Should -Invoke Get-AgentIdentityStateMap -Times 0
             Should -Invoke Set-AgentIdentityState -Times 0
         }
     }
@@ -508,5 +508,231 @@ Describe 'Agents with no Defender record count as having nothing' {
         $row.ToolCount | Should -Be 2
         $row.McpServers | Should -Be 'Work IQ Mail'
         $row.SharedWithCount | Should -Be 1
+    }
+}
+
+Describe 'Graph batching' {
+    BeforeEach {
+        Mock Write-Progress { }
+        Mock Write-Warning { }
+        Mock Start-Sleep { }
+        $script:batchCalls = @()
+    }
+    It 'sends requests 20 at a time and returns every result by id' {
+        Mock Invoke-Graph {
+            $reqs = @(($Body | ConvertFrom-Json).requests)
+            $script:batchCalls += , $reqs.Count
+            [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 200; body = [pscustomobject]@{ echo = $_.url } } }) }
+        }
+        $reqs = 1..45 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
+        $res = Invoke-GraphBatch -Requests $reqs
+        $script:batchCalls | Should -Be @(20, 20, 5)
+        $res.Count | Should -Be 45
+        $res['r33'].Body.echo | Should -Be '/x/33'
+    }
+    It 'retries only the throttled sub-requests and then completes' {
+        $script:seen = @{}
+        Mock Invoke-Graph {
+            $reqs = @(($Body | ConvertFrom-Json).requests)
+            [pscustomobject]@{ responses = @($reqs | ForEach-Object {
+                $n = 1 + [int]$script:seen[$_.id]; $script:seen[$_.id] = $n
+                if ($_.id -eq 'r2' -and $n -lt 3) { [pscustomobject]@{ id = $_.id; status = 429; headers = [pscustomobject]@{ 'Retry-After' = '1' }; body = $null } }
+                else { [pscustomobject]@{ id = $_.id; status = 200; body = [pscustomobject]@{ ok = $true } } } }) }
+        }
+        $res = Invoke-GraphBatch -Requests @(@{ id = 'r1'; method = 'GET'; url = '/a' }, @{ id = 'r2'; method = 'GET'; url = '/b' })
+        $res['r2'].Status | Should -Be 200
+        $script:seen['r1'] | Should -Be 1
+        $script:seen['r2'] | Should -Be 3
+    }
+    It 'gives up after repeated throttling and reports 429' {
+        Mock Invoke-Graph { $reqs = @(($Body | ConvertFrom-Json).requests); [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 429; body = $null } }) } }
+        (Invoke-GraphBatch -Requests @(@{ id = 'r1'; method = 'GET'; url = '/a' }))['r1'].Status | Should -Be 429
+    }
+    It 'handles a thousand requests without per-request cost growing' {
+        Mock Invoke-Graph { $reqs = @(($Body | ConvertFrom-Json).requests); [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 200; body = $null } }) } }
+        $reqs = 1..1000 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        (Invoke-GraphBatch -Requests $reqs).Count | Should -Be 1000
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 15
+    }
+}
+
+Describe 'Bulk prefetch caches' {
+    BeforeEach {
+        Mock Write-Progress { }
+        Mock Start-Sleep { }
+        $script:UserCache = @{}; $script:ManagerCache = @{}; $script:IdentityOwnerCache = @{}
+        $script:g1 = '11111111-1111-1111-1111-111111111111'; $script:g2 = '22222222-2222-2222-2222-222222222222'; $script:g3 = '33333333-3333-3333-3333-333333333333'
+    }
+    It 'caches found and missing users, skips non-ids and already cached ones' {
+        $script:asked = @()
+        Mock Invoke-GraphBatch {
+            $script:asked = @($Requests | ForEach-Object { $_.id })
+            $h = @{}
+            $h[$script:g1] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ id = $script:g1; userPrincipalName = 'a@contoso.com'; displayName = 'A'; accountEnabled = $true } }
+            $h[$script:g2] = [pscustomobject]@{ Status = 404; Body = $null }
+            $h
+        }
+        Initialize-UserCache -Ids @($script:g1, $script:g2, 'not-a-guid', '00000000-0000-0000-0000-000000000000', $script:g1.ToUpper())
+        $script:asked.Count | Should -Be 2
+        $script:UserCache[$script:g1].Upn | Should -Be 'a@contoso.com'
+        $script:UserCache[$script:g2].Exists | Should -BeFalse
+        Initialize-UserCache -Ids @($script:g1, $script:g2)
+        Should -Invoke Invoke-GraphBatch -Times 1
+    }
+    It 'does not cache a user whose lookup failed for another reason' {
+        Mock Invoke-GraphBatch { @{ $script:g3 = [pscustomobject]@{ Status = 500; Body = $null } } }
+        Initialize-UserCache -Ids @($script:g3)
+        $script:UserCache.ContainsKey($script:g3) | Should -BeFalse
+    }
+    It 'reads identity owners in bulk and makes Get-IdentityOwners use the cache' {
+        Mock Invoke-GraphBatch {
+            if ($Version -eq 'beta') { @{ 'idn1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = $script:g1; '@odata.type' = '#microsoft.graph.user' }) } } } }
+            else { @{ $script:g1 = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ id = $script:g1; userPrincipalName = 'o@contoso.com'; displayName = 'O'; accountEnabled = $true } } } }
+        }
+        Mock Invoke-Graph { throw 'Should not call Graph one by one' }
+        Initialize-IdentityOwnerCache -AgentIdentityIds @('idn1')
+        (Get-IdentityOwners 'idn1').Upn | Should -Be 'o@contoso.com'
+    }
+    It 'records managers and uses them without another call' {
+        Mock Invoke-GraphBatch {
+            if ($Requests[0].url -like '*/manager*') { @{ $script:g1 = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ id = $script:g2 } }; $script:g3 = [pscustomobject]@{ Status = 404; Body = $null } } }
+            else { @{ $script:g2 = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ id = $script:g2; userPrincipalName = 'boss@contoso.com'; displayName = 'Boss'; accountEnabled = $true } } } }
+        }
+        Mock Invoke-Graph { throw 'Should not call Graph one by one' }
+        Initialize-ManagerCache -UserIds @($script:g1, $script:g3)
+        (Get-ManagerInfo $script:g1).Upn | Should -Be 'boss@contoso.com'
+        Get-ManagerInfo $script:g3 | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-Packages paging' {
+    It 'follows nextLink to the end and keeps every package' {
+        $script:page = 0
+        Mock Write-Progress { }
+        Mock Invoke-Graph {
+            $script:page++
+            $items = 1..1000 | ForEach-Object { @{ id = "P_$($script:page)_$_"; displayName = "n$_"; supportedHosts = @('Copilot') } }
+            $r = @{ value = $items }
+            if ($script:page -lt 12) { $r['@odata.nextLink'] = "https://graph.microsoft.com/next$($script:page)" }
+            $r
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $all = @(Get-Packages)
+        $all.Count | Should -Be 12000
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 20
+        $script:page = 0
+        @(Get-Packages -AgentsOnly).Count | Should -Be 12000
+    }
+}
+
+Describe 'Bulk permission, detail and identity-state reads' {
+    BeforeEach {
+        Mock Write-Progress { }
+        Mock Start-Sleep { }
+        $script:ResourceCache = @{}; $script:BlueprintPermCache = @{}
+    }
+    It 'reads permissions for many agents in batched calls and adds blueprint permissions once' {
+        $script:batchRequests = 0
+        Mock Invoke-GraphBatch {
+            $script:batchRequests += @($Requests).Count
+            $h = @{}
+            foreach ($r in $Requests) {
+                if ($r.id -like 'g:*') { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ resourceId = 'res1'; scope = ' Runtime.All'; consentType = 'AllPrincipals' }) } } }
+                elseif ($r.id -like 'r:*') { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @() } } }
+                elseif ($r.url -like '/servicePrincipals/res1*') { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'Azure API Connections'; appRoles = @() } } }
+                elseif ($r.url.StartsWith('/servicePrincipals?')) { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-sp' }) } } }
+            }
+            $h
+        }
+        $items = 1..30 | ForEach-Object { @{ Key = "k$_"; ServicePrincipalId = "sp$_"; BlueprintAppId = 'bp-app' } }
+        $got = Get-PermissionsBulk -Items $items
+        $got.Count | Should -Be 30
+        $got['k7'].Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
+        $got['k7'][0].Resource | Should -Be 'Azure API Connections'
+        $got['k7'][0].Permission | Should -Be 'Runtime.All'
+        # 1 blueprint lookup + 2 per identity + 2 for the blueprint SP + 1 resource lookup
+        $script:batchRequests | Should -Be (1 + 60 + 2 + 1)
+    }
+    It 'maps package details and identity states by id' {
+        Mock Invoke-GraphBatch {
+            $h = @{}
+            foreach ($r in $Requests) { $h[$r.id] = if ($r.id -eq 'bad') { [pscustomobject]@{ Status = 404; Body = $null } } else { [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ id = $r.id; activeUsers = 4; accountEnabled = $false } } } }
+            $h
+        }
+        $d = Get-PackageDetailMap -Ids @('a', 'b', 'bad')
+        $d['a'].activeUsers | Should -Be 4
+        $d.ContainsKey('bad') | Should -BeFalse
+        $s = Get-AgentIdentityStateMap -AgentIdentityIds @('i1', 'bad')
+        $s['i1'] | Should -BeFalse
+        $s['bad'] | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Throttling signalled as 424' {
+    BeforeEach {
+        Mock Write-Progress { }
+        Mock Write-Warning { }
+        $script:sleeps = @()
+        Mock Start-Sleep { $script:sleeps += [double]$(if ($Seconds) { $Seconds } else { $Milliseconds / 1000 }) }
+    }
+    It 'retries batch sub-requests that fail with 424 Too Many Requests, and waits longer than for 429' {
+        $script:n = @{}
+        Mock Invoke-Graph {
+            $reqs = @(($Body | ConvertFrom-Json).requests)
+            [pscustomobject]@{ responses = @($reqs | ForEach-Object {
+                $c = 1 + [int]$script:n[$_.id]; $script:n[$_.id] = $c
+                if ($c -lt 2) { [pscustomobject]@{ id = $_.id; status = 424; body = [pscustomobject]@{ error = [pscustomobject]@{ message = '{"StatusCode":424,"Message":"Too Many Requests"}' } } } }
+                else { [pscustomobject]@{ id = $_.id; status = 200; body = [pscustomobject]@{ ok = 1 } } } }) }
+        }
+        $res = Invoke-GraphBatch -Requests @(@{ id = 'a'; method = 'GET'; url = '/x' }, @{ id = 'b'; method = 'GET'; url = '/y' }) -Version beta
+        $res['a'].Status | Should -Be 200
+        $res['b'].Status | Should -Be 200
+        ($script:sleeps | Measure-Object -Maximum).Maximum | Should -BeGreaterOrEqual 10
+    }
+    It 'does not treat a 424 without the throttling message as retryable' {
+        Mock Invoke-Graph {
+            $reqs = @(($Body | ConvertFrom-Json).requests)
+            [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 424; body = [pscustomobject]@{ error = [pscustomobject]@{ message = 'dependency failed' } } } }) }
+        }
+        $res = Invoke-GraphBatch -Requests @(@{ id = 'a'; method = 'GET'; url = '/x' })
+        $res['a'].Status | Should -Be 424
+        Should -Invoke Invoke-Graph -Times 1
+    }
+    It 'paces chunks when a pace is given' {
+        Mock Invoke-Graph { $reqs = @(($Body | ConvertFrom-Json).requests); [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 200; body = $null } }) } }
+        $reqs = 1..30 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
+        Invoke-GraphBatch -Requests $reqs -ChunkSize 10 -PaceSeconds 0.3 | Out-Null
+        Should -Invoke Invoke-Graph -Times 3
+        @($script:sleeps | Where-Object { $_ -gt 2 }).Count | Should -Be 3
+    }
+    It 'retries a single Graph call that answers 424' {
+        $script:calls = 0
+        Mock Invoke-MgGraphRequest {
+            $script:calls++
+            if ($script:calls -lt 2) {
+                $ex = [System.Net.Http.HttpRequestException]::new('424'); $ex | Add-Member -NotePropertyName Response -NotePropertyValue ([pscustomobject]@{ StatusCode = 424; Headers = [pscustomobject]@{ RetryAfter = $null } }) -Force; throw $ex
+            }
+            'ok'
+        }
+        Invoke-Graph -Uri 'https://graph.microsoft.com/beta/x' | Should -Be 'ok'
+        $script:calls | Should -Be 2
+    }
+}
+
+Describe 'Batch pacing stays bounded under heavy throttling' {
+    It 'never sleeps more than a few seconds per request even when many sub-requests are throttled' {
+        Mock Write-Progress { }
+        Mock Write-Warning { }
+        $script:sleepMs = @()
+        Mock Start-Sleep { if ($Milliseconds) { $script:sleepMs += [double]$Milliseconds } }
+        Mock Invoke-Graph {
+            $reqs = @(($Body | ConvertFrom-Json).requests)
+            [pscustomobject]@{ responses = @($reqs | ForEach-Object { [pscustomobject]@{ id = $_.id; status = 424; body = [pscustomobject]@{ error = [pscustomobject]@{ message = 'Too Many Requests' } } } }) }
+        }
+        $reqs = 1..200 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
+        Invoke-GraphBatch -Requests $reqs -ChunkSize 10 -PaceSeconds 0.3 | Out-Null
+        $perRequest = ($script:sleepMs | Measure-Object -Maximum).Maximum / 10
+        $perRequest | Should -BeLessOrEqual 2100   # ms per request, capped at 2 seconds
     }
 }
