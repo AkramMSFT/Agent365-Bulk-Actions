@@ -195,11 +195,12 @@ Describe 'Resolve-AgentOwner' {
 Describe 'Get-OwnerReport' {
     It 'only considers shared agents and counts org-published ones separately' {
         Mock Resolve-AgentOwner { [pscustomobject]@{ Id = $Package.id; State = $(if ($Package.id -eq 'P_ok') { 'OK' } else { 'Needs review' }) } }
-        $pk = @((New-Pkg 'P_ok' 'a'), (New-Pkg 'P_bad' 'b'), (New-Pkg 'P_lob' 'c' -Type 'lob'), (New-Pkg 'P_3p' 'd' -Type 'thirdParty'))
+        $pk = @((New-Pkg 'P_ok' 'a' -OwnerId 'u1'), (New-Pkg 'P_bad' 'b' -OwnerId 'u2'), (New-Pkg 'P_lob' 'c' -Type 'lob'), (New-Pkg 'P_3p' 'd' -Type 'thirdParty'), (New-Pkg 'P_none' 'e'))
         $rep = Get-OwnerReport -Packages $pk
         $rep.OkCount | Should -Be 1
         $rep.Items.Count | Should -Be 1
         $rep.OrgPublished | Should -Be 1
+        $rep.NoOwner | Should -Be 1
         Should -Invoke Resolve-AgentOwner -Times 2
     }
 }
@@ -407,14 +408,19 @@ Describe 'Find-DirectoryUsers' {
 }
 
 Describe 'Test-Reassignable' {
-    It 'allows shared agents only' {
-        Test-Reassignable (New-Pkg 'P_1' 'a' -Type 'shared') | Should -BeTrue
-        Test-Reassignable (New-Pkg 'P_2' 'b' -Type 'thirdParty') | Should -BeFalse
-        Test-Reassignable (New-Pkg 'P_3' 'c' -Type 'lob') | Should -BeFalse
-        Test-Reassignable (New-Pkg 'P_4' 'd' -Type 'firstParty') | Should -BeFalse
+    It 'allows only Copilot Studio shared agents that already have an owner' {
+        Test-Reassignable (New-Pkg 'P_1' 'a' -Type 'shared' -OwnerId 'u1') | Should -BeTrue
+        Test-Reassignable (New-Pkg 'P_2' 'b' -Type 'thirdParty' -OwnerId 'u1') | Should -BeFalse
+        Test-Reassignable (New-Pkg 'P_3' 'c' -Type 'lob' -OwnerId 'u1') | Should -BeFalse
+        Test-Reassignable (New-Pkg 'P_4' 'd' -Type 'firstParty' -OwnerId 'u1') | Should -BeFalse
+    }
+    It 'refuses an ownerless agent and an agent from another platform, with the reason' {
+        Get-ReassignBlock (New-Pkg 'P_5' 'e') | Should -BeLike 'no current owner*'
+        Get-ReassignBlock (New-Pkg 'P_6' 'f' -OwnerId '00000000-0000-0000-0000-000000000000') | Should -BeLike 'no current owner*'
+        $sdk = New-Pkg 'P_7' 'fabrikam' -OwnerId 'u1'; $sdk.platform = 'Not Available'
+        Get-ReassignBlock $sdk | Should -Be 'not created by Copilot Studio'
     }
 }
-
 Describe 'Agent detail helpers' {
     It 'parses array elements that are JSON text, as Defender returns declared tools' {
         $raw = @('{"name":"search_web","type":"capability"}', '{"name":"Send mail","type":"api_action"}')
@@ -446,12 +452,13 @@ Describe 'Get-AgentInfoTable' {
             McpServers = @('{"name":"Work IQ Mail","type":"api_action","approvalModeKind":"never"}')
             DeclaredDataSources = @('https://example.com'); Capabilities = @('Public sites'); SharedWith = @('grp'); Owners = @('u1')
             ConnectedAgents = $null; Endpoints = $null; Triggers = $null; Instructions = 'be helpful' }) }
-        $i = (Get-AgentInfoTable)['t_abc']
+        $i = (Get-AgentInfoTable -TitleId 't_abc')['t_abc']
         $i.Tools[0].Name | Should -Be 'search_web'
         $i.Tools[0].Authentication | Should -Be 'Invoker'
         $i.McpServers[0].Name | Should -Be 'Work IQ Mail'
         $i.Channels | Should -Be @('MsTeams', 'Microsoft365Copilot')
         $i.SharedWith.Count | Should -Be 1
+        $i.SharedCount | Should -Be 1
     }
 }
 
@@ -503,7 +510,7 @@ Describe 'Agents with no Defender record count as having nothing' {
     It 'counts real tools and MCP servers for an agent that has them' {
         $info = [pscustomobject]@{ Platform = 'Copilot Studio'; Channels = @(); Model = ''; PublishedStatus = ''
             Tools = @([pscustomobject]@{ Name = 'a' }, [pscustomobject]@{ Name = 'b' }); McpServers = @([pscustomobject]@{ Name = 'Work IQ Mail' })
-            DataSources = @(); Capabilities = @(); SharedWith = @('g1') }
+            DataSources = @(); Capabilities = @(); SharedWith = @('g1'); SharedCount = 1 }
         $row = Get-InventoryRows -Packages @(New-Pkg 'P_has' 'Agent') -InfoTable @{ 'p_has' = $info }
         $row.ToolCount | Should -Be 2
         $row.McpServers | Should -Be 'Work IQ Mail'
@@ -734,5 +741,129 @@ Describe 'Batch pacing stays bounded under heavy throttling' {
         Invoke-GraphBatch -Requests $reqs -ChunkSize 10 -PaceSeconds 0.3 | Out-Null
         $perRequest = ($script:sleepMs | Measure-Object -Maximum).Maximum / 10
         $perRequest | Should -BeLessOrEqual 2100   # ms per request, capped at 2 seconds
+    }
+}
+
+Describe 'Write loop pacing and scale' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Write-Progress { }
+        Mock Test-Proceed { $true }
+        $OutFile = $null
+        $DisableIdentity = $false
+    }
+    It 'slows down after a throttled call and eases off when calls are clean' {
+        $script:sleepsMs = @(); $script:calls = 0
+        Mock Start-Sleep { if ($Milliseconds) { $script:sleepsMs += [double]$Milliseconds } }
+        Mock Invoke-Graph { $script:calls++; if ($script:calls -eq 3) { Add-ThrottleHit } }
+        $pk = 1..12 | ForEach-Object { New-Pkg "P_$_" "A$_" }
+        Invoke-PackageAction -Packages $pk -Action block | Out-Null
+        $script:calls | Should -Be 12
+        ($script:sleepsMs | Measure-Object -Maximum).Maximum | Should -BeGreaterOrEqual 500     # backed off after the throttle
+        ($script:sleepsMs | Measure-Object -Maximum).Maximum | Should -BeLessOrEqual 3000
+        $script:sleepsMs[-1] | Should -BeLessThan 500                                          # and eased back
+    }
+    It 'handles a large batch of blocks without slowing per item' {
+        Mock Invoke-Graph { }
+        $pk = 1..3000 | ForEach-Object { New-Pkg "P_$_" "A$_" }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $log = @(Invoke-PackageAction -Packages $pk -Action block -PassThru)
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $log.Count | Should -Be 3000
+        @($log | Where-Object Result -eq 'Done').Count | Should -Be 3000
+    }
+}
+
+Describe 'Large inputs stay linear' {
+    It 'compares snapshots of 20,000 agents quickly' {
+        $old = [pscustomobject]@{ items = @(1..20000 | ForEach-Object { [pscustomobject]@{ id = "T_$_"; displayName = "a$_"; isBlocked = $false; ownerId = 'o'; version = '1' } }) }
+        $now = @(1..20000 | ForEach-Object { New-Pkg "T_$_" "a$_" -Blocked ($_ % 1000 -eq 0) -OwnerId 'o' })
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $c = @(Compare-Snapshot -Old $old -Current $now)
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
+        @($c | Where-Object Change -eq 'Blocked').Count | Should -Be 20
+    }
+    It 'plans a policy over 10,000 agents quickly' {
+        $cat = @(1..10000 | ForEach-Object { New-Pkg "T_$_" "a$_" -Blocked ($_ % 50 -eq 0) })
+        Mock Get-Packages { $cat }
+        Mock Get-StalePackages { @($cat | Select-Object -First 4000) }
+        $doc = '{ "rules": [ { "name": "r", "when": { "stale": { "days": 14 } }, "then": { "action": "block" } } ] }' | ConvertFrom-Json
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $plan = @(Get-PolicyPlan $doc)
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
+        $plan[0].Matched.Count | Should -Be 4000
+    }
+    It 'builds inventory rows for 10,000 agents quickly' {
+        Mock Initialize-UserCache { }
+        Mock Get-UserInfo { [pscustomobject]@{ Exists = $true; Enabled = $true; Upn = 'o@contoso.com' } }
+        $pk = @(1..10000 | ForEach-Object { New-Pkg "T_$_" "a$_" -OwnerId 'o' })
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $rows = @(Get-InventoryRows -Packages $pk -InfoTable @{})
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 60
+        $rows.Count | Should -Be 10000
+    }
+    It 'resolves owners for 5,000 shared agents quickly when lookups are cached' {
+        Mock Initialize-UserCache { }; Mock Initialize-IdentityOwnerCache { }; Mock Initialize-ManagerCache { }
+        Mock Get-UserInfo { [pscustomobject]@{ Id = 'o'; Exists = $true; Enabled = $true; Upn = 'o@contoso.com' } }
+        $pk = @(1..5000 | ForEach-Object { New-Pkg "T_$_" "a$_" -OwnerId 'o' })
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $rep = Get-OwnerReport -Packages $pk
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 60
+        $rep.OkCount | Should -Be 5000
+    }
+}
+
+Describe 'Lean Defender read for many agents' {
+    BeforeEach { Mock Write-Progress { } }
+    It 'reads tool and MCP server names and counts without descriptions or instructions' {
+        $script:queries = @()
+        Mock Invoke-HuntingQuery {
+            $script:queries += $Query
+            if ($Query -like '*summarize n = dcount*') { return @([pscustomobject]@{ n = 2 }) }
+            @([pscustomobject]@{ TitleId = 't_a'; Platform = 'Copilot Studio'; EntraBlueprintID = 'bp1'; ToolNames = @('search_web', 'Send mail'); McpNames = @('Work IQ Mail')
+                Channels = 'MsTeams'; DeclaredDataSources = @('https://x.com'); Capabilities = @(); SharedCount = 3 },
+              [pscustomobject]@{ TitleId = 't_b'; Platform = 'Foundry'; EntraBlueprintID = ''; ToolNames = $null; McpNames = $null; Channels = $null; DeclaredDataSources = $null; Capabilities = $null; SharedCount = 0 })
+        }
+        $t = Get-AgentInfoTable
+        $t['t_a'].Tools.Name | Should -Be @('search_web', 'Send mail')
+        $t['t_a'].McpServers.Name | Should -Be 'Work IQ Mail'
+        $t['t_a'].SharedCount | Should -Be 3
+        $t['t_a'].BlueprintId | Should -Be 'bp1'
+        @($t['t_b'].Tools).Count | Should -Be 0
+        @($t['t_b'].McpServers).Count | Should -Be 0
+        ($script:queries -join ' ') | Should -Not -Match 'Instructions'
+        ($script:queries -join ' ') | Should -Not -Match 'where hash'
+    }
+    It 'splits a very large tenant into chunks' {
+        $script:queries = @()
+        Mock Invoke-HuntingQuery {
+            $script:queries += $Query
+            if ($Query -like '*summarize n = dcount*') { return @([pscustomobject]@{ n = 6000 }) }
+            @()
+        }
+        Get-AgentInfoTable | Out-Null
+        $script:queries.Count | Should -Be 4                       # one count plus three chunks of up to 2,500
+        @($script:queries | Where-Object { $_ -match 'hash\(tostring\(AgentId\), 3\) == [012]' }).Count | Should -Be 3
+    }
+}
+Describe 'Lean read keeps exact counts' {
+    It 'pads unnamed entries so the count matches array_length' {
+        $e = @(New-NamedEntries -Names @('a', 'b') -Count 5)
+        $e.Count | Should -Be 5
+        @($e | Where-Object Name).Count | Should -Be 2
+        @(New-NamedEntries -Names $null -Count 0).Count | Should -Be 0
+        @(New-NamedEntries -Names @('a', 'b', 'c') -Count 2).Count | Should -Be 3   # never fewer than the names found
+    }
+    It 'asks Defender for exact counts and a quote-tolerant name match' {
+        $script:q = ''
+        Mock Write-Progress { }
+        Mock Invoke-HuntingQuery { if ($Query -like '*summarize n = dcount*') { return @([pscustomobject]@{ n = 1 }) }; $script:q = $Query; @() }
+        Get-AgentInfoTable | Out-Null
+        $script:q | Should -Match 'ToolCount = array_length'
+        $script:q | Should -Match 'McpCount = array_length'
+        $script:q | Should -Match 'extract_all'
+    }
+    It 'names listing skips unnamed entries' {
+        (Get-NameText @([pscustomobject]@{ Name = 'x' }, [pscustomobject]@{ Name = '' })) | Should -Be 'x'
     }
 }
