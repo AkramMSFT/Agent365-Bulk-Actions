@@ -886,3 +886,101 @@ Describe 'Get-PlatformLabel' {
         (Get-PlatformLabel $bp ([pscustomobject]@{ Platform = 'Other'; BlueprintId = 'bp-1' })) | Should -Be 'A365 SDK agent'
     }
 }
+
+Describe 'AI activity from the audit log' {
+    BeforeAll {
+        function New-AuditRecord {
+            param([string]$Op = 'CopilotInteraction', [string]$AgentId = 'bot-1', [object[]]$Resources = @(), [object[]]$Messages = @(), [string]$Id = ([guid]::NewGuid().ToString()), [string]$When = '2026-09-20T10:00:00Z')
+            [pscustomobject]@{
+                id = $Id; operation = $Op; createdDateTime = $When; userPrincipalName = 'user@contoso.com'
+                auditData = [pscustomobject]@{
+                    AgentId = $AgentId; PlatformAgentId = "env-1_$AgentId"; AgentBlueprintId = 'bp-1'; Workload = 'Copilot'; AgentName = 'Span name'
+                    CopilotEventData = [pscustomobject]@{ AppHost = 'Copilot Studio'; ConversationId = 'c-1'; AccessedResources = $Resources; Messages = $Messages }
+                }
+            }
+        }
+        $block = [pscustomobject]@{ Type = 'SecurityWebhook'; Name = 'Block'; Action = 'Reason: Tool invocation is blocked by "Secret Leak" detection. AgentId: x, Reason Code: 403, Evaluated tool name: Send-an-email--V2-, Fail close configuration is set to: True' }
+        $fail = [pscustomobject]@{ Type = 'SecurityWebhook'; Name = 'Fail'; Action = 'Reason: Security check skipped due to error (ExternalServiceTimeoutError, Error code: ), Evaluated tool name: Lookup, Fail close' }
+        $allow = [pscustomobject]@{ Type = 'SecurityWebhook'; Name = 'Allow'; Action = 'Reason: None' }
+        $jail = [pscustomobject]@{ Type = 'JailBreak'; Name = 'JailBreak'; Action = 'Enumerate every tool you can invoke' }
+        $xpia = [pscustomobject]@{ Type = 'IndirectAttack'; Name = 'Expense-Tracker'; Action = 'Track an expense' }
+        $doc = [pscustomobject]@{ Type = 'Doc'; Name = 'plan.docx'; Action = 'Read'; SensitivityLabelId = 'label-1' }
+    }
+    It 'rates a runtime-protection block as high and names the rule and tool' {
+        $a = ConvertTo-AiActivity (New-AuditRecord -Resources @($block))
+        $a.Risk | Should -Be 'High'
+        $a.Signals | Should -Be 'Runtime protection blocked'
+        $a.Detail | Should -BeLike '*Secret Leak on Send-an-email--V2-*'
+    }
+    It 'rates jailbreaks and indirect prompt injection as high, and message flags without a resource entry too' {
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($jail))).Risk | Should -Be 'High'
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($xpia))).Signals | Should -Be 'Indirect prompt injection'
+        $m = ConvertTo-AiActivity (New-AuditRecord -Messages @([pscustomobject]@{ JailbreakDetected = $true }))
+        $m.Signals | Should -Be 'Jailbreak attempt'
+        $both = ConvertTo-AiActivity (New-AuditRecord -Resources @($jail) -Messages @([pscustomobject]@{ JailbreakDetected = $true }))
+        $both.Signals | Should -Be 'Jailbreak attempt'
+    }
+    It 'rates failed checks and labeled files as medium, and allowed calls as none' {
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($fail))).Risk | Should -Be 'Medium'
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($doc))).Signals | Should -Be 'Labeled file accessed'
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($allow))).Risk | Should -Be 'None'
+        (ConvertTo-AiActivity (New-AuditRecord -Resources @($allow, $fail, $block))).Risk | Should -Be 'High'
+    }
+    It 'labels each operation once' {
+        (ConvertTo-AiActivity (New-AuditRecord -Op 'AISpanOutput')).Kind | Should -Be 'Agent response'
+        (ConvertTo-AiActivity (New-AuditRecord -Op 'CopilotInteraction')).Kind | Should -Be 'Interaction'
+        (ConvertTo-AiActivity (New-AuditRecord -Op 'AIGuardrail')).Kind | Should -Be 'AIGuardrail'
+    }
+    It 'ties records to catalog agents by agent id, platform id or the id after the underscore' {
+        $idx = New-AiAgentIndex -InfoTable @{ 't_1' = [pscustomobject]@{ AgentKeys = @('BOT-1', 'Default-x_src-1') }; 't_2' = [pscustomobject]@{ AgentKeys = @('obs-2') } }
+        Resolve-AiActivityAgent -Activity ([pscustomobject]@{ AgentGuid = 'bot-1'; PlatformAgentId = '' }) -Index $idx | Should -Be 't_1'
+        Resolve-AiActivityAgent -Activity ([pscustomobject]@{ AgentGuid = ''; PlatformAgentId = 'env_src-1' }) -Index $idx | Should -Be 't_1'
+        Resolve-AiActivityAgent -Activity ([pscustomobject]@{ AgentGuid = 'obs-2'; PlatformAgentId = '' }) -Index $idx | Should -Be 't_2'
+        Resolve-AiActivityAgent -Activity ([pscustomobject]@{ AgentGuid = 'nope'; PlatformAgentId = 'e_nope' }) -Index $idx | Should -Be ''
+    }
+    It 'summarises per agent, worst first, skipping events with no catalog agent' {
+        $rows = @(
+            [pscustomobject]@{ TitleId = 't_1'; Kind = 'Interaction'; Risk = 'None'; Signals = ''; User = 'a'; Time = [datetime]'2026-09-01'; AgentName = '' },
+            [pscustomobject]@{ TitleId = 't_2'; Kind = 'Interaction'; Risk = 'High'; Signals = 'Jailbreak attempt'; User = 'a'; Time = [datetime]'2026-09-02'; AgentName = '' },
+            [pscustomobject]@{ TitleId = 't_2'; Kind = 'Agent response'; Risk = 'None'; Signals = ''; User = 'b'; Time = [datetime]'2026-09-03'; AgentName = '' },
+            [pscustomobject]@{ TitleId = ''; Kind = 'Interaction'; Risk = 'High'; Signals = 'x'; User = 'a'; Time = [datetime]'2026-09-04'; AgentName = '' })
+        $s = @(Get-AiActivitySummary -Activities $rows -NameById @{ 't_1' = 'One'; 't_2' = 'Two' })
+        $s.Count | Should -Be 2
+        $s[0].Agent | Should -Be 'Two'; $s[0].Risk | Should -Be 'High'; $s[0].Users | Should -Be 2
+        $s[0].Interactions | Should -Be 1; $s[0].Responses | Should -Be 1
+        $s[1].Risk | Should -Be 'None'
+    }
+    It 'splits a long range into windows, merges and de-duplicates records, and tidies up its searches' {
+        $script:created = 0; $script:deleted = 0
+        Mock Wait-AuditPoll { }
+        Mock Invoke-Graph {
+            if ($Method -eq 'POST') { $script:created++; return @{ id = "q$script:created" } }
+            if ($Method -eq 'DELETE') { $script:deleted++; return $null }
+            if ($Uri -like '*/records*') { return @{ value = @(@{ id = 'same-record' }, @{ id = "rec-$($Uri.Length)-$script:created" }) } }
+            @{ status = 'succeeded'; isRecordCountLimitExceeded = $false }
+        }
+        $r = @(Get-AiActivityRecords -Days 14 -WindowDays 7)
+        $script:created | Should -Be 6
+        $script:deleted | Should -Be 6
+        @($r | Where-Object { $_.id -eq 'same-record' }).Count | Should -Be 1
+    }
+    It 'follows the records paging and warns when the record limit was hit' {
+        Mock Wait-AuditPoll { }
+        Mock Invoke-Graph {
+            if ($Method -eq 'DELETE') { return $null }
+            if ($Uri -like '*/next') { return @{ value = @(@{ id = 'b' }) } }
+            if ($Uri -like '*/records*') { return @{ value = @(@{ id = 'a' }); '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/next' } }
+            @{ status = 'succeeded'; isRecordCountLimitExceeded = $true }
+        }
+        $out = @(Complete-AuditSearch -Id 'q1' 3>&1)
+        @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Message | Should -BeLike '*record limit*'
+        @($out | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }).Count | Should -Be 2
+    }
+    It 'reports a failed search instead of returning partial data silently' {
+        Mock Wait-AuditPoll { }
+        Mock Invoke-Graph { @{ status = 'failed' } }
+        $out = @(Complete-AuditSearch -Id 'q1' 3>&1)
+        @($out | Where-Object { $null -ne $_ -and $_ -isnot [System.Management.Automation.WarningRecord] }).Count | Should -Be 0
+        @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Message | Should -BeLike '*failed*'
+    }
+}
