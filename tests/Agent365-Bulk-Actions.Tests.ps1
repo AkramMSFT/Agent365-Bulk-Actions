@@ -984,3 +984,21 @@ Describe 'AI activity from the audit log' {
         @($out | Where-Object { $_ -is [System.Management.Automation.WarningRecord] }).Message | Should -BeLike '*failed*'
     }
 }
+
+Describe 'Format-GraphError' {
+    It 'puts the service code and message first and names the request' {
+        $detail = 'GET https://graph.microsoft.com/v1.0/security/auditLog/queries/abc/records?$top=1000 HTTP/1.1 400 Bad Request Date: x request-id: y {"error":{"code":"BadRequest","message":"The query is not ready."}}'
+        $m = Format-GraphError -Summary 'Response status code does not indicate success: BadRequest (Bad Request).' -Detail $detail
+        $m | Should -BeLike '*BadRequest: The query is not ready.*'
+        $m | Should -BeLike '*`[GET /v1.0/security/auditLog/queries/abc/records*'
+        $m | Should -Not -BeLike '*request-id*'
+    }
+    It 'falls back to the summary when the body is not JSON' {
+        (Format-GraphError -Summary 'boom' -Detail 'plain text') | Should -Be 'boom'
+    }
+    It 'names the failing step of an audit search' {
+        Mock Wait-AuditPoll { }
+        Mock Invoke-Graph { throw 'BadRequest: nope' }
+        { Complete-AuditSearch -Id 'q1' } | Should -Throw '*Checking an audit search failed: BadRequest: nope*'
+    }
+}
