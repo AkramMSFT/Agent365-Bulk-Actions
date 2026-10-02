@@ -469,6 +469,20 @@ function Get-IdentityOwners {
     } catch { @() }
 }
 
+# The platform an agent runs on, as precisely as the data allows. The catalog names Copilot Studio, Foundry, Agent Builder,
+# Bedrock and SharePoint agents. Agents onboarded through the A365 SDK come back as "Not Available" there and "Other" in
+# Defender, but they are the only packages that carry an Entra agent identity (Defender also records a blueprint),
+# so that is how they are recognised. The remaining packages are Microsoft 365 apps from the store.
+function Get-PlatformLabel {
+    param([object]$Package, [object]$Info)
+    $map = @{ 'AmazonBedrock' = 'Amazon Bedrock'; 'Microsoft Foundry' = 'Foundry'; 'Agent Builder in Microsoft 365 Copilot' = 'Microsoft 365 Copilot Agent Builder' }
+    foreach ($candidate in @($Package.platform, $Info.Platform)) {
+        if ($candidate -and $candidate -notin 'Not Available', 'Other') { return $(if ($map.ContainsKey([string]$candidate)) { $map[[string]$candidate] } else { [string]$candidate }) }
+    }
+    if ($Package.agentIdentityId -or $Info.BlueprintId) { return 'A365 SDK agent' }
+    'Microsoft 365 app'
+}
+
 # The reassign API only moves a Copilot Studio shared agent from its current owner to another user. Verified live:
 # other agent kinds answer 500 ("Only Shared titles created by Copilot Studio can be reassigned") and an agent with
 # no owner answers 424. Returns why an agent cannot be sent, or an empty string when it can.
@@ -979,7 +993,7 @@ function Get-AgentDetail {
     [pscustomobject]@{
         Id = $d.id; Name = $d.displayName
         Overview = [ordered]@{
-            Name = $d.displayName; 'Catalog id' = $d.id; Kind = Get-TypeLabel $d.type; Platform = $(if ($info.Platform) { $info.Platform } else { $d.platform })
+            Name = $d.displayName; 'Catalog id' = $d.id; Kind = Get-TypeLabel $d.type; Platform = (Get-PlatformLabel $d $info)
             Publisher = $d.publisher; Version = $d.version; Status = $(if ($d.isBlocked) { 'Blocked' } else { 'Active' })
             Published = $info.PublishedStatus; Lifecycle = $info.LifecycleStatus; Model = $info.Model
             Created = $(if ($d.createdDateTime) { ([datetimeoffset]$d.createdDateTime).ToString('yyyy-MM-dd') }); Modified = $(if ($d.lastModifiedDateTime) { ([datetimeoffset]$d.lastModifiedDateTime).ToString('yyyy-MM-dd') })
@@ -1093,7 +1107,7 @@ function Get-InventoryRows {
         $info = $InfoTable[$p.id.ToLower()]
         $owner = Get-UserInfo $p.ownerId
         $row = [ordered]@{
-            Name = $p.displayName; Id = $p.id; Kind = Get-TypeLabel $p.type; Platform = $(if ($info.Platform) { $info.Platform } else { $p.platform })
+            Name = $p.displayName; Id = $p.id; Kind = Get-TypeLabel $p.type; Platform = (Get-PlatformLabel $p $info)
             Publisher = $p.publisher; Status = $(if ($p.isBlocked) { 'Blocked' } else { 'Active' })
             Owner = $(if ($owner.Exists) { $owner.Upn } elseif ($p.ownerId -and $p.ownerId -ne '00000000-0000-0000-0000-000000000000') { '(account no longer exists)' } else { '' })
             Version = $p.version; Created = $(if ($p.createdDateTime) { ([datetimeoffset]$p.createdDateTime).ToString('yyyy-MM-dd') }); Modified = $(if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') })
@@ -1588,7 +1602,7 @@ function Get-DeleteCandidates {
         $days = if ($since) { [int]($now - $since).TotalDays } else { $null }
         if (($null -ne $days -and $days -ge $MinDays) -or ($null -eq $days -and $IncludeUnknown)) {
             [pscustomobject]@{
-                Agent = $p.displayName; Id = $p.id; Platform = $(if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { 'Not reported' })
+                Agent = $p.displayName; Id = $p.id; Platform = (Get-PlatformLabel $p $null)
                 BlockedSince = $(if ($since) { $since.ToString('yyyy-MM-dd') } else { 'unknown' }); DaysBlocked = $days
                 Evidence = $(if ($e) { $e.Source } else { 'none' })
                 DeleteVia = $(if ($p.platform -match 'Copilot Studio') { 'Admin center, or Power Platform API' } else { 'Admin center' })
@@ -2406,7 +2420,7 @@ function New-ConsoleWindow {
             foreach ($p in ($pkgs | Sort-Object displayName)) {
                 $r = New-Object AgentRow
                 $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
-                $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { 'Not reported' }
+                $r.Platform = Get-PlatformLabel $p $null
                 $r.Hosts = ($p.supportedHosts) -join ','
                 $r.Owner = Get-OwnerLabel $p
                 $r.Kind = Get-TypeLabel $p.type
@@ -2508,6 +2522,7 @@ function New-ConsoleWindow {
             $toolCount = @(Get-ItemList $i.Tools).Count
             $r.ToolCount = [string]$toolCount; $r.ToolCountSort = $toolCount
             $r.ToolsText = Get-NameText $i.Tools; $r.Mcp = Get-NameText $i.McpServers
+            $r.Platform = Get-PlatformLabel $r.Package $i
             $r.SharedCount = [string][int]$i.SharedCount; $r.Channels = ($i.Channels -join ', ')
         }
     }
