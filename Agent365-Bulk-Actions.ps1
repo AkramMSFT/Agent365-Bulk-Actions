@@ -249,6 +249,10 @@ if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
 if (-not $script:LoadOnly) { Connect-MgGraph @connect }
 
+$script:ThrottleHits = 0   # incremented on every throttled retry; write loops watch it to adapt their pace
+function Add-ThrottleHit { $script:ThrottleHits++ }
+function Get-ThrottleHits { $script:ThrottleHits }
+
 # Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
 function Invoke-Graph {
     param([string]$Method = 'GET', [string]$Uri, [string]$Body, [string]$ContentType)
@@ -259,10 +263,16 @@ function Invoke-Graph {
         catch {
             $resp = $_.Exception.Response
             $code = if ($resp -and $resp.StatusCode) { [int]$resp.StatusCode } else { 0 }
-            # The package service throttles with 424 "Too Many Requests" instead of 429.
-            if ($code -notin 424, 429, 502, 503, 504 -or $attempt -ge 5) { throw }
+            $detail = "$($_.ErrorDetails.Message)"
+            # The package service throttles with 424 "Too Many Requests" instead of 429. Any other 424 is a real dependency failure.
+            $throttled = $code -ne 424 -or $detail -match 'Too Many Requests' -or -not $detail
+            if ($code -notin 424, 429, 502, 503, 504 -or -not $throttled -or $attempt -ge 5) {
+                if ($detail) { throw ("{0} | {1}" -f $_.Exception.Message, ($detail -replace '\s+', ' ').Trim()) }
+                throw
+            }
             $wait = if ($code -eq 424) { [Math]::Max(10, 5 * $attempt) } else { [Math]::Pow(2, $attempt) }
             try { if ($resp.Headers.RetryAfter.Delta) { $wait = [Math]::Max($wait, $resp.Headers.RetryAfter.Delta.TotalSeconds) } } catch { $null = $_ }
+            Add-ThrottleHit
             Write-Warning ("HTTP {0}; retrying in {1:N0}s (attempt {2}/5)." -f $code, $wait, $attempt)
             Start-Sleep -Seconds $wait
         }
@@ -459,11 +469,19 @@ function Get-IdentityOwners {
     } catch { @() }
 }
 
-# The reassign API only works for shared agents. Anything else (store apps, org-published packages)
-# makes it answer 500, so those are never sent.
+# The reassign API only moves a Copilot Studio shared agent from its current owner to another user. Verified live:
+# other agent kinds answer 500 ("Only Shared titles created by Copilot Studio can be reassigned") and an agent with
+# no owner answers 424. Returns why an agent cannot be sent, or an empty string when it can.
+function Get-ReassignBlock {
+    param([object]$Package)
+    if ($Package.type -ne 'shared') { return 'not a shared agent' }
+    if ($Package.platform -notmatch 'Copilot Studio') { return 'not created by Copilot Studio' }
+    if (-not $Package.ownerId -or $Package.ownerId -eq '00000000-0000-0000-0000-000000000000') { return 'no current owner (the service cannot assign one)' }
+    ''
+}
 function Test-Reassignable {
     param([object]$Package)
-    $Package.type -eq 'shared'
+    -not (Get-ReassignBlock $Package)
 }
 
 # Decide what to do about one shared agent's ownership. Order of preference:
@@ -503,7 +521,8 @@ function Resolve-AgentOwner {
 # Scan the catalog. Only shared agents are reassignable through the API; org-published (lob) agents are counted, not acted on.
 function Get-OwnerReport {
     param([object[]]$Packages)
-    $shared = @($Packages | Where-Object { $_.type -eq 'shared' })
+    $sharedAll = @($Packages | Where-Object { $_.type -eq 'shared' })
+    $shared = @($sharedAll | Where-Object { Test-Reassignable $_ })
     Initialize-UserCache -Ids @($shared | ForEach-Object { $_.ownerId })
     $needsOwner = @($shared | Where-Object { $u = Get-UserInfo $_.ownerId; -not ($u.Exists -and $u.Enabled) })
     Initialize-IdentityOwnerCache -AgentIdentityIds @($needsOwner | ForEach-Object { $_.agentIdentityId })
@@ -517,6 +536,7 @@ function Get-OwnerReport {
         Items         = @($report | Where-Object { $_.State -ne 'OK' })
         OkCount       = @($report | Where-Object { $_.State -eq 'OK' }).Count
         OrgPublished  = @($Packages | Where-Object { $_.type -eq 'lob' -and -not $_.ownerId }).Count
+        NoOwner       = @($sharedAll | Where-Object { (Get-ReassignBlock $_) -like 'no current owner*' }).Count
     }
 }
 
@@ -534,7 +554,7 @@ function Invoke-OwnerReassign {
     if (-not $Items -or $Items.Count -eq 0) { Write-Host 'Nothing to reassign.'; return }
     $who = (Get-MgContext).Account
     Write-Host ("`nReassign {0} agent(s):" -f $Items.Count) -ForegroundColor Cyan
-    $log = @(); $ok = 0; $fail = 0
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($i in $Items) {
         $rec = [ordered]@{
             Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'reassign'
@@ -551,7 +571,7 @@ function Invoke-OwnerReassign {
                 $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
             }
         }
-        $log += [pscustomobject]$rec
+        $log.Add([pscustomobject]$rec)
     }
     Write-Host ("Done: {0} reassigned, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
     Export-ActionLog -Records $log
@@ -729,7 +749,11 @@ function Get-ItemList {
 function Get-NameText {
     param($Items, [string]$Property = 'name')
     $names = foreach ($i in (ConvertTo-ObjectList $Items)) {
-        if ($i -is [string]) { $i } elseif ($i.$Property) { [string]$i.$Property } elseif ($i.Name) { [string]$i.Name } else { ($i | ConvertTo-Json -Compress -Depth 2) }
+        if ($i -is [string]) { $i }
+        elseif ($i.$Property) { [string]$i.$Property }
+        elseif ($i.Name) { [string]$i.Name }
+        elseif ($i.PSObject.Properties.Name -contains 'Name') { }   # an entry whose name could not be read
+        else { ($i | ConvertTo-Json -Compress -Depth 2) }
     }
     (@($names | Where-Object { $_ }) -join '; ')
 }
@@ -739,35 +763,78 @@ function Get-TypeLabel {
     switch ($Type) { 'firstParty' { 'Microsoft' } 'thirdParty' { 'Partner or store app' } 'lob' { 'Org-published' } 'shared' { 'Shared by a creator' } default { $Type } }
 }
 
-# One query for every agent's declared tools, MCP servers, data sources, channels and sharing, keyed by catalog id.
+# One entry per declared tool or server: the names that could be read, padded with unnamed entries up to the exact count.
+function New-NamedEntries {
+    param($Names, $Count)
+    $named = @(Get-ItemList $Names | ForEach-Object { [pscustomobject]@{ Name = [string]$_ } })
+    $total = [Math]::Max($named.Count, [int]$Count)
+    if ($named.Count -lt $total) { $named += @(1..($total - $named.Count) | ForEach-Object { [pscustomobject]@{ Name = '' } }) }
+    $named
+}
+
+# Defender's per-agent records, keyed by catalog id.
+#   - With -TitleId: the full record of one agent (tool types, authentication, descriptions, instructions).
+#   - Without it: a lean read of every agent (tool and MCP server names, counts, channels, sharing counts), split into
+#     chunks of about 2,500 agents so a very large tenant never hits the hunting API's row, size or time limits.
 function Get-AgentInfoTable {
-    param([string]$TitleId)
-    $where = if ($TitleId) { "| where tolower(tostring(r.titleId)) == '$($TitleId.ToLower().Replace("'", ''))'" } else { '' }
-    $kql = 'AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | extend r = todynamic(RawAgentInfo) ' + $where +
-           ' | project TitleId = tolower(tostring(r.titleId)), Name, Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
-           ' EntraAgentID = tostring(EntraAgentID), EntraBlueprintID = tostring(EntraBlueprintID), Owners, SharedWith, DeclaredTools, McpServers,' +
-           ' DeclaredDataSources, Capabilities, ConnectedAgents, Endpoints, Triggers, Instructions = substring(tostring(Instructions), 0, 1500)'
-    $rows = Invoke-HuntingQuery -Query $kql -Hint 'Detail columns need Defender Advanced Hunting (ThreatHunting.Read.All).'
+    param([string]$TitleId, [int]$ChunkSize = 2500)
     $table = @{}
-    foreach ($row in $rows) {
-        if (-not $row.TitleId) { continue }
-        $table[[string]$row.TitleId] = [pscustomobject]@{
-            Platform = $row.Platform; BlueprintId = [string]$row.EntraBlueprintID; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
-            Channels = @(ConvertTo-ObjectList $row.Channels | ForEach-Object { "$_".Split(' ') } | Where-Object { $_ })
-            Tools = @(ConvertTo-ObjectList $row.DeclaredTools | ForEach-Object {
-                [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
-            McpServers = @(ConvertTo-ObjectList $row.McpServers | ForEach-Object {
-                [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
-            DataSources = @(ConvertTo-ObjectList $row.DeclaredDataSources | ForEach-Object { "$_" } | Where-Object { $_ })
-            Capabilities = @(ConvertTo-ObjectList $row.Capabilities | ForEach-Object { "$_" } | Where-Object { $_ })
-            ConnectedAgents = @(ConvertTo-ObjectList $row.ConnectedAgents | ForEach-Object { "$_" } | Where-Object { $_ })
-            SharedWith = @(ConvertTo-ObjectList $row.SharedWith | ForEach-Object { "$_" } | Where-Object { $_ })
-            Owners = @(ConvertTo-ObjectList $row.Owners | ForEach-Object { "$_" } | Where-Object { $_ })
-            Endpoints = @(ConvertTo-ObjectList $row.Endpoints | ForEach-Object { if ($_.endpointUrl) { "$($_.endpointType): $($_.endpointUrl)" } else { "$_" } })
-            Triggers = @(ConvertTo-ObjectList $row.Triggers | ForEach-Object { "$_" } | Where-Object { $_ })
-            Instructions = [string]$row.Instructions
+    if ($TitleId) {
+        $kql = 'AgentsInfo | summarize arg_max(Timestamp, *) by AgentId | extend r = todynamic(RawAgentInfo) ' +
+               "| where tolower(tostring(r.titleId)) == '$($TitleId.ToLower().Replace("'", ''))'" +
+               ' | project TitleId = tolower(tostring(r.titleId)), Name, Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
+               ' EntraAgentID = tostring(EntraAgentID), EntraBlueprintID = tostring(EntraBlueprintID), Owners, SharedWith, DeclaredTools, McpServers,' +
+               ' DeclaredDataSources, Capabilities, ConnectedAgents, Endpoints, Triggers, Instructions = substring(tostring(Instructions), 0, 1500)'
+        $rows = Invoke-HuntingQuery -Query $kql -Hint 'Detail columns need Defender Advanced Hunting (ThreatHunting.Read.All).'
+        foreach ($row in $rows) {
+            if (-not $row.TitleId) { continue }
+            $shared = @(ConvertTo-ObjectList $row.SharedWith | ForEach-Object { "$_" } | Where-Object { $_ })
+            $table[[string]$row.TitleId] = [pscustomobject]@{
+                Platform = $row.Platform; BlueprintId = [string]$row.EntraBlueprintID; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
+                Channels = @(ConvertTo-ObjectList $row.Channels | ForEach-Object { "$_".Split(' ') } | Where-Object { $_ })
+                Tools = @(ConvertTo-ObjectList $row.DeclaredTools | ForEach-Object {
+                    [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
+                McpServers = @(ConvertTo-ObjectList $row.McpServers | ForEach-Object {
+                    [pscustomobject]@{ Name = $_.name; Type = $_.type; Authentication = $_.authenticationUsed.type; Approval = $_.approvalModeKind; Connection = $_.connectionName; Description = $_.description } })
+                DataSources = @(ConvertTo-ObjectList $row.DeclaredDataSources | ForEach-Object { "$_" } | Where-Object { $_ })
+                Capabilities = @(ConvertTo-ObjectList $row.Capabilities | ForEach-Object { "$_" } | Where-Object { $_ })
+                ConnectedAgents = @(ConvertTo-ObjectList $row.ConnectedAgents | ForEach-Object { "$_" } | Where-Object { $_ })
+                SharedWith = $shared; SharedCount = $shared.Count
+                Owners = @(ConvertTo-ObjectList $row.Owners | ForEach-Object { "$_" } | Where-Object { $_ })
+                Endpoints = @(ConvertTo-ObjectList $row.Endpoints | ForEach-Object { if ($_.endpointUrl) { "$($_.endpointType): $($_.endpointUrl)" } else { "$_" } })
+                Triggers = @(ConvertTo-ObjectList $row.Triggers | ForEach-Object { "$_" } | Where-Object { $_ })
+                Instructions = [string]$row.Instructions
+            }
+        }
+        return $table
+    }
+
+    $count = 0
+    try { $count = [int]@(Invoke-HuntingQuery -Query 'AgentsInfo | summarize n = dcount(AgentId)' -Hint 'Agent records need Defender Advanced Hunting (ThreatHunting.Read.All).')[0].n } catch { throw }
+    $chunks = [Math]::Max(1, [int][Math]::Ceiling($count / [double]$ChunkSize))
+    for ($k = 0; $k -lt $chunks; $k++) {
+        $slice = if ($chunks -gt 1) { "| where hash(tostring(AgentId), $chunks) == $k" } else { '' }
+        $kql = 'AgentsInfo | summarize arg_max(Timestamp, *) by AgentId ' + $slice + ' | extend r = todynamic(RawAgentInfo)' +
+               ' | project TitleId = tolower(tostring(r.titleId)), Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
+               ' EntraBlueprintID = tostring(EntraBlueprintID),' +
+               ' ToolCount = array_length(todynamic(DeclaredTools)), McpCount = array_length(todynamic(McpServers)),' +
+               ' ToolNames = extract_all(@''\\?"name\\?":\\?"([^"\\]*)'', tostring(DeclaredTools)), McpNames = extract_all(@''\\?"name\\?":\\?"([^"\\]*)'', tostring(McpServers)),' +
+               ' DeclaredDataSources, Capabilities, SharedCount = array_length(todynamic(SharedWith))'
+        if ($chunks -gt 1) { Write-Progress -Activity 'Reading Defender agent records' -Status ("part {0} of {1}" -f ($k + 1), $chunks) -PercentComplete (100 * $k / $chunks) }
+        foreach ($row in (Invoke-HuntingQuery -Query $kql -Hint 'Agent records need Defender Advanced Hunting (ThreatHunting.Read.All).')) {
+            if (-not $row.TitleId) { continue }
+            $table[[string]$row.TitleId] = [pscustomobject]@{
+                Platform = $row.Platform; BlueprintId = [string]$row.EntraBlueprintID; Model = $row.Model; PublishedStatus = $row.PublishedStatus; LifecycleStatus = $row.LifecycleStatus
+                Channels = @(ConvertTo-ObjectList $row.Channels | ForEach-Object { "$_".Split(' ') } | Where-Object { $_ })
+                Tools = @(New-NamedEntries -Names $row.ToolNames -Count $row.ToolCount)
+                McpServers = @(New-NamedEntries -Names $row.McpNames -Count $row.McpCount)
+                DataSources = @(ConvertTo-ObjectList $row.DeclaredDataSources | ForEach-Object { "$_" } | Where-Object { $_ })
+                Capabilities = @(ConvertTo-ObjectList $row.Capabilities | ForEach-Object { "$_" } | Where-Object { $_ })
+                ConnectedAgents = @(); SharedWith = @(); SharedCount = [int]$row.SharedCount; Owners = @(); Endpoints = @(); Triggers = @(); Instructions = ''
+            }
         }
     }
+    if ($chunks -gt 1) { Write-Progress -Activity 'Reading Defender agent records' -Completed }
     $table
 }
 
@@ -890,9 +957,9 @@ function Get-AgentIdentityStateMap {
 
 # The full picture of one agent. Entra lookups run only when the agent has an identity.
 function Get-AgentDetail {
-    param([object]$Package, [hashtable]$InfoTable, [switch]$SkipEntra, [switch]$SkipRisk)
+    param([object]$Package, [switch]$SkipEntra, [switch]$SkipRisk)
     $d = Invoke-Graph -Uri "$Base/$($Package.id)"
-    $info = if ($InfoTable) { $InfoTable[$Package.id.ToLower()] } else { (Get-AgentInfoTable -TitleId $Package.id)[$Package.id.ToLower()] }
+    $info = (Get-AgentInfoTable -TitleId $Package.id)[$Package.id.ToLower()]
     $owner = Get-UserInfo $d.ownerId
     $identity = $null; $perms = @(); $owners = @(); $sponsors = @()
     if ($d.agentIdentityId -and -not $SkipEntra) {
@@ -921,7 +988,7 @@ function Get-AgentDetail {
         Sharing = [ordered]@{
             'Who can use it' = $d.availableTo; 'Deployed to' = $d.deployedTo
             'Allowed users and groups' = (& $count $d.allowedUsersAndGroups); 'Users and groups it can be installed by' = (& $count $d.acquireUsersAndGroups)
-            'Shared with (catalog)' = (& $count $d.sharedWithUsersAndGroups); 'Shared with (agent record)' = $(if ($info) { (& $count $info.SharedWith) } else { 0 })
+            'Shared with (catalog)' = (& $count $d.sharedWithUsersAndGroups); 'Shared with (agent record)' = $(if ($info) { [int]$info.SharedCount } else { 0 })
             Channels = $(if ($info) { $info.Channels -join ', ' } else { '' })
         }
         Tools = @(Get-ItemList $info.Tools); McpServers = @(Get-ItemList $info.McpServers)
@@ -1033,7 +1100,7 @@ function Get-InventoryRows {
             Published = $info.PublishedStatus; Channels = ($info.Channels -join ', '); Model = $info.Model
             ToolCount = @(Get-ItemList $info.Tools).Count; Tools = (Get-NameText $info.Tools); McpServers = (Get-NameText $info.McpServers)
             DataSources = ($info.DataSources -join '; '); Capabilities = ($info.Capabilities -join '; ')
-            SharedWithCount = @(Get-ItemList $info.SharedWith).Count; AgentIdentity = $p.agentIdentityId
+            SharedWithCount = [int]$info.SharedCount; AgentIdentity = $p.agentIdentityId
         }
         if ($Deep) {
             foreach ($c in 'AvailableTo', 'DeployedTo', 'CatalogSharedWith', 'ActiveUsers', 'Sessions', 'LastUsed') { $row[$c] = '' }
@@ -1420,8 +1487,13 @@ function Invoke-PackageAction {
     $who = (Get-MgContext).Account
     $verb = $Action.Substring(0,1).ToUpper() + $Action.Substring(1)
     Write-Host ("`n{0} {1} package(s):" -f $verb, $Packages.Count) -ForegroundColor Cyan
-    $log = @(); $ok = 0; $skip = 0; $fail = 0
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $skip = 0; $fail = 0
+    [double]$pace = 0; $n = 0
     foreach ($p in $Packages) {
+        $n++
+        if ($Packages.Count -gt 50 -and $n % 25 -eq 0) {
+            Write-Progress -Activity ("{0} agents" -f $verb) -Status ("{0} of {1}" -f $n, $Packages.Count) -PercentComplete (100 * $n / $Packages.Count)
+        }
         $rec = [ordered]@{
             Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action
             Id = $p.id; DisplayName = $p.displayName; WasBlocked = $p.isBlocked; Result = ''; Identity = ''; Error = ''
@@ -1432,6 +1504,9 @@ function Invoke-PackageAction {
         } elseif (-not (Test-Proceed ("{0} ({1})" -f $p.displayName, $p.id) $verb)) {
             $rec.Result = 'WhatIf'
         } else {
+            # The package service rate-limits writes too: back off after a throttle, ease off again when calls are clean.
+            if ($pace -gt 0) { Start-Sleep -Milliseconds ([int]($pace * 1000)) }
+            $hitsBefore = Get-ThrottleHits
             try {
                 Invoke-Graph -Method POST -Uri "$Base/$($p.id)/$Action" | Out-Null   # 204
                 Write-Host ("  OK   {0}  ({1})" -f $p.displayName, $p.id) -ForegroundColor Green
@@ -1440,9 +1515,11 @@ function Invoke-PackageAction {
                 Write-Host ("  FAIL {0}  ({1}) -> {2}" -f $p.displayName, $p.id, $_.Exception.Message) -ForegroundColor Red
                 $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
             }
+            $pace = if ((Get-ThrottleHits) -gt $hitsBefore) { [Math]::Min([Math]::Max($pace * 2, 0.5), 3) } else { [Math]::Max(0.0, $pace * 0.8) }
         }
-        $log += [pscustomobject]$rec
+        $log.Add([pscustomobject]$rec)
     }
+    if ($Packages.Count -gt 50) { Write-Progress -Activity ("{0} agents" -f $verb) -Completed }
     if ($DisableIdentity) {
         $byId = @{}; foreach ($p in $Packages) { $byId[$p.id] = $p }
         Confirm-AgentIdentityState -Records $log -PackageById $byId -WantDisabled $want
@@ -1511,7 +1588,7 @@ function Get-DeleteCandidates {
         $days = if ($since) { [int]($now - $since).TotalDays } else { $null }
         if (($null -ne $days -and $days -ge $MinDays) -or ($null -eq $days -and $IncludeUnknown)) {
             [pscustomobject]@{
-                Agent = $p.displayName; Id = $p.id; Platform = $(if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { $p.type })
+                Agent = $p.displayName; Id = $p.id; Platform = $(if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { 'Not reported' })
                 BlockedSince = $(if ($since) { $since.ToString('yyyy-MM-dd') } else { 'unknown' }); DaysBlocked = $days
                 Evidence = $(if ($e) { $e.Source } else { 'none' })
                 DeleteVia = $(if ($p.platform -match 'Copilot Studio') { 'Admin center, or Power Platform API' } else { 'Admin center' })
@@ -2233,8 +2310,7 @@ function New-DetailWindow {
         $w = $script:detailState.Window
         try {
             $w.Cursor = [Windows.Input.Cursors]::Wait
-            $table = $script:ctx.InfoTable
-            $script:detailState.Detail = Get-AgentDetail -Package $script:detailState.Row.Package -InfoTable $table
+            $script:detailState.Detail = Get-AgentDetail -Package $script:detailState.Row.Package
             Set-DetailWindowContent -Window $w -Detail $script:detailState.Detail
         } catch {
             $w.FindName('Subtitle').Text = 'Could not read the record: ' + $_.Exception.Message
@@ -2252,7 +2328,7 @@ function New-ConsoleWindow {
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; InfoTable = $null; ToolsSet = $null; PermSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; RowById = @{}; Bulk = $false; InfoTable = $null; ToolsSet = $null; PermSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -2260,6 +2336,13 @@ function New-ConsoleWindow {
     $script:ctx.Pump = { $script:w.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
     $script:ctx.Busy = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = [Windows.Input.Cursors]::Wait; & $script:ctx.Pump }
     $script:ctx.Idle = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = $null }
+
+    # Row events only schedule a summary refresh; it runs once after a burst of changes settles.
+    $script:ctx.SummaryTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:ctx.SummaryTimer.Interval = [TimeSpan]::FromMilliseconds(80)
+    $script:ctx.SummaryTimer.Add_Tick({ $script:ctx.SummaryTimer.Stop(); & $script:ctx.Summary })
+    # Run a bulk change with row events muted, then refresh the summary once.
+    $script:ctx.BulkChange = { param([scriptblock]$Change) $script:ctx.Bulk = $true; try { & $Change } finally { $script:ctx.Bulk = $false }; & $script:ctx.Summary }
 
     $script:ctx.Summary = {
         $rows = @($script:ctx.Rows)
@@ -2319,11 +2402,11 @@ function New-ConsoleWindow {
             $pkgs = @(Get-Packages)
             & $script:ctx.Busy ("Resolving owners of {0} agents..." -f $pkgs.Count)
             Initialize-UserCache -Ids @($pkgs | ForEach-Object { $_.ownerId })
-            $script:ctx.Rows.Clear(); & $script:ctx.ResetFilters
+            $script:ctx.Rows.Clear(); $script:ctx.RowById = @{}; & $script:ctx.ResetFilters
             foreach ($p in ($pkgs | Sort-Object displayName)) {
                 $r = New-Object AgentRow
                 $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
-                $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { [string]$p.type }
+                $r.Platform = if ($p.platform -and $p.platform -ne 'Not Available') { $p.platform } else { 'Not reported' }
                 $r.Hosts = ($p.supportedHosts) -join ','
                 $r.Owner = Get-OwnerLabel $p
                 $r.Kind = Get-TypeLabel $p.type
@@ -2331,8 +2414,12 @@ function New-ConsoleWindow {
                 $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
                 $r.Package = $p
                 $r.IdleSort = -1; $r.RiskSort = 0; $r.AlertsSort = 0
-                $r.add_PropertyChanged({ param($s, $e) if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { & $script:ctx.Summary } })
+                $r.add_PropertyChanged({ param($s, $e)
+                    if ($script:ctx.Bulk) { return }
+                    if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { $script:ctx.SummaryTimer.Stop(); $script:ctx.SummaryTimer.Start() }
+                })
                 $script:ctx.Rows.Add($r)
+                $script:ctx.RowById[$r.Id] = $r
             }
             & $script:ctx.FillInfo
             & $script:ctx.Refilter
@@ -2421,7 +2508,7 @@ function New-ConsoleWindow {
             $toolCount = @(Get-ItemList $i.Tools).Count
             $r.ToolCount = [string]$toolCount; $r.ToolCountSort = $toolCount
             $r.ToolsText = Get-NameText $i.Tools; $r.Mcp = Get-NameText $i.McpServers
-            $r.SharedCount = [string]@(Get-ItemList $i.SharedWith).Count; $r.Channels = ($i.Channels -join ', ')
+            $r.SharedCount = [string][int]$i.SharedCount; $r.Channels = ($i.Channels -join ', ')
         }
     }
 
@@ -2461,15 +2548,15 @@ function New-ConsoleWindow {
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($i in $report.Items) {
                 [void]$set.Add($i.Id)
-                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $i.Id } | Select-Object -First 1
+                $row = $script:ctx.RowById[[string]$i.Id]
                 if (-not $row) { continue }
                 $row.OwnerNote = $i.Reason
                 if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
             }
             $script:ctx.OwnerSet = $set
             & $script:ctx.Refilter
-            & $script:ctx.Idle ("{0} shared agent(s) need an owner: {1} with a suggestion, {2} to assign manually. {3} org-published agent(s) have no owner but cannot be reassigned through the API." -f
-                $report.Items.Count, $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.OrgPublished)
+            & $script:ctx.Idle ("{0} shared agent(s) need an owner: {1} with a suggestion, {2} to assign manually. {3} org-published and {4} ownerless Copilot Studio agent(s) cannot be reassigned through the API." -f
+                $report.Items.Count, $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.OrgPublished, $report.NoOwner)
         } catch {
             $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
             & $script:ctx.Idle 'Ownership check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Ownership', 'OK', 'Error')
@@ -2488,7 +2575,7 @@ function New-ConsoleWindow {
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($c in $found) {
                 [void]$set.Add($c.Id)
-                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $c.Id } | Select-Object -First 1
+                $row = $script:ctx.RowById[[string]$c.Id]
                 if (-not $row) { continue }
                 $row.BlockedFor = if ($null -ne $c.DaysBlocked) { "$($c.DaysBlocked) days" } else { 'unknown' }
                 $row.BlockedForSort = if ($null -ne $c.DaysBlocked) { [int]$c.DaysBlocked } else { -1 }
@@ -2512,7 +2599,7 @@ function New-ConsoleWindow {
         $recs = @(Invoke-OwnerReassign -Items $Items -PassThru)
         foreach ($rec in $recs) {
             if ($rec.Result -ne 'Done') { continue }
-            $row = $script:ctx.Rows | Where-Object { $_.Id -eq $rec.Id } | Select-Object -First 1
+            $row = $script:ctx.RowById[[string]$rec.Id]
             if ($row) { $row.Package.ownerId = $rec.NewOwner; $row.Owner = Get-OwnerLabel $row.Package; $row.Checked = $false }
         }
         $done = @($recs | Where-Object { $_.Result -eq 'Done' }).Count; $failed = @($recs | Where-Object { $_.Result -eq 'Failed' }).Count
@@ -2537,7 +2624,7 @@ function New-ConsoleWindow {
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($m in $found) {
                 [void]$set.Add($m.id)
-                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
+                $row = $script:ctx.RowById[[string]$m.id]
                 if (-not $row) { continue }
                 if ($m.StaleSince) {
                     $row.LastActivity = $m.StaleSince.ToString('yyyy-MM-dd')
@@ -2565,7 +2652,7 @@ function New-ConsoleWindow {
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($m in $found) {
                 [void]$set.Add($m.id)
-                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $m.id } | Select-Object -First 1
+                $row = $script:ctx.RowById[[string]$m.id]
                 if (-not $row) { continue }
                 $row.Risk = $m.RiskSeverity; $row.RiskSort = Get-SevRank $m.RiskSeverity
                 $row.Alerts = [string]$m.RiskAlerts; $row.AlertsSort = [int]$m.RiskAlerts
@@ -2596,7 +2683,7 @@ function New-ConsoleWindow {
         $recs = @(Invoke-PackageAction -Packages @($Rows | ForEach-Object { $_.Package | Add-Member -NotePropertyName isBlocked -NotePropertyValue $_.IsBlocked -Force -PassThru }) -Action $Verb.ToLower() -PassThru)
         foreach ($rec in $recs) {
             if ($rec.Result -eq 'Done') {
-                $row = $script:ctx.Rows | Where-Object { $_.Id -eq $rec.Id } | Select-Object -First 1
+                $row = $script:ctx.RowById[[string]$rec.Id]
                 if ($row) { $row.IsBlocked = ($Verb -eq 'Block'); $row.Package.isBlocked = $row.IsBlocked; $row.Checked = $false }
             }
         }
@@ -2662,16 +2749,16 @@ function New-ConsoleWindow {
             [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn; Source = 'Manual' } })
         if ($items.Count -eq 0) { & $script:ctx.Idle 'Those agents already belong to that user.'; return }
         if ($checked.Count -gt $rows.Count) {
-            [void][Windows.MessageBox]::Show(("{0} of the {1} selected agents are not shared agents and were left out: only shared agents can be reassigned." -f ($checked.Count - $rows.Count), $checked.Count), 'Assign owner', 'OK', 'Information')
+            [void][Windows.MessageBox]::Show(("{0} of the {1} selected agents are not shared agents and were left out: the service only reassigns Copilot Studio shared agents that already have an owner." -f ($checked.Count - $rows.Count), $checked.Count), 'Assign owner', 'OK', 'Information')
         }
         & $script:ctx.ReassignRows $items 'Assign owner'
     })
     $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
-    $script:ui.BtnSelectVisible.Add_Click({ foreach ($r in $script:ctx.View) { $r.Checked = $true }; & $script:ctx.Summary })
-    $script:ui.BtnClearSel.Add_Click({ foreach ($r in $script:ctx.Rows) { $r.Checked = $false }; & $script:ctx.Summary })
+    $script:ui.BtnSelectVisible.Add_Click({ & $script:ctx.BulkChange { foreach ($r in $script:ctx.View) { $r.Checked = $true } } })
+    $script:ui.BtnClearSel.Add_Click({ & $script:ctx.BulkChange { foreach ($r in $script:ctx.Rows) { $r.Checked = $false } } })
     $script:ui.HeaderCheck.Add_Click({
         $on = [bool]$script:ui.HeaderCheck.IsChecked
-        foreach ($r in $script:ctx.View) { $r.Checked = $on }; & $script:ctx.Summary
+        & $script:ctx.BulkChange { foreach ($r in $script:ctx.View) { $r.Checked = $on } }
     })
 
 
@@ -2680,7 +2767,7 @@ function New-ConsoleWindow {
 
     $script:ui.BtnUndo.Add_Click({
         $done = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' })
-        $back = @($done | ForEach-Object { $id = $_.Id; $script:ctx.Rows | Where-Object { $_.Id -eq $id } } | Where-Object { $_ })
+        $back = @($done | ForEach-Object { $script:ctx.RowById[[string]$_.Id] } | Where-Object { $_ })
         if ($back.Count -eq 0) { return }
         $verb = if ($done[0].Action -eq 'block') { 'Unblock' } else { 'Block' }
         & $script:ctx.Apply $verb $back
@@ -2767,8 +2854,8 @@ switch ($PSCmdlet.ParameterSetName) {
     }
     'Ownerless' {
         $report = Get-OwnerReport -Packages @(Get-Packages)
-        Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published agent(s) have no owner but cannot be reassigned through the API." -f
-            $report.OkCount, $report.Items.Count, $report.OrgPublished) -ForegroundColor Cyan
+        Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published and {3} ownerless Copilot Studio agent(s) cannot be reassigned through the API." -f
+            $report.OkCount, $report.Items.Count, $report.OrgPublished, $report.NoOwner) -ForegroundColor Cyan
         if ($report.Items.Count -eq 0) { break }
         Show-OwnerPreview -Items $report.Items
         $proposed = @($report.Items | Where-Object { $_.State -eq 'Proposed' })
@@ -2786,7 +2873,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $targets = @(Resolve-Packages $Reassign)
         $skipped = @($targets | Where-Object { -not (Test-Reassignable $_) })
         if ($skipped.Count) {
-            Write-Warning ("Only shared agents can be reassigned through the API. Skipped: {0}" -f (($skipped | ForEach-Object { "$($_.displayName) [$($_.type)]" }) -join '; '))
+            Write-Warning ("Skipped (the service only reassigns Copilot Studio shared agents that already have an owner): {0}" -f (($skipped | ForEach-Object { "$($_.displayName) [$(Get-ReassignBlock $_)]" }) -join '; '))
         }
         $items = @($targets | Where-Object { (Test-Reassignable $_) -and $_.ownerId -ne $owner.Id } | ForEach-Object {
             [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; Platform = $_.platform; CurrentOwnerId = $_.ownerId; CurrentOwner = ''
