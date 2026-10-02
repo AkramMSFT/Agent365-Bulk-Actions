@@ -867,3 +867,22 @@ Describe 'Lean read keeps exact counts' {
         (Get-NameText @([pscustomobject]@{ Name = 'x' }, [pscustomobject]@{ Name = '' })) | Should -Be 'x'
     }
 }
+
+Describe 'Get-PlatformLabel' {
+    It 'uses the catalog platform when it names one, with readable names' {
+        (Get-PlatformLabel (New-Pkg 'P_1' 'a') $null) | Should -Be 'Copilot Studio'
+        $b = New-Pkg 'P_2' 'b'; $b.platform = 'AmazonBedrock'
+        (Get-PlatformLabel $b $null) | Should -Be 'Amazon Bedrock'
+    }
+    It 'falls back to a specific Defender platform, ignoring Other' {
+        $p = New-Pkg 'P_3' 'c'; $p.platform = 'Not Available'
+        (Get-PlatformLabel $p ([pscustomobject]@{ Platform = 'Microsoft Foundry' })) | Should -Be 'Foundry'
+        (Get-PlatformLabel $p ([pscustomobject]@{ Platform = 'Other' })) | Should -Be 'Microsoft 365 app'
+    }
+    It 'recognises SDK-onboarded agents by their agent identity or blueprint' {
+        $sdk = New-Pkg 'P_4' 'fabrikam' -IdentityId 'identity-1'; $sdk.platform = 'Not Available'
+        (Get-PlatformLabel $sdk $null) | Should -Be 'A365 SDK agent'
+        $bp = New-Pkg 'P_5' 'x'; $bp.platform = 'Not Available'
+        (Get-PlatformLabel $bp ([pscustomobject]@{ Platform = 'Other'; BlueprintId = 'bp-1' })) | Should -Be 'A365 SDK agent'
+    }
+}
