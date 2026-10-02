@@ -1,0 +1,31 @@
+{
+  "name": "Agent governance baseline",
+  "exclude": {
+    "publishers": ["Microsoft Corporation"],
+    "types": ["firstParty"],
+    "names": [],
+    "ids": []
+  },
+  "rules": [
+    {
+      "name": "Contain agents with high-severity security signals",
+      "when": { "risky": { "minSeverity": "High", "source": "Both" } },
+      "then": { "action": "block", "disableIdentity": true }
+    },
+    {
+      "name": "Block agents that went quiet",
+      "when": { "stale": { "by": "activity", "days": 21 } },
+      "then": { "action": "block" }
+    },
+    {
+      "name": "Give orphaned shared agents a new owner where one can be derived",
+      "when": { "ownerless": true },
+      "then": { "action": "reassign" }
+    },
+    {
+      "name": "Report blocked agents ready for deletion",
+      "when": { "blockedDays": 30 },
+      "then": { "action": "report" }
+    }
+  ]
+}
