@@ -21,6 +21,7 @@ Beyond one‑off actions, it can bulk‑block **stale** agents — those that ha
 - **Contain** agents by also disabling their Entra identity, and see each agent's blast radius first.
 - Track **delete candidates** (agents that stayed blocked) for clean-up in the admin center.
 - Run a repeatable **policy file**, keep **snapshots**, and **undo** a run from its log.
+- See the **risky AI activity of each agent** (jailbreak attempts, prompt injection, blocked tool calls) from the Purview audit log.
 - See the **full record of any agent** (sharing, tools, MCP servers, permissions, identity) and export an inventory.
 - Use the **graphical console** (`-Gui`) for all of the above.
 
@@ -54,6 +55,7 @@ On each run the script: ensures the `Microsoft.Graph.Authentication` module is i
 | `CopilotPackages.Read.All` | Read‑only actions (`-List`, or any mode with `-Action list`) |
 | `CopilotPackages.ReadWrite.All` | Blocking or unblocking agents |
 | `ThreatHunting.Read.All` | Activity‑based staleness (`-Stale -By activity`) |
+| `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, and the *AI activity* tab in the console). Needs admin consent and a Purview audit role (for example Audit Reader). |
 
 ## Getting started
 
@@ -280,6 +282,36 @@ Behaviors carry no severity of their own, so the table above is the mapping the 
 > [!NOTE]
 > Not every signal can be attributed to a catalog agent. "Defender for AI Services" alerts name an Azure AI account rather than an agent, `BehaviorAIAgentsRealTimeBlock` records carry no agent identity, and a Prompt Shield record whose agent name is missing or duplicated in `AgentsInfo` is skipped. **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
 
+### AI activity from Purview
+
+DSPM's **Activity Explorer > AI activities** tab has no API of its own. It is a view over the Microsoft Purview unified audit log, and Graph exposes that log as asynchronous searches (`/security/auditLog/queries`). `-AiActivity` runs those searches, ties each record to a catalog agent and flags the risky ones.
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -AiActivity                                  # every agent with activity, worst first
+.\Agent365-Bulk-Actions.ps1 -AiActivity -AiDays 7 -RiskyOnly             # only agents with a risk signal in the last week
+.\Agent365-Bulk-Actions.ps1 -AiActivity -ForAgent 'Family Trails Guide'  # the individual events of one agent
+.\Agent365-Bulk-Actions.ps1 -AiActivity -OutFile ai-activity.csv         # export the summary (or, with -ForAgent, the events)
+```
+
+In the console, select an agent and press **AI activity...** (or open **Details...** and use the **AI activity** tab). Pick a period, press **Load from Purview audit**, and the events appear with the risk coloured. The search is tenant-wide and is reused by every agent you open afterwards. **Risky only** hides the routine events.
+
+| Signal | Where it comes from in the audit record | Risk |
+| --- | --- | --- |
+| Jailbreak attempt | A `JailBreak` entry in the accessed resources, or a message flagged `JailbreakDetected` | High |
+| Indirect prompt injection | An `IndirectAttack` entry, with the tool it came through | High |
+| Runtime protection blocked | A `SecurityWebhook` verdict of `Block`, with the detection rule and the tool | High |
+| Protection check failed | A `SecurityWebhook` verdict of `Fail` (the call was not evaluated, for example a timeout) | Medium |
+| Labeled file accessed | An accessed file that carries a sensitivity label | Medium |
+
+What is read: `CopilotInteraction` records (the interactions), `AISpanOutputs` records (the agent's responses) and the Agent 365 operations `AIInvokeAgent`, `AIExecuteTool`, `AIInferenceCall` and `AIGuardrail`. A record is tied to an agent through Defender's identifiers for it (agent id, bot id, Entra id, observability id, source id). Events of agents that are not in the catalog, such as Microsoft 365 Copilot's own agents, are counted but not listed.
+
+> [!NOTE]
+> - **Risk levels here come from the audit signals above, not from Insider Risk Management.** The risk level and the sensitive-information-type classification shown in the portal are computed inside Purview and have no API. Insider Risk, DLP and Security for AI alerts do reach Defender, so `-Risky` covers those.
+> - **Speed.** The service takes about a minute for 7 days and about ten minutes for 30, and does the same work however many agents you have. Ranges longer than 30 days are split into windows that run side by side.
+> - **Prompt text.** A jailbreak event shows the start of the offending prompt (160 characters), as the portal does. Treat exports accordingly.
+> - **Saved searches.** Each run creates audit searches named `Agent365-Bulk-Actions AI activity ...` and deletes them afterwards when the service allows it; if not, remove them from the Purview audit search history.
+> - The audit log retention of your licence (180 days or one year) bounds `-AiDays` (maximum 180).
+
 ## Parameter reference
 
 Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`) is used per run.
@@ -298,6 +330,10 @@ Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`
 | `-To` | UPN or object id | The new owner for `-Reassign`. |
 | `-DisableIdentity` | switch | After block, verify the agent's Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
 | `-Impact` | switch | Show active users, sessions and last use for each target before acting. |
+| `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. Add `-ForAgent` for the events of named agents. |
+| `-ForAgent` | names and/or ids | With `-AiActivity`: list the individual events of these agents. |
+| `-AiDays` | 1-180, default 30 | With `-AiActivity`: how many days back to search. |
+| `-RiskyOnly` | switch | With `-AiActivity`: only events with a risk signal. |
 | `-DeleteCandidates` | switch | List agents that have stayed blocked at least `-MinDaysBlocked` days (default 30). Reports only; nothing is deleted. |
 | `-History` | paths | Extra result logs or folders that record when agents were blocked. |
 | `-IncludeUnknown` | switch | With `-DeleteCandidates`, also list blocked agents whose block date is unknown. |

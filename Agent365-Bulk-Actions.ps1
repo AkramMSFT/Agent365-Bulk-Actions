@@ -110,6 +110,19 @@ param(
     [Parameter(ParameterSetName = 'Inventory')]
     [switch]$WithPermissions,                # inventory: also list each agent identity's Entra permissions
 
+    [Parameter(ParameterSetName = 'AiActivity', Mandatory)]
+    [switch]$AiActivity,                    # risky AI activity per agent from the Purview audit log (what DSPM's AI activities tab is built on)
+
+    [Parameter(ParameterSetName = 'AiActivity')]
+    [string[]]$ForAgent,                    # AI activity: show the individual events of these agents (names or ids)
+
+    [Parameter(ParameterSetName = 'AiActivity')]
+    [ValidateRange(1, 180)]
+    [int]$AiDays = 30,                      # AI activity: how many days back to read
+
+    [Parameter(ParameterSetName = 'AiActivity')]
+    [switch]$RiskyOnly,                     # AI activity: only events with a risk signal
+
     [Parameter(ParameterSetName = 'Policy', Mandatory)]
     [string]$Policy,                         # path to a JSON policy file; prints the plan (no changes without -Apply)
 
@@ -241,7 +254,8 @@ if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
 if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.Read.All', 'AgentIdentity.EnableDisable.All' }
-if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory', 'AiActivity')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -eq 'AiActivity') { $scopes += 'AuditLogsQuery.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
@@ -798,6 +812,7 @@ function Get-AgentInfoTable {
                "| where tolower(tostring(r.titleId)) == '$($TitleId.ToLower().Replace("'", ''))'" +
                ' | project TitleId = tolower(tostring(r.titleId)), Name, Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
                ' EntraAgentID = tostring(EntraAgentID), EntraBlueprintID = tostring(EntraBlueprintID), Owners, SharedWith, DeclaredTools, McpServers,' +
+               ' AgentGuid = tostring(AgentId), SourceAgentId = tostring(SourceAgentId), ObservabilityId = tostring(ObservabilityID), BotId = tostring(r.botId),' +
                ' DeclaredDataSources, Capabilities, ConnectedAgents, Endpoints, Triggers, Instructions = substring(tostring(Instructions), 0, 1500)'
         $rows = Invoke-HuntingQuery -Query $kql -Hint 'Detail columns need Defender Advanced Hunting (ThreatHunting.Read.All).'
         foreach ($row in $rows) {
@@ -818,6 +833,7 @@ function Get-AgentInfoTable {
                 Endpoints = @(ConvertTo-ObjectList $row.Endpoints | ForEach-Object { if ($_.endpointUrl) { "$($_.endpointType): $($_.endpointUrl)" } else { "$_" } })
                 Triggers = @(ConvertTo-ObjectList $row.Triggers | ForEach-Object { "$_" } | Where-Object { $_ })
                 Instructions = [string]$row.Instructions
+                AgentKeys = @($row.AgentGuid, $row.SourceAgentId, $row.ObservabilityId, $row.EntraAgentId, $row.EntraAgentID, $row.BotId | Where-Object { $_ })
             }
         }
         return $table
@@ -831,6 +847,7 @@ function Get-AgentInfoTable {
         $kql = 'AgentsInfo | summarize arg_max(Timestamp, *) by AgentId ' + $slice + ' | extend r = todynamic(RawAgentInfo)' +
                ' | project TitleId = tolower(tostring(r.titleId)), Platform, Channels, Model, PublishedStatus, LifecycleStatus,' +
                ' EntraBlueprintID = tostring(EntraBlueprintID),' +
+               ' AgentGuid = tostring(AgentId), SourceAgentId = tostring(SourceAgentId), ObservabilityId = tostring(ObservabilityID), EntraAgentId = tostring(EntraAgentID), BotId = tostring(r.botId),' +
                ' ToolCount = array_length(todynamic(DeclaredTools)), McpCount = array_length(todynamic(McpServers)),' +
                ' ToolNames = extract_all(@''\\?"name\\?":\\?"([^"\\]*)'', tostring(DeclaredTools)), McpNames = extract_all(@''\\?"name\\?":\\?"([^"\\]*)'', tostring(McpServers)),' +
                ' DeclaredDataSources, Capabilities, SharedCount = array_length(todynamic(SharedWith))'
@@ -845,6 +862,7 @@ function Get-AgentInfoTable {
                 DataSources = @(ConvertTo-ObjectList $row.DeclaredDataSources | ForEach-Object { "$_" } | Where-Object { $_ })
                 Capabilities = @(ConvertTo-ObjectList $row.Capabilities | ForEach-Object { "$_" } | Where-Object { $_ })
                 ConnectedAgents = @(); SharedWith = @(); SharedCount = [int]$row.SharedCount; Owners = @(); Endpoints = @(); Triggers = @(); Instructions = ''
+                AgentKeys = @($row.AgentGuid, $row.SourceAgentId, $row.ObservabilityId, $row.EntraAgentId, $row.EntraAgentID, $row.BotId | Where-Object { $_ })
             }
         }
     }
@@ -1443,6 +1461,202 @@ function Confirm-Batch {
 }
 
 # Save the per-agent results (and the state each agent had before the run) as CSV or JSON.
+# AI activity from the Microsoft Purview audit log. DSPM's Activity Explorer has no API of its own; it is a view over the
+# unified audit log, which Graph exposes as asynchronous searches (AuditLogsQuery.Read.All). Each search is created,
+# polled until it succeeds, then its records are read. Large ranges are split into windows so no single search grows
+# past the service's record limit.
+$script:AiActivityCache = $null
+
+# Sleep in short steps so a caller (the GUI) can keep its window responsive.
+function Wait-AuditPoll {
+    param([double]$Seconds, [scriptblock]$OnWait)
+    $end = (Get-Date).AddSeconds($Seconds)
+    while ((Get-Date) -lt $end) {
+        if ($OnWait) { & $OnWait $null }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Start-AuditSearch {
+    param([string]$Name, [datetime]$Start, [datetime]$End, [string[]]$RecordTypes, [string[]]$Operations)
+    $body = @{ displayName = $Name; filterStartDateTime = $Start.ToUniversalTime().ToString('o'); filterEndDateTime = $End.ToUniversalTime().ToString('o') }
+    if ($RecordTypes) { $body.recordTypeFilters = @($RecordTypes) }
+    if ($Operations) { $body.operationFilters = @($Operations) }
+    $q = Invoke-Graph -Method POST -Uri 'https://graph.microsoft.com/v1.0/security/auditLog/queries' -Body ($body | ConvertTo-Json) -ContentType 'application/json'
+    $q.id
+}
+
+# Wait for a search to finish and return its records (null on failure).
+function Complete-AuditSearch {
+    param([string]$Id, [scriptblock]$OnWait, [int]$TimeoutMinutes = 20)
+    $base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/$Id"
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes); $interval = 5
+    do {
+        Wait-AuditPoll -Seconds $interval -OnWait $OnWait
+        $q = Invoke-Graph -Uri $base
+        if ($interval -lt 15) { $interval += 2 }
+    } while (($q.status -in 'notStarted', 'running') -and (Get-Date) -lt $deadline)
+    if ($q.status -ne 'succeeded') { Write-Warning ("An audit search ended as '{0}'; its records are missing." -f $q.status); return $null }
+    if ($q.isRecordCountLimitExceeded) { Write-Warning 'An audit search hit the service record limit; the oldest or newest records in that window may be missing. Use a shorter -AiDays.' }
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    $uri = "$base/records?`$top=1000"
+    do {
+        $r = Invoke-Graph -Uri $uri
+        foreach ($v in $r.value) { $records.Add($v) }
+        $uri = $r.'@odata.nextLink'
+    } while ($uri)
+    try { Invoke-Graph -Method DELETE -Uri $base | Out-Null } catch { $null = $_ }   # tidy up the saved search when the service allows it
+    $records.ToArray()
+}
+
+# Agent activity records for the last -Days days: Copilot and agent interactions, agent responses and the Agent 365 operations.
+# Ranges longer than -WindowDays are split into windows (the service limits how many records one search may return);
+# the searches of up to three windows run side by side, because each one takes minutes on the service side.
+function Get-AiActivityRecords {
+    param([int]$Days = 30, [int]$WindowDays = 30, [int]$Parallel = 3, [scriptblock]$OnWait)
+    $specs = @(
+        @{ Tag = 'interactions'; RecordTypes = @('CopilotInteraction') },
+        @{ Tag = 'responses';    RecordTypes = @('AISpanOutputs') },
+        @{ Tag = 'operations';   Operations = @('AIInvokeAgent', 'AIExecuteTool', 'AIInferenceCall', 'AIGuardrail') }
+    )
+    $now = Get-Date; $all = @{}
+    $windows = [int][Math]::Ceiling($Days / [double]$WindowDays)
+    for ($first = 0; $first -lt $windows; $first += $Parallel) {
+        $last = [Math]::Min($windows, $first + $Parallel) - 1
+        if ($OnWait) { & $OnWait ("Searching the audit log (part {0}-{1} of {2}); the service needs a few minutes per search..." -f ($first + 1), ($last + 1), $windows) }
+        $started = @(foreach ($w in $first..$last) {
+            $end = $now.AddDays(-$w * $WindowDays); $start = $now.AddDays(-[Math]::Min($Days, ($w + 1) * $WindowDays))
+            foreach ($s in $specs) {
+                $name = 'Agent365-Bulk-Actions AI activity {0} {1:yyyyMMdd-HHmm} w{2}' -f $s.Tag, $now, ($w + 1)
+                @{ Id = (Start-AuditSearch -Name $name -Start $start -End $end -RecordTypes $s.RecordTypes -Operations $s.Operations) }
+            }
+        })
+        foreach ($s in $started) {
+            foreach ($rec in @(Complete-AuditSearch -Id $s.Id -OnWait $OnWait)) { if ($rec -and $rec.id) { $all[[string]$rec.id] = $rec } }
+        }
+    }
+    @($all.Values)
+}
+function ConvertTo-AiTime {
+    param($Value)
+    if ($Value -is [datetime]) { return $Value.ToLocalTime() }
+    try { [datetimeoffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { $null }
+}
+
+function Limit-Text {
+    param([string]$Text, [int]$Max = 160)
+    $t = ($Text -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Max) { $t.Substring(0, $Max - 1) + '...' } else { $t }
+}
+
+# One audit record to one activity row, with the risk signals found in it.
+#   High:   a jailbreak attempt, an indirect prompt injection, or a tool call the runtime protection blocked.
+#   Medium: a protection check that failed (the call was not evaluated), or a sensitivity-labelled file was read.
+function ConvertTo-AiActivity {
+    param([object]$Record)
+    $a = $Record.auditData
+    $cd = $a.CopilotEventData
+    $signals = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($res in @($cd.AccessedResources)) {
+        if (-not $res) { continue }
+        switch ($res.Type) {
+            'JailBreak'      { $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = Limit-Text $res.Action }) }
+            'IndirectAttack' { $signals.Add(@{ Name = 'Indirect prompt injection'; Risk = 'High'; Detail = "via $($res.Name)" }) }
+            'SecurityWebhook' {
+                $why = [string]$res.Action
+                $tool = if ($why -match 'Evaluated tool name: ([^,]+)') { $Matches[1] } else { '' }
+                if ($res.Name -eq 'Block') {
+                    $rule = if ($why -match 'blocked by "([^"]+)"') { $Matches[1] } else { 'runtime protection' }
+                    $signals.Add(@{ Name = 'Runtime protection blocked'; Risk = 'High'; Detail = "$rule on $tool" })
+                } elseif ($res.Name -eq 'Fail') {
+                    $err = if ($why -match 'due to error \((\w+)') { $Matches[1] } else { 'error' }
+                    $signals.Add(@{ Name = 'Protection check failed'; Risk = 'Medium'; Detail = "$err on $tool" })
+                }
+            }
+        }
+        if ($res.SensitivityLabelId) { $signals.Add(@{ Name = 'Labeled file accessed'; Risk = 'Medium'; Detail = [string]$res.Name }) }
+    }
+    if (-not @($signals | Where-Object { $_.Name -eq 'Jailbreak attempt' }).Count -and @($cd.Messages | Where-Object { $_.JailbreakDetected -eq $true }).Count) {
+        $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = '' })
+    }
+    $risk = if (@($signals | Where-Object { $_.Risk -eq 'High' }).Count) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
+    $op = [string]$Record.operation
+    $kind = if ($op -eq 'CopilotInteraction') { 'Interaction' } elseif ($op -like 'AISpanOutput*') { 'Agent response' } else { $op }
+    [pscustomobject]@{
+        Time = ConvertTo-AiTime $Record.createdDateTime; User = [string]$Record.userPrincipalName
+        AgentName = [string]$a.AgentName; AgentGuid = [string]$a.AgentId; PlatformAgentId = [string]$a.PlatformAgentId; Blueprint = [string]$a.AgentBlueprintId
+        App = $(if ($cd.AppHost) { [string]$cd.AppHost } elseif ($a.ChannelName) { [string]$a.ChannelName } else { [string]$a.Workload })
+        Kind = $kind; Risk = $risk
+        Signals = (@($signals | ForEach-Object { $_.Name } | Select-Object -Unique) -join '; ')
+        Detail = (@($signals | ForEach-Object { if ($_.Detail) { "$($_.Name): $($_.Detail)" } } | Select-Object -Unique) -join ' | ')
+        Conversation = $(if ($cd.ConversationId) { [string]$cd.ConversationId } else { [string]$a.ConversationId })
+        RecordId = [string]$Record.id; TitleId = ''; Agent = ''
+    }
+}
+
+# Defender's identifiers for each agent (its own id, the bot id, the Entra and observability ids, the source id) to its catalog id.
+function New-AiAgentIndex {
+    param([hashtable]$InfoTable)
+    $idx = @{}
+    foreach ($kv in $InfoTable.GetEnumerator()) {
+        foreach ($k in @($kv.Value.AgentKeys)) {
+            $key = ([string]$k).ToLower()
+            if (-not $key) { continue }
+            $idx[$key] = $kv.Key
+            $tail = $key.Split('_')[-1]
+            if ($tail -ne $key -and -not $idx.ContainsKey($tail)) { $idx[$tail] = $kv.Key }
+        }
+    }
+    $idx
+}
+
+function Resolve-AiActivityAgent {
+    param([object]$Activity, [hashtable]$Index)
+    foreach ($k in @($Activity.AgentGuid, $Activity.PlatformAgentId, ($Activity.PlatformAgentId -split '_')[-1])) {
+        $key = ([string]$k).ToLower()
+        if ($key -and $Index.ContainsKey($key)) { return $Index[$key] }
+    }
+    ''
+}
+
+# Per-agent totals over a set of activity rows (rows with no catalog agent are skipped).
+function Get-AiActivitySummary {
+    param([object[]]$Activities, [hashtable]$NameById = @{})
+    $Activities | Where-Object { $_.TitleId } | Group-Object TitleId | ForEach-Object {
+        $rows = @($_.Group)
+        $high = @($rows | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count
+        $top = @($rows | ForEach-Object { $_.Signals -split '; ' } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join '; '
+        [pscustomobject]@{
+            TitleId = $_.Name; Agent = $(if ($NameById.ContainsKey($_.Name)) { $NameById[$_.Name] } else { $rows[0].AgentName })
+            Interactions = @($rows | Where-Object { $_.Kind -ne 'Agent response' }).Count; Responses = @($rows | Where-Object { $_.Kind -eq 'Agent response' }).Count
+            Users = @($rows | ForEach-Object { $_.User } | Where-Object { $_ } | Select-Object -Unique).Count
+            LastActivity = ($rows | Sort-Object Time -Descending | Select-Object -First 1).Time
+            High = $high; Medium = $med; Risk = $(if ($high) { 'High' } elseif ($med) { 'Medium' } else { 'None' }); TopSignals = $top
+        }
+    } | Sort-Object @{ e = { switch ($_.Risk) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, @{ e = 'High'; Descending = $true }, @{ e = 'Interactions'; Descending = $true }
+}
+
+# Everything the CLI and the GUI need, read once and reused: activity rows (each tied to a catalog agent when possible).
+function Get-AiActivityData {
+    param([int]$Days = 30, [hashtable]$InfoTable, [object[]]$Packages = @(), [scriptblock]$OnWait, [switch]$Refresh)
+    $c = $script:AiActivityCache
+    if (-not $Refresh -and $c -and $c.Days -ge $Days -and ((Get-Date) - $c.At).TotalMinutes -lt 30) { return $c }
+    if (-not $InfoTable) { $InfoTable = Get-AgentInfoTable }
+    $records = @(Get-AiActivityRecords -Days $Days -OnWait $OnWait)
+    $idx = New-AiAgentIndex -InfoTable $InfoTable
+    $names = @{}; foreach ($p in $Packages) { $names[[string]$p.id] = [string]$p.displayName }
+    $rows = @($records | ForEach-Object { ConvertTo-AiActivity $_ })
+    foreach ($r in $rows) {
+        $r.TitleId = Resolve-AiActivityAgent -Activity $r -Index $idx
+        $r.Agent = if ($r.TitleId -and $names.ContainsKey($r.TitleId)) { $names[$r.TitleId] } else { $r.AgentName }
+    }
+    $script:AiActivityCache = [pscustomobject]@{
+        Days = $Days; At = Get-Date; Activities = $rows; Names = $names
+        Unmapped = @($rows | Where-Object { -not $_.TitleId -and $_.AgentGuid }).Count
+    }
+    $script:AiActivityCache
+}
+
 function Export-ActionLog {
     param([object[]]$Records)
     if (-not $OutFile -or $Records.Count -eq 0) { return }
@@ -1945,6 +2159,7 @@ $GuiXaml = @'
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
           <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
+          <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" Visibility="Collapsed"/>
           <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
@@ -2257,6 +2472,42 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
+      <TabItem x:Name="TabAi" Header="AI activity">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Border Padding="12,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+            <DockPanel>
+              <Button x:Name="BtnAiLoad" Content="Load from Purview audit" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Searches the Microsoft Purview audit log. The first search can take minutes; every agent you open afterwards reuses it."/>
+              <ComboBox x:Name="AiDaysBox" DockPanel.Dock="Right" SelectedIndex="0" Width="110" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="How far back to search. The service takes about a minute for 7 days and about ten minutes for 30.">
+                <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+              </ComboBox>
+              <CheckBox x:Name="AiRiskyOnly" Content="Risky only" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0"/>
+              <TextBlock x:Name="AiNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563" Text="Not loaded yet."/>
+            </DockPanel>
+          </Border>
+          <DataGrid x:Name="AiGrid" Grid.Row="1" Style="{StaticResource Grid}">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Time" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm}" Width="130" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="User" Binding="{Binding User}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="App" Binding="{Binding App}" Width="120" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="Event" Binding="{Binding Kind}" Width="110" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="70">
+                <DataGridTextColumn.ElementStyle>
+                  <Style TargetType="TextBlock">
+                    <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="#6B7280"/><Setter Property="VerticalAlignment" Value="Center"/>
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#B91C1C"/></DataTrigger>
+                      <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </DataGridTextColumn.ElementStyle>
+              </DataGridTextColumn>
+              <DataGridTextColumn Header="Signals" Binding="{Binding Signals}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" ElementStyle="{StaticResource Wrap}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+        </Grid>
+      </TabItem>
     </TabControl>
     <Border Grid.Row="2" Padding="16,12" Margin="0,8,0,0">
       <Grid>
@@ -2305,6 +2556,41 @@ function Set-DetailWindowContent {
     (& $f 'Note').Text = $noPerms
 }
 
+# Reading the audit log needs a scope the console does not ask for at sign-in; ask only when the tab is used.
+function Test-AuditScope { @((Get-MgContext).Scopes) -contains 'AuditLogsQuery.Read.All' }
+function Request-AuditScope {
+    Connect-MgGraph -Scopes @(@((Get-MgContext).Scopes) + 'AuditLogsQuery.Read.All' | Select-Object -Unique) -NoWelcome
+}
+
+# Show the AI activity of one grid row in the details window; -Load reads (or refreshes) the audit log first.
+function Update-AiActivityTab {
+    param([System.Windows.Window]$Window, [object]$Row, [switch]$Load)
+    $note = $Window.FindName('AiNote'); $grid = $Window.FindName('AiGrid'); $btn = $Window.FindName('BtnAiLoad')
+    if ($Load) {
+        try {
+            $days = [int]$Window.FindName('AiDaysBox').SelectedItem.Tag
+            $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
+            if (-not (Test-AuditScope)) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; Request-AuditScope }
+            $dispatcher = $script:w.Dispatcher   # a closure cannot see $script: variables, so hand it the dispatcher directly
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $info = if ($script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
+            $null = Get-AiActivityData -Days $days -InfoTable $info -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnWait $pump -Refresh
+        } catch {
+            $note.Text = 'Could not read the audit log: ' + $_.Exception.Message + ' (needs the AuditLogsQuery.Read.All permission and a Purview audit role).'
+            return
+        } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
+    }
+    $cache = $script:AiActivityCache
+    if (-not $cache) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Choose a period and press "Load from Purview audit".'; return }
+    $mine = @($cache.Activities | Where-Object { $_.TitleId -eq $Row.Id } | Sort-Object Time -Descending)
+    $high = @($mine | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($mine | Where-Object { $_.Risk -eq 'Medium' }).Count
+    $shown = @(if ($Window.FindName('AiRiskyOnly').IsChecked) { $mine | Where-Object { $_.Risk -ne 'None' } } else { $mine })
+    $grid.ItemsSource = $shown
+    $Window.FindName('TabAi').Header = if ($high) { "AI activity ($high high)" } elseif ($med) { "AI activity ($med medium)" } else { 'AI activity' }
+    $note.Text = if ($mine.Count) { "{0} event(s) in the last {1} days: {2} high, {3} medium. Last: {4:yyyy-MM-dd HH:mm}. Risk comes from audit signals, not Insider Risk Management." -f $mine.Count, $cache.Days, $high, $med, $mine[0].Time }
+                 else { "No AI activity found for this agent in the last $($cache.Days) days." }
+}
+
 # Build the details window (not yet shown) for one grid row.
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
@@ -2319,8 +2605,11 @@ function New-DetailWindow {
         $dlg.Filter = 'JSON (*.json)|*.json'; $dlg.FileName = ('{0}.json' -f ($script:detailState.Detail.Name -replace '[^\w\-. ]', '_'))
         if ($dlg.ShowDialog()) { $script:detailState.Detail | ConvertTo-Json -Depth 8 | Set-Content -Path $dlg.FileName -Encoding utf8 }
     })
+    $d.FindName('BtnAiLoad').Add_Click({ Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row -Load })
+    $d.FindName('AiRiskyOnly').Add_Click({ Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row })
     $d.Add_ContentRendered({
         if ($script:detailState.Detail) { return }
+        Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row
         $w = $script:detailState.Window
         try {
             $w.Cursor = [Windows.Input.Cursors]::Wait
@@ -2338,7 +2627,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -2732,13 +3021,17 @@ function New-ConsoleWindow {
         & $script:ctx.Refilter
     })
     $script:ctx.ShowDetails = {
+        param($tab)
         $row = $script:ui.Grid.SelectedItem
         if (-not $row) { return }
-        (New-DetailWindow -Row $row -Owner $script:w).ShowDialog() | Out-Null
+        $win = New-DetailWindow -Row $row -Owner $script:w
+        if ($tab -eq 'AI') { $win.FindName('Tabs').SelectedItem = $win.FindName('TabAi') }
+        $win.ShowDialog() | Out-Null
     }
+    $script:ui.BtnAi.Add_Click({ & $script:ctx.ShowDetails 'AI' })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
-    $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
+    $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
     $script:ui.ToolsBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunTools } })
     $script:ui.PermBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunPerm } })
     $script:ui.OwnerBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunOwner } })
@@ -2829,6 +3122,31 @@ switch ($PSCmdlet.ParameterSetName) {
         $det = Get-AgentDetail -Package $pkg
         Show-AgentDetail -Detail $det
         if ($OutFile) { $det | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding utf8; Write-Host "Saved: $OutFile" -ForegroundColor Cyan }
+    }
+    'AiActivity' {
+        $pk = @(Get-Packages)
+        Write-Host ("Searching the Purview audit log for the last {0} day(s). This can take a few minutes..." -f $AiDays) -ForegroundColor DarkGray
+        $data = Get-AiActivityData -Days $AiDays -Packages $pk -OnWait { param($m) if ($m) { Write-Host "  $m" -ForegroundColor DarkGray } }
+        $cutoff = (Get-Date).AddDays(-$AiDays)
+        $acts = @($data.Activities | Where-Object { $_.Time -ge $cutoff -and $_.TitleId })
+        if ($RiskyOnly) { $acts = @($acts | Where-Object { $_.Risk -ne 'None' }) }
+        if ($ForAgent) {
+            $ids = @(Resolve-Packages $ForAgent | ForEach-Object { $_.id })
+            $mine = @($acts | Where-Object { $ids -contains $_.TitleId } | Sort-Object Time -Descending)
+            foreach ($id in $ids) {
+                $rows = @($mine | Where-Object { $_.TitleId -eq $id })
+                Write-Host ("`n{0}: {1} event(s), {2} high, {3} medium" -f $data.Names[$id], $rows.Count, @($rows | Where-Object { $_.Risk -eq 'High' }).Count, @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count) -ForegroundColor Cyan
+                if ($rows.Count) { $rows | Select-Object Time, User, App, Kind, Risk, Signals, Detail | Format-Table -AutoSize -Wrap | Out-Host }
+            }
+            Export-ActionLog -Records @($mine | Select-Object Time, Agent, User, App, Kind, Risk, Signals, Detail, Conversation, RecordId)
+        } else {
+            $sum = @(Get-AiActivitySummary -Activities $acts -NameById $data.Names)
+            Write-Host ("`n{0} agent(s) with AI activity; {1} with a high-risk signal, {2} with a medium one." -f $sum.Count, @($sum | Where-Object { $_.Risk -eq 'High' }).Count, @($sum | Where-Object { $_.Risk -eq 'Medium' }).Count) -ForegroundColor Cyan
+            $sum | Select-Object Agent, Risk, Interactions, Users, High, Medium, LastActivity, TopSignals | Format-Table -AutoSize -Wrap | Out-Host
+            if ($data.Unmapped) { Write-Host ("{0} event(s) belong to an agent that is not in the catalog (for example a Microsoft 365 Copilot agent) and are not listed." -f $data.Unmapped) -ForegroundColor DarkGray }
+            Write-Host 'Use -ForAgent <name> to see the events of one agent. Risk levels here come from the audit signals, not from Insider Risk Management.' -ForegroundColor DarkGray
+            Export-ActionLog -Records @($sum | Select-Object Agent, TitleId, Risk, Interactions, Responses, Users, High, Medium, LastActivity, TopSignals)
+        }
     }
     'Inventory' {
         $pk = @(Get-Packages -AgentsOnly:$AgentsOnly)
