@@ -268,6 +268,23 @@ function Add-ThrottleHit { $script:ThrottleHits++ }
 function Get-ThrottleHits { $script:ThrottleHits }
 
 # Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
+# The part of a failed Graph call worth reading: the service's own code and message, and which request it was.
+function Format-GraphError {
+    param([string]$Summary, [string]$Detail)
+    $request = if ($Detail -match '^\s*(GET|POST|PATCH|PUT|DELETE)\s+https://graph\.microsoft\.com(\S+)') { "$($Matches[1]) $($Matches[2])" } else { '' }
+    $service = ''
+    $brace = $Detail.IndexOf('{"')
+    if ($brace -ge 0) {
+        try {
+            $e = ($Detail.Substring($brace) | ConvertFrom-Json).error
+            if ($e) { $service = (@($e.code, $e.message | Where-Object { $_ }) -join ': ') }
+        } catch { $null = $_ }
+    }
+    $text = if ($service) { "$Summary | $service" } else { $Summary }
+    if ($request) { $text += " [$request]" }
+    $text
+}
+
 function Invoke-Graph {
     param([string]$Method = 'GET', [string]$Uri, [string]$Body, [string]$ContentType)
     $call = @{ Method = $Method; Uri = $Uri }
@@ -281,7 +298,7 @@ function Invoke-Graph {
             # The package service throttles with 424 "Too Many Requests" instead of 429. Any other 424 is a real dependency failure.
             $throttled = $code -ne 424 -or $detail -match 'Too Many Requests' -or -not $detail
             if ($code -notin 424, 429, 502, 503, 504 -or -not $throttled -or $attempt -ge 5) {
-                if ($detail) { throw ("{0} | {1}" -f $_.Exception.Message, ($detail -replace '\s+', ' ').Trim()) }
+                if ($detail) { throw (Format-GraphError -Summary $_.Exception.Message -Detail ($detail -replace '\r?\n', ' ').Trim()) }
                 throw
             }
             $wait = if ($code -eq 424) { [Math]::Max(10, 5 * $attempt) } else { [Math]::Pow(2, $attempt) }
@@ -1493,7 +1510,7 @@ function Complete-AuditSearch {
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes); $interval = 5
     do {
         Wait-AuditPoll -Seconds $interval -OnWait $OnWait
-        $q = Invoke-Graph -Uri $base
+        try { $q = Invoke-Graph -Uri $base } catch { throw "Checking an audit search failed: $($_.Exception.Message)" }
         if ($interval -lt 15) { $interval += 2 }
     } while (($q.status -in 'notStarted', 'running') -and (Get-Date) -lt $deadline)
     if ($q.status -ne 'succeeded') { Write-Warning ("An audit search ended as '{0}'; its records are missing." -f $q.status); return $null }
@@ -1501,7 +1518,7 @@ function Complete-AuditSearch {
     $records = New-Object 'System.Collections.Generic.List[object]'
     $uri = "$base/records?`$top=1000"
     do {
-        $r = Invoke-Graph -Uri $uri
+        try { $r = Invoke-Graph -Uri $uri } catch { throw "Reading the records of an audit search failed: $($_.Exception.Message)" }
         foreach ($v in $r.value) { $records.Add($v) }
         $uri = $r.'@odata.nextLink'
     } while ($uri)
@@ -2397,7 +2414,7 @@ $DetailXaml = @'
     <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,16">
       <StackPanel>
         <TextBlock x:Name="Title" FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Loading..."/>
-        <TextBlock x:Name="Subtitle" Foreground="#6B7280" Margin="0,2,0,0"/>
+        <TextBlock x:Name="Subtitle" Foreground="#6B7280" Margin="0,2,0,0" TextWrapping="Wrap"/>
       </StackPanel>
     </Border>
     <TabControl x:Name="Tabs" Grid.Row="1" Margin="16,12,16,0" Background="White" BorderBrush="#E5E7EB">
@@ -2609,7 +2626,7 @@ function New-DetailWindow {
     $d.FindName('AiRiskyOnly').Add_Click({ Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row })
     $d.Add_ContentRendered({
         if ($script:detailState.Detail) { return }
-        Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row
+        try { Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row } catch { $script:detailState.Window.FindName('AiNote').Text = 'AI activity: ' + $_.Exception.Message }
         $w = $script:detailState.Window
         try {
             $w.Cursor = [Windows.Input.Cursors]::Wait

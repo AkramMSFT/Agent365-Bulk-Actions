@@ -309,7 +309,7 @@ What is read: `CopilotInteraction` records (the interactions), `AISpanOutputs` r
 > - **Risk levels here come from the audit signals above, not from Insider Risk Management.** The risk level and the sensitive-information-type classification shown in the portal are computed inside Purview and have no API. Insider Risk, DLP and Security for AI alerts do reach Defender, so `-Risky` covers those.
 > - **Speed.** The service takes about a minute for 7 days and about ten minutes for 30, and does the same work however many agents you have. Ranges longer than 30 days are split into windows that run side by side.
 > - **Prompt text.** A jailbreak event shows the start of the offending prompt (160 characters), as the portal does. Treat exports accordingly.
-> - **Saved searches.** Each run creates audit searches named `Agent365-Bulk-Actions AI activity ...` and deletes them afterwards when the service allows it; if not, remove them from the Purview audit search history.
+> - **Saved searches.** Each run creates three audit searches per 30-day window, named `Agent365-Bulk-Actions AI activity ...`. The service does not allow deleting them through the API (HTTP 405), so they stay in the Purview audit search history until you remove them there. The console reuses one search for every agent you open, so load it once per session.
 > - The audit log retention of your licence (180 days or one year) bounds `-AiDays` (maximum 180).
 
 ## Parameter reference
