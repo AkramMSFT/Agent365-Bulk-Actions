@@ -3690,7 +3690,7 @@ function New-ConsoleWindow {
         & $script:ctx.Idle ("{0}: {1} reassigned, {2} failed. Log: {3}" -f $Label, $done, $failed, $script:OutFile)
         if ($failed) {
             $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
-            if ($why -match 'FailedDependency|424') { $why += "`n`nThe service reported a failed dependency and gave no reason. Every reassignment that failed this way so far was for an agent whose previous owner was missing or deleted. Set the owner in Copilot Studio itself for those agents." }
+            if ($why -match 'FailedDependency|424') { $why += "`n`nThe service reported a failed dependency and gave no reason. In testing it refused Copilot Studio reassignments even for an agent with a valid owner, and even when reassigning to its current owner, so it is not about who the owners are. Try Assign new owner in the Microsoft 365 admin center, or set the owner in Copilot Studio itself." }
             [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some reassignments failed', 'OK', 'Warning')
         }
     }

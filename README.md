@@ -179,11 +179,12 @@ Notes:
 - The package API exposes no creator field, so step 2 is the creator substitute. It only applies to agents that have an Entra identity.
 - Only **shared** agents can be reassigned; `-Reassign` skips anything else with a warning, and the GUI button stays off until a shared agent is selected (the API answers 500 for other package types). Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
 - Reassign is **delegated-only** (the API has no application permission), so it cannot run unattended.
+- **Known problem in the test tenant:** every reassignment of a Copilot Studio agent failed with HTTP 424 ("An error occurred while reassigning the agent"), including an agent with a valid owner and a reassignment to its own current owner, so it is not caused by a missing owner or by the person chosen. The service gives no further reason. Try **Assign new owner** in the Microsoft 365 admin center (Agents > All agents), which one guide reports fails in environments with an IP firewall, or set the owner in Copilot Studio. Check with one agent before relying on this mode in your tenant.
 - The mode needs `User.Read.All` and `AgentIdentity.Read.All` in addition to `CopilotPackages.ReadWrite.All`.
 
 ### Entra accountability: sponsors and owners
 
-The package reassign API cannot help an agent that has no owner (it answers 424), and it only works for Copilot Studio agents. But every agent that has an Entra identity can carry a **sponsor** (the person accountable for why the agent exists and whether it is still needed; Microsoft requires at least one) and **owners** (technical administrators). Those relationships sit on the identity and can be filled in there.
+The package reassign API only applies to Copilot Studio agents, answers 424 for an agent that has no owner, and in the test tenant answered 424 for every Copilot Studio agent (see the note under Ownership). But every agent that has an Entra identity can carry a **sponsor** (the person accountable for why the agent exists and whether it is still needed; Microsoft requires at least one) and **owners** (technical administrators). Those relationships sit on the identity and can be filled in there.
 
 ```powershell
 .\Agent365-Bulk-Actions.ps1 -Accountability                          # identities with no valid sponsor, and who would be added
