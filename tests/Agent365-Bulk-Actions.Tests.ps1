@@ -1350,3 +1350,11 @@ Describe 'Agent users are not people' {
         $r.Source | Should -Be 'Agent identity owner'
     }
 }
+Describe 'Format-GraphError with a real response dump' {
+    It 'finds the error body even when an earlier header also holds JSON' {
+        $detail = 'POST https://graph.microsoft.com/beta/copilot/admin/catalog/packages/T_1/reassign HTTP/1.1 424 Failed Dependency Date: Fri request-id: abc x-ms-ags-diagnostic: {"ServerInfo":{"DataCenter":"UAE North","Slice":"E"}} X-Cache: CONFIG_NOCACHE Content-Type: application/json {"error":{"code":"UnknownError","message":"{\"StatusCode\":424,\"Message\":\"An error occurred while reassigning the agent.\"}"}}'
+        $m = Format-GraphError -Summary 'Response status code does not indicate success: FailedDependency (Failed Dependency).' -Detail $detail
+        $m | Should -BeLike '*UnknownError: *An error occurred while reassigning the agent.*'
+        $m | Should -BeLike '*`[POST /beta/copilot/admin/catalog/packages/T_1/reassign`]'
+    }
+}
