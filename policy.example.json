@@ -23,6 +23,11 @@
       "then": { "action": "reassign" }
     },
     {
+      "name": "Pull back agents that keep tripping runtime protection",
+      "when": { "aiActivity": { "days": 7, "minHigh": 3, "signals": ["Runtime protection blocked", "Jailbreak attempt"] } },
+      "then": { "action": "restrict", "availableTo": "owner" }
+    },
+    {
       "name": "Report blocked agents ready for deletion",
       "when": { "blockedDays": 30 },
       "then": { "action": "report" }

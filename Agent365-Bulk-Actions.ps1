@@ -96,6 +96,7 @@ param(
     [string[]]$Reassign,                     # manual assignment: agents (names or ids) to give to -To
 
     [Parameter(ParameterSetName = 'Reassign', Mandatory)]
+    [Parameter(ParameterSetName = 'AddSponsor', Mandatory)]
     [string]$To,                             # UPN or object id of the new owner
 
     [Parameter(ParameterSetName = 'Detail', Mandatory)]
@@ -122,6 +123,37 @@ param(
 
     [Parameter(ParameterSetName = 'AiActivity')]
     [switch]$RiskyOnly,                     # AI activity: only events with a risk signal
+
+    [Parameter(ParameterSetName = 'Restrict', Mandatory)]
+    [string[]]$Restrict,                     # agents (names or ids) whose availability to narrow or reopen
+
+    [Parameter(ParameterSetName = 'Restrict')]
+    [ValidateSet('None', 'Some', 'All')]
+    [string]$AvailableTo = 'None',           # Restrict: who the agents stay available to
+
+    [Parameter(ParameterSetName = 'Restrict')]
+    [string[]]$AllowUsers,                   # Restrict -AvailableTo Some: users (UPN or id)
+
+    [Parameter(ParameterSetName = 'Restrict')]
+    [string[]]$AllowGroups,                  # Restrict -AvailableTo Some: groups (name or id)
+
+    [Parameter(ParameterSetName = 'Restrict')]
+    [switch]$OwnerOnly,                      # Restrict: keep each agent available to its own owner and nobody else
+
+    [Parameter(ParameterSetName = 'Restrict')]
+    [switch]$IncludeDeployment,              # Restrict: also change who the agent is deployed to
+
+    [Parameter(ParameterSetName = 'Accountability', Mandatory)]
+    [switch]$Accountability,                 # agents whose Entra identity has no sponsor (and, with -IncludeOwners, no owner); -Action assign fills them in
+
+    [Parameter(ParameterSetName = 'Accountability')]
+    [switch]$IncludeOwners,                  # Accountability: also look for identities with no owner
+
+    [Parameter(ParameterSetName = 'AddSponsor', Mandatory)]
+    [string[]]$AddSponsor,                   # manual: add -To as sponsor of these agents' Entra identities
+
+    [Parameter(ParameterSetName = 'AddSponsor')]
+    [switch]$AsOwner,                        # AddSponsor: add -To as owner instead of sponsor
 
     [Parameter(ParameterSetName = 'Policy', Mandatory)]
     [string]$Policy,                         # path to a JSON policy file; prints the plan (no changes without -Apply)
@@ -195,7 +227,8 @@ param(
     [Parameter(ParameterSetName = 'Risky')]
     [Parameter(ParameterSetName = 'FromCsv')]
     [Parameter(ParameterSetName = 'Ownerless')]
-    [ValidateSet('block', 'unblock', 'list', 'reassign')]
+    [Parameter(ParameterSetName = 'Accountability')]
+    [ValidateSet('block', 'unblock', 'list', 'reassign', 'assign')]
     [string]$Action = 'block',                # what to do with the matched set ('list' = preview only)
 
     [Parameter(ParameterSetName = 'List')]
@@ -225,7 +258,8 @@ param(
 $ErrorActionPreference = 'Stop'
 # Dot-sourcing (. .\Agent365-Bulk-Actions.ps1) loads the functions only: no sign-in, no action. Used by the tests.
 $script:LoadOnly = ($MyInvocation.InvocationName -eq '.')
-if ($PSCmdlet.ParameterSetName -eq 'Ownerless' -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
+if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Accountability') -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
+if ($Action -eq 'assign' -and $PSCmdlet.ParameterSetName -ne 'Accountability') { throw '-Action assign is only valid with -Accountability.' }
 if ($Action -eq 'reassign' -and $PSCmdlet.ParameterSetName -ne 'Ownerless') { throw '-Action reassign is only valid with -Ownerless. Use -Reassign <agents> -To <user> for manual assignment.' }
 $Base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
 
@@ -248,7 +282,7 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory')) -or
             ($PSCmdlet.ParameterSetName -eq 'Policy' -and -not $Apply) -or
-            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless') -and $Action -eq 'list')
+            ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless', 'Accountability') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
 if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
@@ -256,6 +290,17 @@ if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes 
 if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.Read.All', 'AgentIdentity.EnableDisable.All' }
 if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory', 'AiActivity')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'AiActivity') { $scopes += 'AuditLogsQuery.Read.All' }
+if ($PSCmdlet.ParameterSetName -eq 'Restrict') { $scopes += 'User.Read.All'; if ($AllowGroups) { $scopes += 'Group.Read.All' } }
+if ($PSCmdlet.ParameterSetName -in @('Accountability', 'AddSponsor')) {
+    $scopes += 'User.Read.All', 'AgentIdentity.Read.All'
+    if ($Action -eq 'assign' -or $PSCmdlet.ParameterSetName -eq 'AddSponsor') { $scopes += 'AgentIdentity.ReadWrite.All' }
+}
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'addsponsor|addowner')) { $scopes += 'AgentIdentity.ReadWrite.All', 'User.Read.All' }
+if ($PSCmdlet.ParameterSetName -eq 'Policy' -and (Test-Path -LiteralPath $Policy)) {
+    $policyText = Get-Content -Raw -LiteralPath $Policy
+    if ($policyText -match '"aiActivity"') { $scopes += 'AuditLogsQuery.Read.All' }
+    if ($policyText -match '"groups"\s*:\s*\[\s*"') { $scopes += 'Group.Read.All' }
+}
 if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 $connect = @{ Scopes = $scopes; NoWelcome = $true }
@@ -267,7 +312,6 @@ $script:ThrottleHits = 0   # incremented on every throttled retry; write loops w
 function Add-ThrottleHit { $script:ThrottleHits++ }
 function Get-ThrottleHits { $script:ThrottleHits }
 
-# Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
 # The part of a failed Graph call worth reading: the service's own code and message, and which request it was.
 function Format-GraphError {
     param([string]$Summary, [string]$Detail)
@@ -285,6 +329,7 @@ function Format-GraphError {
     $text
 }
 
+# Graph call with retry on throttling (429) and transient 5xx, honouring Retry-After.
 function Invoke-Graph {
     param([string]$Method = 'GET', [string]$Uri, [string]$Body, [string]$ContentType)
     $call = @{ Method = $Method; Uri = $Uri }
@@ -624,6 +669,304 @@ function Invoke-OwnerReassign {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Access scope: who an agent is available to. Narrowing it is a softer containment than a block:
+# the agent keeps running for the people left, and the previous scope is logged so Undo restores it.
+# ---------------------------------------------------------------------------------------------
+function Get-AccessLabel {
+    param([string]$AvailableTo)
+    switch ($AvailableTo) { 'allowedForAll' { 'Everyone' } 'allowedForSome' { 'Some users or groups' } 'allowedForNone' { 'Nobody' } default { [string]$AvailableTo } }
+}
+
+# The API values for a target scope: None, Some (named users and groups) or All.
+function ConvertTo-AccessTarget {
+    param([ValidateSet('None', 'Some', 'All')][string]$To)
+    switch ($To) {
+        'None' { @{ Available = 'allowedForNone'; Deployed = 'acquiredForNone' } }
+        'Some' { @{ Available = 'allowedForSome'; Deployed = 'acquiredForSome' } }
+        'All'  { @{ Available = 'allowedForAll';  Deployed = 'acquiredForAll' } }
+    }
+}
+
+# Users (UPN or id) and groups (name or id) to the {resourceType, resourceId} entries the API takes.
+function Resolve-AccessEntities {
+    param([string[]]$Users, [string[]]$Groups)
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($u in @($Users | Where-Object { $_ })) {
+        $info = Get-UserInfo $u
+        if (-not $info.Exists -or -not $info.Enabled) { throw "'$u' is not an existing, enabled user." }
+        $out.Add([pscustomobject]@{ resourceType = 'user'; resourceId = $info.Id; Label = $info.Upn })
+    }
+    foreach ($g in @($Groups | Where-Object { $_ })) {
+        $byId = $g -match $script:GuidPattern
+        $uri = if ($byId) { "https://graph.microsoft.com/v1.0/groups/$g`?`$select=id,displayName" }
+               else { ("https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '{0}'&`$select=id,displayName" -f ($g -replace "'", "''")) }
+        $r = Invoke-Graph -Uri $uri
+        $hit = @(if ($byId) { $r } else { $r.value })
+        if ($hit.Count -ne 1 -or -not $hit[0].id) { throw "Group '$g' matched $($hit.Count) group(s); use its object id." }
+        $out.Add([pscustomobject]@{ resourceType = 'group'; resourceId = $hit[0].id; Label = $hit[0].displayName })
+    }
+    $out.ToArray()
+}
+
+# The request body for the PATCH. The list of users is only sent for "some"; deployment only when asked.
+function New-AccessPatchBody {
+    param([string]$AvailableTo, [object[]]$Allowed = @(), [string]$DeployedTo, [object[]]$Acquire = @(), [switch]$IncludeDeployment)
+    $ref = { param($list) @(@($list) | Where-Object { $_ } | ForEach-Object { @{ resourceType = [string]$_.resourceType; resourceId = [string]$_.resourceId } }) }
+    $body = [ordered]@{ availableTo = $AvailableTo }
+    if ($AvailableTo -eq 'allowedForSome') { $body['allowedUsersAndGroups'] = @(& $ref $Allowed) }
+    if ($IncludeDeployment -and $DeployedTo) {
+        $body['deployedTo'] = $DeployedTo
+        if ($DeployedTo -eq 'acquiredForSome') { $body['acquireUsersAndGroups'] = @(& $ref $Acquire) }
+    }
+    $body
+}
+
+# What an agent's package currently says about availability and deployment.
+function Get-AccessState {
+    param([object]$Detail)
+    $list = { param($x) @(@($x) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ resourceType = [string]$_.resourceType; resourceId = [string]$_.resourceId } }) }
+    [pscustomobject]@{
+        AvailableTo = [string]$Detail.availableTo; Allowed = @(& $list $Detail.allowedUsersAndGroups)
+        DeployedTo = [string]$Detail.deployedTo;   Acquire = @(& $list $Detail.acquireUsersAndGroups)
+    }
+}
+
+function Test-SameEntities {
+    param([object[]]$A, [object[]]$B)
+    $key = { param($x) @(@($x) | Where-Object { $_ } | ForEach-Object { ('{0}:{1}' -f $_.resourceType, $_.resourceId).ToLower() } | Sort-Object) -join '|' }
+    (& $key $A) -eq (& $key $B)
+}
+
+# Change who can use each package. The scope it had before is read first and written to the log, so Undo can put it back.
+# -OwnerOnly keeps each agent available to its own owner and nobody else.
+function Invoke-AvailabilityChange {
+    param([object[]]$Packages, [ValidateSet('None', 'Some', 'All')][string]$To, [object[]]$Entities = @(),
+          [switch]$OwnerOnly, [switch]$IncludeDeployment, [switch]$PassThru)
+    if (-not $Packages -or $Packages.Count -eq 0) { Write-Host 'Nothing to change.'; return }
+    $target = ConvertTo-AccessTarget $To
+    $who = (Get-MgContext).Account
+    Write-Host ("`nChange who can use {0} agent(s): {1}" -f $Packages.Count, (Get-AccessLabel $target.Available)) -ForegroundColor Cyan
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0; $skip = 0
+    foreach ($p in $Packages) {
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'restrict'
+            Id = $p.id; DisplayName = $p.displayName; WasAvailableTo = ''; WasAllowed = ''; WasDeployedTo = ''; WasAcquire = ''
+            IncludeDeployment = [bool]$IncludeDeployment; NewAvailableTo = $target.Available; NewAllowed = ''; Result = ''; Error = ''
+        }
+        try {
+            $prev = Get-AccessState (Invoke-Graph -Uri "$Base/$($p.id)")
+            $rec.WasAvailableTo = $prev.AvailableTo; $rec.WasAllowed = ConvertTo-Json -InputObject @($prev.Allowed) -Compress
+            $rec.WasDeployedTo = $prev.DeployedTo;   $rec.WasAcquire = ConvertTo-Json -InputObject @($prev.Acquire) -Compress
+            $entities = @($Entities)
+            if ($OwnerOnly) {
+                $o = Get-UserInfo $p.ownerId
+                if (-not ($o.Exists -and $o.Enabled)) { throw 'no valid owner to keep it available to' }
+                $entities = @([pscustomobject]@{ resourceType = 'user'; resourceId = $o.Id; Label = $o.Upn })
+            }
+            $rec.NewAllowed = (@($entities | ForEach-Object { $_.Label }) -join '; ')
+            $sameScope = $prev.AvailableTo -eq $target.Available -and ($To -ne 'Some' -or (Test-SameEntities $prev.Allowed $entities))
+            $sameDeploy = -not $IncludeDeployment -or ($prev.DeployedTo -eq $target.Deployed -and ($To -ne 'Some' -or (Test-SameEntities $prev.Acquire $entities)))
+            if ($sameScope -and $sameDeploy) {
+                Write-Host ("  SKIP {0}  (already {1})" -f $p.displayName, (Get-AccessLabel $target.Available).ToLower()) -ForegroundColor DarkGray
+                $rec.Result = 'Skipped'; $skip++
+            }
+            elseif (-not (Test-Proceed ("{0} -> {1}" -f $p.displayName, (Get-AccessLabel $target.Available)) 'Change who can use')) { $rec.Result = 'WhatIf' }
+            else {
+                $body = New-AccessPatchBody -AvailableTo $target.Available -Allowed $entities -DeployedTo $target.Deployed -Acquire $entities -IncludeDeployment:$IncludeDeployment
+                Invoke-Graph -Method PATCH -Uri "$Base/$($p.id)" -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' | Out-Null
+                Write-Host ("  OK   {0}  ->  {1}{2}" -f $p.displayName, (Get-AccessLabel $target.Available), $(if ($rec.NewAllowed) { " ($($rec.NewAllowed))" } else { '' })) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            }
+        } catch {
+            Write-Host ("  FAIL {0}  -> {1}" -f $p.displayName, $_.Exception.Message) -ForegroundColor Red
+            $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+        }
+        $log.Add([pscustomobject]$rec)
+    }
+    Write-Host ("Done: {0} changed, {1} already set, {2} failed." -f $ok, $skip, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
+    if ($PassThru) { $log }
+}
+
+# Put back the availability that logged 'restrict' rows recorded.
+function Invoke-AccessRestore {
+    param([object[]]$Records, [switch]$PassThru)
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
+    foreach ($r in $Records) {
+        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = (Get-MgContext).Account; Action = 'restore-access'
+                           Id = $r.Id; DisplayName = $r.DisplayName; RestoredTo = [string]$r.WasAvailableTo; Result = ''; Error = '' }
+        try {
+            $allowed = @(if ($r.WasAllowed) { ConvertFrom-Json ([string]$r.WasAllowed) })
+            $acquire = @(if ($r.WasAcquire) { ConvertFrom-Json ([string]$r.WasAcquire) })
+            $deploy = ([string]$r.IncludeDeployment) -eq 'True'
+            $body = New-AccessPatchBody -AvailableTo ([string]$r.WasAvailableTo) -Allowed $allowed -DeployedTo ([string]$r.WasDeployedTo) -Acquire $acquire -IncludeDeployment:$deploy
+            if (-not (Test-Proceed ("{0} -> {1}" -f $r.DisplayName, (Get-AccessLabel $r.WasAvailableTo)) 'Restore who can use')) { $rec.Result = 'WhatIf' }
+            else {
+                Invoke-Graph -Method PATCH -Uri "$Base/$($r.Id)" -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' | Out-Null
+                Write-Host ("  OK   {0}  restored to {1}" -f $r.DisplayName, (Get-AccessLabel $r.WasAvailableTo)) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            }
+        } catch {
+            Write-Host ("  FAIL {0}  -> {1}" -f $r.DisplayName, $_.Exception.Message) -ForegroundColor Red
+            $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+        }
+        $log.Add([pscustomobject]$rec)
+    }
+    Write-Host ("Restored {0}, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
+    if ($PassThru) { $log }
+}
+
+# ---------------------------------------------------------------------------------------------
+# Entra accountability: every agent identity should have a sponsor (the person accountable for why the agent
+# exists and whether it is still needed) and may have owners (technical administrators). The package reassign API
+# cannot help ownerless agents, but these relationships live on the agent identity and can be filled in there.
+# ---------------------------------------------------------------------------------------------
+$script:IdentitySponsorCache = @{}
+
+# Sponsors of many agent identities in a few calls. A 403 is not cached: an unreadable identity must not look like one with no sponsor.
+function Initialize-IdentitySponsorCache {
+    param([string[]]$AgentIdentityIds)
+    $need = @($AgentIdentityIds | Where-Object { $_ } | Select-Object -Unique | Where-Object { -not $script:IdentitySponsorCache.ContainsKey($_) })
+    if ($need.Count -eq 0) { return }
+    $reqs = @($need | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_/microsoft.graph.agentIdentity/sponsors?`$select=id" } })
+    $res = Invoke-GraphBatch -Requests $reqs -Version beta -Activity 'Reading agent identity sponsors'
+    foreach ($id in $need) {
+        $r = $res[$id]
+        if ($r -and $r.Status -eq 200) {
+            $script:IdentitySponsorCache[$id] = @(@($r.Body.value) | ForEach-Object { [pscustomobject]@{ Id = [string]$_.id; Kind = $(if ($_.'@odata.type' -match 'group$') { 'group' } else { 'user' }) } })
+        } elseif ($r -and $r.Status -eq 404) { $script:IdentitySponsorCache[$id] = @() }
+    }
+    Initialize-UserCache -Ids @($need | ForEach-Object { $script:IdentitySponsorCache[$_] } | ForEach-Object { $_ } | Where-Object { $_.Kind -eq 'user' } | ForEach-Object { $_.Id })
+}
+
+function Test-HasSponsor {
+    param([object]$Package)
+    $sp = @($script:IdentitySponsorCache[$Package.agentIdentityId])
+    if (@($sp | Where-Object { $_.Kind -eq 'group' }).Count) { return $true }
+    @($sp | Where-Object { $_.Kind -eq 'user' } | ForEach-Object { Get-UserInfo $_.Id } | Where-Object { $_.Exists -and $_.Enabled }).Count -gt 0
+}
+
+function Test-HasIdentityOwner {
+    param([object]$Package)
+    @(Get-IdentityOwners $Package.agentIdentityId | Where-Object { $_.Exists -and $_.Enabled }).Count -gt 0
+}
+
+# Who should be accountable for one agent, in the same order the owner resolver uses: the agent's own owner, an owner of its
+# identity, then the manager of either (or of the former owner). Never guesses beyond that: no candidate means review by hand.
+function Resolve-AgentAccountability {
+    param([object]$Package, [switch]$IncludeOwners)
+    $hasSponsor = Test-HasSponsor $Package
+    $hasOwner = Test-HasIdentityOwner $Package
+    $sponsorGap = -not $hasSponsor; $ownerGap = [bool]$IncludeOwners -and -not $hasOwner
+    $sponsorUpns = @(@($script:IdentitySponsorCache[$Package.agentIdentityId]) | ForEach-Object { if ($_.Kind -eq 'group') { '(group)' } else { (Get-UserInfo $_.Id).Upn } } | Where-Object { $_ }) -join '; '
+    $idOwners = @(Get-IdentityOwners $Package.agentIdentityId)
+    $r = [ordered]@{
+        Id = $Package.id; DisplayName = $Package.displayName; Platform = Get-PlatformLabel $Package $null; IdentityId = $Package.agentIdentityId
+        Sponsors = $sponsorUpns; IdentityOwners = (@($idOwners | ForEach-Object { $_.Upn }) -join '; ')
+        SponsorGap = $sponsorGap; OwnerGap = $ownerGap; AddSponsor = $sponsorGap; AddOwner = $ownerGap
+        Reason = ''; State = ''; ProposedId = ''; Proposed = ''; Source = ''
+    }
+    if (-not ($sponsorGap -or $ownerGap)) { $r.State = 'OK'; return [pscustomobject]$r }
+    $r.Reason = (@($(if ($sponsorGap) { if ($sponsorUpns) { 'sponsors are disabled' } else { 'no sponsor' } }), $(if ($ownerGap) { 'no owner on the identity' })) | Where-Object { $_ }) -join ', '
+
+    $pkgOwner = Get-UserInfo $Package.ownerId
+    $pick = $null; $source = ''
+    if ($pkgOwner.Exists -and $pkgOwner.Enabled) { $pick = $pkgOwner; $source = 'Agent owner' }
+    else {
+        $idPick = $idOwners | Where-Object { $_.Exists -and $_.Enabled } | Select-Object -First 1
+        if ($idPick) { $pick = $idPick; $source = 'Agent identity owner' }
+        else {
+            foreach ($who in @($idOwners | Select-Object -First 1) + @($pkgOwner | Where-Object { $_.Exists })) {
+                $mgr = Get-ManagerInfo $who.Id
+                if ($mgr -and $mgr.Enabled) { $pick = $mgr; $source = "Manager of $($who.Upn)"; break }
+            }
+        }
+    }
+    if ($pick) { $r.State = 'Proposed'; $r.ProposedId = $pick.Id; $r.Proposed = $pick.Upn; $r.Source = $source } else { $r.State = 'Needs review' }
+    [pscustomobject]$r
+}
+
+# Scan agents that have an Entra identity and report those without a valid sponsor (and, with -IncludeOwners, without an owner).
+function Get-AccountabilityReport {
+    param([object[]]$Packages, [switch]$IncludeOwners)
+    $withId = @($Packages | Where-Object { $_.agentIdentityId })
+    Initialize-IdentitySponsorCache -AgentIdentityIds @($withId | ForEach-Object { $_.agentIdentityId })
+    Initialize-IdentityOwnerCache -AgentIdentityIds @($withId | ForEach-Object { $_.agentIdentityId })
+    Initialize-UserCache -Ids @($withId | ForEach-Object { $_.ownerId })
+    $known = @($withId | Where-Object { $script:IdentitySponsorCache.ContainsKey($_.agentIdentityId) })
+    $gaps = @($known | Where-Object { -not (Test-HasSponsor $_) -or ($IncludeOwners -and -not (Test-HasIdentityOwner $_)) })
+    Initialize-ManagerCache -UserIds @($gaps | ForEach-Object { $_.ownerId } )
+    Initialize-ManagerCache -UserIds @($gaps | ForEach-Object { $script:IdentityOwnerCache[$_.agentIdentityId] } | ForEach-Object { $_ })
+    $rows = @($known | ForEach-Object { Resolve-AgentAccountability -Package $_ -IncludeOwners:$IncludeOwners })
+    [pscustomobject]@{
+        Items = @($rows | Where-Object { $_.State -ne 'OK' }); OkCount = @($rows | Where-Object { $_.State -eq 'OK' }).Count
+        Unreadable = $withId.Count - $known.Count; NoIdentity = @($Packages).Count - $withId.Count
+    }
+}
+
+function Show-AccountabilityPreview {
+    param([object[]]$Items)
+    $Items | Select-Object @{ n = 'agent'; e = { $_.DisplayName } }, @{ n = 'platform'; e = { $_.Platform } }, @{ n = 'why'; e = { $_.Reason } },
+        @{ n = 'sponsors'; e = { $_.Sponsors } }, @{ n = 'identityOwners'; e = { $_.IdentityOwners } },
+        @{ n = 'status'; e = { $_.State } }, @{ n = 'proposed'; e = { $_.Proposed } }, @{ n = 'basis'; e = { $_.Source } } |
+        Format-Table -AutoSize -Wrap | Out-Host
+}
+
+# Add the proposed person as sponsor and/or owner of each agent identity. Sponsor and owner are added separately, each logged so Undo can remove it.
+function Invoke-AccountabilityAssign {
+    param([object[]]$Items, [switch]$PassThru)
+    if (-not $Items -or $Items.Count -eq 0) { Write-Host 'Nothing to assign.'; return }
+    $who = (Get-MgContext).Account
+    Write-Host ("`nAdd accountability for {0} agent(s):" -f $Items.Count) -ForegroundColor Cyan
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
+    foreach ($i in $Items) {
+        foreach ($kind in @(@('sponsor') * [int][bool]$i.AddSponsor) + @(@('owner') * [int][bool]$i.AddOwner)) {
+            $segment = if ($kind -eq 'sponsor') { 'sponsors' } else { 'owners' }
+            $rec = [ordered]@{
+                Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = "add$kind"
+                Id = $i.Id; DisplayName = $i.DisplayName; IdentityId = $i.IdentityId; UserId = $i.ProposedId; User = $i.Proposed; Basis = $i.Source; Result = ''; Error = ''
+            }
+            if (-not (Test-Proceed ("{0}: add {1} {2}" -f $i.DisplayName, $kind, $i.Proposed) 'Add accountability')) { $rec.Result = 'WhatIf' }
+            else {
+                try {
+                    $uri = 'https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/{1}/$ref' -f $i.IdentityId, $segment
+                    $body = @{ '@odata.id' = "https://graph.microsoft.com/beta/directoryObjects/$($i.ProposedId)" } | ConvertTo-Json
+                    Invoke-Graph -Method POST -Uri $uri -Body $body -ContentType 'application/json' | Out-Null
+                    Write-Host ("  OK   {0}  +{1}  {2}" -f $i.DisplayName, $kind, $i.Proposed) -ForegroundColor Green
+                    $rec.Result = 'Done'; $ok++
+                } catch {
+                    $msg = $_.Exception.Message
+                    if ($kind -eq 'sponsor' -and $msg -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $msg += ' (Microsoft documents adding a sponsor as an application-permission call; add an owner instead with -IncludeOwners, or use the Entra admin center.)' }
+                    Write-Host ("  FAIL {0}  +{1} -> {2}" -f $i.DisplayName, $kind, $msg) -ForegroundColor Red
+                    $rec.Result = 'Failed'; $rec.Error = $msg; $fail++
+                }
+            }
+            $log.Add([pscustomobject]$rec)
+        }
+    }
+    Write-Host ("Done: {0} added, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
+    if ($PassThru) { $log }
+}
+
+# Remove what logged 'addsponsor' / 'addowner' rows added.
+function Invoke-AccountabilityRemove {
+    param([object[]]$Records)
+    $ok = 0; $fail = 0
+    foreach ($r in $Records) {
+        $segment = if ($r.Action -eq 'addsponsor') { 'sponsors' } else { 'owners' }
+        if (-not (Test-Proceed ("{0}: remove {1} {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) 'Remove accountability')) { continue }
+        try {
+            $uri = 'https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/{1}/{2}/$ref' -f $r.IdentityId, $segment, $r.UserId
+            Invoke-Graph -Method DELETE -Uri $uri | Out-Null
+            Write-Host ("  OK   {0}  -{1}  {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) -ForegroundColor Green; $ok++
+        } catch { Write-Host ("  FAIL {0}  -> {1}" -f $r.DisplayName, $_.Exception.Message) -ForegroundColor Red; $fail++ }
+    }
+    Write-Host ("Removed {0}, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------------------------
 # Policy file: declare rules once, review the plan, apply it. Conditions inside a rule combine
 # with AND (or OR when "match": "any"). Without -Apply nothing is changed.
 # ---------------------------------------------------------------------------------------------
@@ -644,7 +987,7 @@ function Get-PolicyPlan {
     param([object]$PolicyDoc)
     $catalog = @(Get-Packages)
     $byId = @{}; foreach ($p in $catalog) { $byId[$p.id] = $p }
-    $ownerReport = $null
+    $ownerReport = $null; $aiData = $null
     foreach ($rule in @($PolicyDoc.rules)) {
         if (-not $rule.when) { throw "Rule '$($rule.name)' has no conditions; a rule without 'when' would match everything." }
         $sets = @(); $proposals = @{}
@@ -673,7 +1016,33 @@ function Get-PolicyPlan {
             $wantBlocked = ([string]$w.state -eq 'blocked')
             $sets += , @($catalog | Where-Object { [bool]$_.isBlocked -eq $wantBlocked } | ForEach-Object { $_.id })
         }
-        if ($sets.Count -eq 0) { throw "Rule '$($rule.name)' uses no recognised condition (stale, risky, blockedDays, ownerless, state)." }
+        $evidence = @{}
+        if ($w.aiActivity) {
+            $days = if ($w.aiActivity.days) { [int]$w.aiActivity.days } else { 7 }
+            $minHigh = if ($null -ne $w.aiActivity.minHigh) { [int]$w.aiActivity.minHigh } else { 1 }
+            $minMedium = if ($null -ne $w.aiActivity.minMedium) { [int]$w.aiActivity.minMedium } else { 0 }
+            if ($minHigh -lt 1 -and $minMedium -lt 1) { throw "Rule '$($rule.name)': aiActivity needs minHigh or minMedium of at least 1." }
+            $wanted = @($w.aiActivity.signals | Where-Object { $_ })
+            if (-not $aiData -or $aiData.Days -lt $days) {
+                $aiData = Get-AiActivityData -Days $days -InfoTable (Get-AgentInfoTable) -Packages $catalog -OnWait { param($m) if ($m) { Write-Host "  $m" -ForegroundColor DarkGray } }
+            }
+            $cutoff = (Get-Date).AddDays(-$days)
+            $hit = @()
+            foreach ($g in ($aiData.Activities | Where-Object { $_.TitleId -and $_.Time -ge $cutoff } | Group-Object TitleId)) {
+                $pkg = $byId[$g.Name]
+                if (-not $pkg) { continue }
+                $rows = @($g.Group | Where-Object { $_.Risk -ne 'None' })
+                if ($wanted.Count) { $rows = @($rows | Where-Object { $sig = $_.Signals; @($wanted | Where-Object { $sig -like "*$_*" }).Count -gt 0 }) }
+                $high = @($rows | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count
+                if ($high -ge $minHigh -and $med -ge $minMedium) {
+                    $hit += $pkg.id
+                    $top = (@($rows | ForEach-Object { $_.Signals -split '; ' } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join '; ')
+                    $evidence[$pkg.id] = '{0} high, {1} medium in {2} days: {3}' -f $high, $med, $days, $top
+                }
+            }
+            $sets += , @($hit)
+        }
+        if ($sets.Count -eq 0) { throw "Rule '$($rule.name)' uses no recognised condition (stale, risky, aiActivity, blockedDays, ownerless, state)." }
 
         $ids = New-Object 'System.Collections.Generic.HashSet[string]'
         if ($rule.match -eq 'any') { foreach ($s in $sets) { foreach ($i in $s) { [void]$ids.Add([string]$i) } } }
@@ -686,18 +1055,29 @@ function Get-PolicyPlan {
             }
         }
         $action = if ($rule.then.action) { ([string]$rule.then.action).ToLower() } else { 'report' }
-        if ($action -notin 'block', 'unblock', 'reassign', 'report') { throw "Rule '$($rule.name)': unknown action '$action'." }
+        if ($action -notin 'block', 'unblock', 'reassign', 'restrict', 'report') { throw "Rule '$($rule.name)': unknown action '$action'." }
+        $restrict = $null
+        if ($action -eq 'restrict') {
+            $scope = ([string]$rule.then.availableTo).ToLower()
+            $to = switch ($scope) { 'some' { 'Some' } 'owner' { 'Some' } 'all' { 'All' } default { 'None' } }
+            $ownerOnly = $scope -eq 'owner' -or [bool]$rule.then.ownerOnly
+            if ($to -eq 'Some' -and -not $ownerOnly -and -not (@($rule.then.users | Where-Object { $_ }).Count + @($rule.then.groups | Where-Object { $_ }).Count)) {
+                throw "Rule '$($rule.name)': restricting to some users needs users, groups or ownerOnly."
+            }
+            $restrict = @{ To = $to; OwnerOnly = $ownerOnly; Users = @($rule.then.users | Where-Object { $_ }); Groups = @($rule.then.groups | Where-Object { $_ }); IncludeDeployment = [bool]$rule.then.includeDeployment }
+        }
 
         $matched = @($ids | ForEach-Object { $byId[$_] } | Where-Object { $_ -and -not (Test-PolicyExcluded $_ $PolicyDoc.exclude) })
         $actionable = switch ($action) {
             'block'    { @($matched | Where-Object { -not $_.isBlocked }) }
             'unblock'  { @($matched | Where-Object { $_.isBlocked }) }
             'reassign' { @($matched | Where-Object { $proposals.ContainsKey($_.id) -and $proposals[$_.id].State -eq 'Proposed' }) }
+            'restrict' { $want = (ConvertTo-AccessTarget $restrict.To).Available; @($matched | Where-Object { $_.availableTo -ne $want -or $restrict.To -eq 'Some' }) }
             default    { @($matched) }
         }
         [pscustomobject]@{
             Rule = [string]$rule.name; Action = $action; DisableIdentity = [bool]$rule.then.disableIdentity
-            Matched = $matched; Actionable = $actionable; Proposals = $proposals
+            Matched = $matched; Actionable = $actionable; Proposals = $proposals; Evidence = $evidence; Restrict = $restrict
         }
     }
 }
@@ -710,7 +1090,8 @@ function Invoke-PolicyPlan {
     foreach ($step in $Plan) {
         if ($step.Matched.Count -gt 0) {
             Write-Host ("Rule '{0}' ({1}):" -f $step.Rule, $step.Action) -ForegroundColor Cyan
-            $step.Matched | Select-Object displayName, id, isBlocked, type | Format-Table -AutoSize | Out-Host
+            $ev = $step.Evidence
+            $step.Matched | Select-Object displayName, id, isBlocked, type, @{ n = 'availableTo'; e = { Get-AccessLabel $_.availableTo } }, @{ n = 'evidence'; e = { $ev[$_.id] } } | Format-Table -AutoSize -Wrap | Out-Host
         }
     }
     $total = ($Plan | Where-Object { $_.Action -ne 'report' } | ForEach-Object { $_.Actionable.Count } | Measure-Object -Sum).Sum
@@ -724,6 +1105,10 @@ function Invoke-PolicyPlan {
         if ($step.Action -in 'block', 'unblock') {
             $script:DisableIdentity = $step.DisableIdentity
             Invoke-PackageAction -Packages $step.Actionable -Action $step.Action
+        } elseif ($step.Action -eq 'restrict') {
+            $r = $step.Restrict
+            $entities = if ($r.To -eq 'Some' -and -not $r.OwnerOnly) { @(Resolve-AccessEntities -Users $r.Users -Groups $r.Groups) } else { @() }
+            Invoke-AvailabilityChange -Packages $step.Actionable -To $r.To -Entities $entities -OwnerOnly:$r.OwnerOnly -IncludeDeployment:$r.IncludeDeployment
         } else {
             $items = @($step.Actionable | ForEach-Object { $s = $step.Proposals[$_.id]
                 [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; CurrentOwnerId = $_.ownerId; NewOwnerId = $s.ProposedId; NewOwnerUpn = $s.Proposed; Source = $s.Source } })
@@ -1477,7 +1862,6 @@ function Confirm-Batch {
     (Read-Host ("Proceed to {0} {1} package(s)? [y/N]" -f $Action, $Count)) -match '^(y|yes)$'
 }
 
-# Save the per-agent results (and the state each agent had before the run) as CSV or JSON.
 # AI activity from the Microsoft Purview audit log. DSPM's Activity Explorer has no API of its own; it is a view over the
 # unified audit log, which Graph exposes as asynchronous searches (AuditLogsQuery.Read.All). Each search is created,
 # polled until it succeeds, then its records are read. Large ranges are split into windows so no single search grows
@@ -1781,6 +2165,7 @@ function Get-AiActivityData {
     $script:AiActivityCache
 }
 
+# Save the per-agent results (and the state each agent had before the run) as CSV or JSON.
 function Export-ActionLog {
     param([object[]]$Records)
     if (-not $OutFile -or $Records.Count -eq 0) { return }
@@ -2156,6 +2541,8 @@ $GuiXaml = @'
             <ComboBox x:Name="OwnerBox" Width="190" SelectedIndex="0" ToolTip="Shared agents whose owner is missing, deleted or disabled, with a suggested replacement">
               <ComboBoxItem Content="None" Tag=""/>
               <ComboBoxItem Content="Needs an owner" Tag="needs"/>
+              <ComboBoxItem Content="Missing an Entra sponsor" Tag="nosponsor"/>
+              <ComboBoxItem Content="Missing a sponsor or owner (Entra)" Tag="noboth"/>
             </ComboBox>
             <TextBlock Text="Blocked" VerticalAlignment="Center" Margin="14,0,8,0"/>
             <ComboBox x:Name="BlockedBox" Width="165" SelectedIndex="0" ToolTip="How long an agent has stayed blocked, from this tool's logs and the 30-day audit trail">
@@ -2191,6 +2578,13 @@ $GuiXaml = @'
               <ComboBoxItem Content="Holds any Entra permission" Tag="any"/>
               <ComboBoxItem Content="Holds a Microsoft Graph application permission" Tag="graphapp"/>
               <ComboBoxItem Content="Holds an MCP server permission" Tag="mcp"/>
+            </ComboBox>
+            <TextBlock Text="Access" VerticalAlignment="Center" Margin="22,0,8,0"/>
+            <ComboBox x:Name="AccessBox" Width="190" SelectedIndex="0" ToolTip="Who each agent is available to. Narrowing it is a softer step than blocking.">
+              <ComboBoxItem Content="None" Tag=""/>
+              <ComboBoxItem Content="Open to everyone" Tag="allowedForAll"/>
+              <ComboBoxItem Content="Restricted to some" Tag="allowedForSome"/>
+              <ComboBoxItem Content="Available to nobody" Tag="allowedForNone"/>
             </ComboBox>
           </WrapPanel>
           </StackPanel>
@@ -2263,6 +2657,7 @@ $GuiXaml = @'
             <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
             <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+            <DataGridTextColumn Header="Available to" Binding="{Binding Availability}" Width="150" IsReadOnly="True" Visibility="Collapsed" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Suggested owner" Binding="{Binding Suggested}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
             <DataGridTextColumn Header="Ownership note" Binding="{Binding OwnerNote}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
           </DataGrid.Columns>
@@ -2285,6 +2680,7 @@ $GuiXaml = @'
           <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
           <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" Visibility="Collapsed"/>
+          <Button x:Name="BtnRestrict" Content="Restrict access..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Narrow who can use the selected agents (nobody, their owner, named users and groups) or reopen them. A softer step than Block; the old scope is saved for Undo."/>
           <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Margin="0,0,18,0" IsEnabled="False"/>
@@ -2306,7 +2702,7 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int', 'Availability:string'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -2383,6 +2779,65 @@ function New-ConfirmDialog {
     $script:confirmDialog = $d
     $ok.Add_Click({ $script:confirmDialog.DialogResult = $true })
     $d
+}
+
+$RestrictXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Restrict access" Width="560" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <StackPanel Margin="28,24,28,22">
+    <TextBlock Text="Restrict who can use the selected agents" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
+    <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
+    <RadioButton x:Name="OptNone" GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
+    <RadioButton x:Name="OptOwner" GroupName="scope" Margin="0,0,0,8" Content="Its owner only"/>
+    <RadioButton x:Name="OptUsers" GroupName="scope" Margin="0,0,0,6" Content="These users and groups"/>
+    <TextBox x:Name="Users" AcceptsReturn="True" Height="72" Margin="22,0,0,8" Padding="6" BorderBrush="#D1D5DB" VerticalScrollBarVisibility="Auto"
+             IsEnabled="{Binding IsChecked, ElementName=OptUsers}" ToolTip="One per line: an email address, or group:Group name (or group:object id)"/>
+    <RadioButton x:Name="OptAll" GroupName="scope" Margin="0,0,0,12" Content="Everyone (reopen the agent)"/>
+    <CheckBox x:Name="Deploy" Margin="0,0,0,12" Content="Also change who the agent is deployed to" ToolTip="Deployment is the set of people it is installed for; availability is the set who may use it."/>
+    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB">
+      <ListBox x:Name="Names" MaxHeight="130" BorderThickness="0" Background="Transparent" Padding="6,4"/>
+    </Border>
+    <TextBlock x:Name="Note" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap" Text="Reverse this with Undo last run, or by choosing Everyone."/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" MinWidth="100" Margin="0,0,10,0"/>
+      <Button x:Name="BtnOk" Content="Apply" Style="{DynamicResource BtnAccent}" MinWidth="120"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+
+# Ask how to restrict the selected rows. Returns @{ To; OwnerOnly; Entities; Deploy }, or $null when cancelled.
+function Read-RestrictChoice {
+    param([object[]]$Rows, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($RestrictXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $count = @($Rows).Count
+    $d.FindName('Info').Text = "$count agent$(if ($count -ne 1) { 's' }) selected. The scope they have now is saved first, so Undo last run puts it back."
+    $names = $d.FindName('Names')
+    foreach ($r in @($Rows) | Select-Object -First 40) { [void]$names.Items.Add(('{0}    (now: {1})' -f $r.Name, (Get-AccessLabel $r.Package.availableTo))) }
+    if ($count -gt 40) { [void]$names.Items.Add("... and $($count - 40) more") }
+    $script:restrictDialog = $d; $script:restrictResult = $null
+    $d.FindName('BtnOk').Add_Click({
+        $dlg = $script:restrictDialog; $note = $dlg.FindName('Note')
+        try {
+            $to = 'None'; $ownerOnly = $false; $entities = @()
+            if ($dlg.FindName('OptOwner').IsChecked) { $to = 'Some'; $ownerOnly = $true }
+            elseif ($dlg.FindName('OptUsers').IsChecked) {
+                $to = 'Some'
+                $lines = @($dlg.FindName('Users').Text -split '[\r\n;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                if (-not $lines.Count) { throw 'Enter at least one user or group.' }
+                $groups = @($lines | Where-Object { $_ -like 'group:*' } | ForEach-Object { $_.Substring(6).Trim() })
+                $users = @($lines | Where-Object { $_ -notlike 'group:*' })
+                $entities = @(Resolve-AccessEntities -Users $users -Groups $groups)
+            }
+            elseif ($dlg.FindName('OptAll').IsChecked) { $to = 'All' }
+            $script:restrictResult = @{ To = $to; OwnerOnly = $ownerOnly; Entities = $entities; Deploy = [bool]$dlg.FindName('Deploy').IsChecked }
+            $dlg.DialogResult = $true
+        } catch { $note.Text = $_.Exception.Message; $note.Foreground = '#B91C1C' }
+    })
+    if ($d.ShowDialog()) { $script:restrictResult } else { $null }
 }
 
 $OwnerPromptXaml = @'
@@ -2690,10 +3145,11 @@ function Set-DetailWindowContent {
     (& $f 'Note').Text = $noPerms
 }
 
-# Reading the audit log needs a scope the console does not ask for at sign-in; ask only when the tab is used.
-function Test-AuditScope { @((Get-MgContext).Scopes) -contains 'AuditLogsQuery.Read.All' }
-function Request-AuditScope {
-    Connect-MgGraph -Scopes @(@((Get-MgContext).Scopes) + 'AuditLogsQuery.Read.All' | Select-Object -Unique) -NoWelcome
+# Some actions need a scope the console does not ask for at sign-in (reading the audit log, writing agent identity sponsors); ask only when used.
+function Test-GraphScope { param([string]$Scope) @((Get-MgContext).Scopes) -contains $Scope }
+function Request-GraphScope {
+    param([string]$Scope)
+    Connect-MgGraph -Scopes @(@((Get-MgContext).Scopes) + $Scope | Select-Object -Unique) -NoWelcome
 }
 
 # Fill the pane under the events with everything known about the highlighted one.
@@ -2712,7 +3168,7 @@ function Update-AiActivityTab {
         try {
             $days = [int]$Window.FindName('AiDaysBox').SelectedItem.Tag
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            if (-not (Test-AuditScope)) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; Request-AuditScope }
+            if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; Request-GraphScope 'AuditLogsQuery.Read.All' }
             $dispatcher = $script:w.Dispatcher   # a closure cannot see $script: variables, so hand it the dispatcher directly
             $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
             $info = if ($script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
@@ -2786,7 +3242,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -2818,6 +3274,7 @@ function New-ConsoleWindow {
         $script:ui.BtnUndo.IsEnabled    = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
         $script:ui.BtnAssign.IsEnabled  = @($checked | Where-Object { Test-Reassignable $_.Package }).Count -gt 0
         $script:ui.BtnApplyOwner.IsEnabled = @($checked | Where-Object { $script:ctx.Suggest.ContainsKey($_.Id) }).Count -gt 0
+        $script:ui.BtnRestrict.IsEnabled = $checked.Count -gt 0
         $shown = [int]$script:ui.CountShown.Text
         $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
         $script:ui.EmptyText.Text = if ($rows.Count -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
@@ -2832,6 +3289,7 @@ function New-ConsoleWindow {
         if ($script:ctx.BlockedSet -and -not $script:ctx.BlockedSet.Contains($o.Id)) { return $false }
         if ($null -ne $script:ctx.ToolsSet -and -not $script:ctx.ToolsSet.Contains($o.Id)) { return $false }
         if ($null -ne $script:ctx.PermSet  -and -not $script:ctx.PermSet.Contains($o.Id))  { return $false }
+        if ($null -ne $script:ctx.AccessSet -and -not $script:ctx.AccessSet.Contains($o.Id)) { return $false }
         if ($null -ne $script:ctx.OwnerSet   -and $script:ctx.OwnerSet.Count -eq 0)   { return $false }
         if ($null -ne $script:ctx.BlockedSet -and $script:ctx.BlockedSet.Count -eq 0) { return $false }
         $sets = @(); foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $sets += , $s } }
@@ -2849,7 +3307,7 @@ function New-ConsoleWindow {
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
                $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
-               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet)
+               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet -or $null -ne $script:ctx.AccessSet)
     }
     $script:ctx.MatchNoteText = {
         $n = 0; foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $n++ } }
@@ -2871,6 +3329,7 @@ function New-ConsoleWindow {
                 $r.Platform = Get-PlatformLabel $p $null
                 $r.Hosts = ($p.supportedHosts) -join ','
                 $r.Owner = Get-OwnerLabel $p
+                $r.Availability = Get-AccessLabel $p.availableTo
                 $r.Kind = Get-TypeLabel $p.type
                 $r.IsBlocked = [bool]$p.isBlocked
                 $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
@@ -2897,12 +3356,24 @@ function New-ConsoleWindow {
         $script:ctx.Resetting = $true
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
         $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
-        $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0; $script:ui.ToolsBox.SelectedIndex = 0; $script:ui.PermBox.SelectedIndex = 0
-        & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm
+        $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0; $script:ui.ToolsBox.SelectedIndex = 0; $script:ui.PermBox.SelectedIndex = 0; $script:ui.AccessBox.SelectedIndex = 0
+        & $script:ctx.ClearAccess; & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm
         $script:ctx.Resetting = $false
     }
 
     $script:ctx.ClearTools = { $script:ctx.ToolsSet = $null }
+    $script:ctx.ClearAccess = { $script:ctx.AccessSet = $null }
+
+    # Agents by who they are available to (read from the catalog, so it is instant).
+    $script:ctx.RunAccess = {
+        $tag = [string]$script:ui.AccessBox.SelectedItem.Tag
+        if (-not $tag) { & $script:ctx.ClearAccess; & $script:ctx.Refilter; & $script:ctx.Idle 'Access filter cleared.'; return }
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($r in $script:ctx.Rows) { if ([string]$r.Package.availableTo -eq $tag) { [void]$set.Add($r.Id) } }
+        $script:ctx.AccessSet = $set
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("{0} agent(s): {1}." -f $set.Count, $script:ui.AccessBox.SelectedItem.Content.ToLower())
+    }
     $script:ctx.ClearPerm  = { foreach ($r in $script:ctx.Rows) { $r.PermNote = '' }; $script:ctx.PermSet = $null }
 
     # Make sure Defender's per-agent tool records are loaded (once per refresh).
@@ -2985,6 +3456,7 @@ function New-ConsoleWindow {
             'Tools' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.ToolsSet); 'MCP servers' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.ToolsSet)
             'Shared with' = [bool]$script:ui.DetailColsBox.IsChecked; 'Channels' = [bool]$script:ui.DetailColsBox.IsChecked
             'Permissions held' = ($null -ne $script:ctx.PermSet)
+            'Available to' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.AccessSet)
         }
         $script:ui.BtnApplyOwner.Visibility = if ($null -ne $script:ctx.OwnerSet) { 'Visible' } else { 'Collapsed' }
         foreach ($c in $script:ui.Grid.Columns) {
@@ -2993,6 +3465,7 @@ function New-ConsoleWindow {
     }
 
     $script:ctx.ClearOwner = {
+        $script:ctx.OwnerMode = 'owner'
         foreach ($r in $script:ctx.Rows) { $r.Suggested = ''; $r.OwnerNote = '' }
         $script:ctx.OwnerSet = $null; $script:ctx.Suggest = @{}
     }
@@ -3004,6 +3477,8 @@ function New-ConsoleWindow {
     # Shared agents without a usable owner, each with the replacement the resolver would pick.
     $script:ctx.RunOwner = {
         & $script:ctx.ClearOwner
+        $ownerTag = [string]$script:ui.OwnerBox.SelectedItem.Tag
+        if ($ownerTag -in 'nosponsor', 'noboth') { & $script:ctx.RunSponsor ($ownerTag -eq 'noboth'); return }
         if (-not [string]$script:ui.OwnerBox.SelectedItem.Tag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Ownership filter cleared.'; return }
         & $script:ctx.Busy 'Checking owners of shared agents...'
         try {
@@ -3023,6 +3498,61 @@ function New-ConsoleWindow {
         } catch {
             $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
             & $script:ctx.Idle 'Ownership check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Ownership', 'OK', 'Error')
+        }
+    }
+
+    # Agent identities with no sponsor (and, when asked, no owner), each with who the resolver would add.
+    $script:ctx.RunSponsor = {
+        param([bool]$WithOwners)
+        & $script:ctx.Busy 'Checking sponsors of agent identities...'
+        try {
+            $report = Get-AccountabilityReport -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -IncludeOwners:$WithOwners
+            $script:ctx.OwnerMode = 'sponsor'
+            $set = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($i in $report.Items) {
+                [void]$set.Add($i.Id)
+                $row = $script:ctx.RowById[[string]$i.Id]
+                if (-not $row) { continue }
+                $row.OwnerNote = $i.Reason
+                if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
+            }
+            $script:ctx.OwnerSet = $set
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("{0} agent identit{1} need a {2}: {3} with a suggestion, {4} to add by hand. {5} agent(s) have no Entra identity and {6} could not be read. Press Apply suggested to add them." -f
+                $report.Items.Count, $(if ($report.Items.Count -eq 1) { 'y' } else { 'ies' }), $(if ($WithOwners) { 'sponsor or owner' } else { 'sponsor' }), $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.NoIdentity, $report.Unreadable)
+        } catch {
+            $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
+            & $script:ctx.Idle 'Sponsor check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Sponsors', 'OK', 'Error')
+        }
+    }
+
+    # Add the suggested sponsor (and owner) to the selected rows' agent identities.
+    $script:ctx.AssignSponsors = {
+        param([object[]]$Rows)
+        $items = @($Rows | ForEach-Object { $script:ctx.Suggest[$_.Id] } | Where-Object { $_ })
+        if ($items.Count -eq 0) { return }
+        $names = ($items | Select-Object -First 12 | ForEach-Object { "  - $($_.DisplayName)  ->  $($_.Proposed)" }) -join "`n"
+        if ([Windows.MessageBox]::Show("Add the suggested sponsor to $($items.Count) agent identit$(if ($items.Count -eq 1) { 'y' } else { 'ies' })?`n`n$names", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+        try {
+            if (-not (Test-GraphScope 'AgentIdentity.ReadWrite.All')) { & $script:ctx.Busy 'Granting write access to agent identities: finish the sign-in window...'; Request-GraphScope 'AgentIdentity.ReadWrite.All' }
+        } catch { & $script:ctx.Idle 'Sign-in failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Sign-in', 'OK', 'Error'); return }
+        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script:OutFile = Join-Path $dir ('accountability-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.Busy ("Adding accountability for {0} agent(s)..." -f $items.Count)
+        $recs = @(Invoke-AccountabilityAssign -Items $items -PassThru)
+        foreach ($rec in $recs) {
+            if ($rec.Result -ne 'Done') { continue }
+            $row = $script:ctx.RowById[[string]$rec.Id]
+            if ($row) { $row.Suggested = "Added: $($rec.User)"; $row.Checked = $false; $script:ctx.Suggest.Remove([string]$rec.Id) }
+        }
+        $script:ctx.LastRun = @($recs | Where-Object { $_.Result -eq 'Done' })
+        $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("Accountability: {0} added, {1} failed. Log: {2}" -f $script:ctx.LastRun.Count, $failed.Count, $script:OutFile)
+        if ($failed.Count) {
+            $why = ($failed | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            [void][Windows.MessageBox]::Show("$($failed.Count) change(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
         }
     }
 
@@ -3193,17 +3723,44 @@ function New-ConsoleWindow {
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
     $script:ui.ToolsBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunTools } })
     $script:ui.PermBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunPerm } })
+    $script:ui.AccessBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunAccess } })
     $script:ui.OwnerBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunOwner } })
     $script:ui.BlockedBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunBlocked } })
 
     $script:ui.BtnApplyOwner.Add_Click({
         $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $script:ctx.Suggest.ContainsKey($_.Id) })
         if ($rows.Count -eq 0) { return }
+        if ($script:ctx.OwnerMode -eq 'sponsor') { & $script:ctx.AssignSponsors $rows; return }
         $items = @($rows | ForEach-Object { $s = $script:ctx.Suggest[$_.Id]
             [pscustomobject]@{ Id = $_.Id; DisplayName = $_.Name; CurrentOwnerId = $_.Package.ownerId; NewOwnerId = $s.ProposedId; NewOwnerUpn = $s.Proposed; Source = $s.Source } })
         $names = ($items | Select-Object -First 12 | ForEach-Object { "  - $($_.DisplayName)  ->  $($_.NewOwnerUpn)" }) -join "`n"
         if ([Windows.MessageBox]::Show("Assign the suggested owner to $($items.Count) agent(s)?`n`n$names", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
         & $script:ctx.ReassignRows $items 'Apply suggested owners'
+    })
+
+    $script:ui.BtnRestrict.Add_Click({
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked })
+        if ($rows.Count -eq 0) { return }
+        $choice = Read-RestrictChoice -Rows $rows -Owner $script:w
+        if (-not $choice) { return }
+        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script:OutFile = Join-Path $dir ('access-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.Busy ("Changing who can use {0} agent(s)..." -f $rows.Count)
+        $recs = @(Invoke-AvailabilityChange -Packages @($rows | ForEach-Object { $_.Package }) -To $choice.To -Entities $choice.Entities -OwnerOnly:$choice.OwnerOnly -IncludeDeployment:$choice.Deploy -PassThru)
+        foreach ($rec in $recs) {
+            if ($rec.Result -notin 'Done', 'Skipped') { continue }
+            $row = $script:ctx.RowById[[string]$rec.Id]
+            if ($row) { $row.Package.availableTo = $rec.NewAvailableTo; $row.Availability = Get-AccessLabel $rec.NewAvailableTo; $row.Checked = $false }
+        }
+        $script:ctx.LastRun = @($recs | Where-Object { $_.Result -eq 'Done' })
+        if ($null -ne $script:ctx.AccessSet) { & $script:ctx.RunAccess } else { & $script:ctx.Refilter }
+        $done = $script:ctx.LastRun.Count; $failed = @($recs | Where-Object { $_.Result -eq 'Failed' }).Count; $same = @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count
+        & $script:ctx.Idle ("Access: {0} changed, {1} already set, {2} failed. Log: {3}" -f $done, $same, $failed, $script:OutFile)
+        if ($failed) {
+            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
+        }
     })
 
     $script:ui.BtnAssign.Add_Click({
@@ -3235,6 +3792,26 @@ function New-ConsoleWindow {
     $script:ui.BtnUndo.Add_Click({
         $done = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' })
         $back = @($done | ForEach-Object { $script:ctx.RowById[[string]$_.Id] } | Where-Object { $_ })
+        if ($done.Count -gt 0 -and $done[0].Action -eq 'restrict') {
+            if ([Windows.MessageBox]::Show("Restore the previous access of $($done.Count) agent(s)?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            $recs = @(Invoke-AccessRestore -Records $done -PassThru)
+            foreach ($rec in @($recs | Where-Object { $_.Result -eq 'Done' })) {
+                $row = $script:ctx.RowById[[string]$rec.Id]
+                if ($row) { $row.Package.availableTo = $rec.RestoredTo; $row.Availability = Get-AccessLabel $rec.RestoredTo }
+            }
+            $script:ctx.LastRun = @()
+            if ($null -ne $script:ctx.AccessSet) { & $script:ctx.RunAccess } else { & $script:ctx.Refilter }
+            & $script:ctx.Idle ("Restored access for {0} agent(s)." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count)
+            return
+        }
+        if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
+            if ([Windows.MessageBox]::Show("Remove the sponsor or owner added to $($done.Count) agent identit$(if ($done.Count -eq 1) { 'y' } else { 'ies' })?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            Invoke-AccountabilityRemove -Records $done
+            $script:ctx.LastRun = @()
+            & $script:ctx.Refilter
+            & $script:ctx.Idle 'Removed the sponsors and owners that were added.'
+            return
+        }
         if ($back.Count -eq 0) { return }
         $verb = if ($done[0].Action -eq 'block') { 'Unblock' } else { 'Block' }
         & $script:ctx.Apply $verb $back
@@ -3244,7 +3821,7 @@ function New-ConsoleWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
         if (-not $dlg.ShowDialog()) { return }
-        $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
+        $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, Availability, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -Path $dlg.FileName -Encoding utf8 }
         else { $out | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding utf8 }
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
@@ -3344,6 +3921,47 @@ switch ($PSCmdlet.ParameterSetName) {
         Export-ActionLog -Records $c
         Write-Host 'This tool does not delete agents: the catalog API has no delete. Delete them in the admin center (Agents > All agents > Delete, then Deleted > Permanently delete).' -ForegroundColor Yellow
     }
+    'Restrict' {
+        $targets = @(Resolve-Packages $Restrict)
+        $entities = @()
+        if ($AvailableTo -eq 'Some' -and -not $OwnerOnly) {
+            $entities = @(Resolve-AccessEntities -Users $AllowUsers -Groups $AllowGroups)
+            if ($entities.Count -eq 0) { throw '-AvailableTo Some needs -AllowUsers, -AllowGroups or -OwnerOnly.' }
+        }
+        if ($AvailableTo -ne 'Some' -and ($AllowUsers -or $AllowGroups -or $OwnerOnly)) { Write-Warning '-AllowUsers, -AllowGroups and -OwnerOnly only apply with -AvailableTo Some; ignored.' }
+        $want = (ConvertTo-AccessTarget $AvailableTo).Available
+        $pending = @($targets | Where-Object { $_.availableTo -ne $want -or $AvailableTo -eq 'Some' })
+        Write-Host ("{0} of {1} target(s) change to: {2}{3}" -f $pending.Count, $targets.Count, (Get-AccessLabel $want),
+            $(if ($AvailableTo -eq 'Some') { if ($OwnerOnly) { ' (each agent''s owner)' } else { ' (' + (($entities | ForEach-Object { $_.Label }) -join '; ') + ')' } } else { '' })) -ForegroundColor Cyan
+        $targets | Select-Object displayName, id, @{ n = 'availableNow'; e = { Get-AccessLabel $_.availableTo } }, isBlocked | Format-Table -AutoSize | Out-Host
+        if (-not (Confirm-Batch -Count $pending.Count -Action 'restrict')) { Write-Host 'Cancelled.'; break }
+        Invoke-AvailabilityChange -Packages $pending -To $AvailableTo -Entities $entities -OwnerOnly:$OwnerOnly -IncludeDeployment:$IncludeDeployment
+    }
+    'Accountability' {
+        $report = Get-AccountabilityReport -Packages @(Get-Packages) -IncludeOwners:$IncludeOwners
+        Write-Host ("`n{0} agent identities have what they need, {1} need attention. {2} agent(s) have no Entra identity and {3} could not be read." -f $report.OkCount, $report.Items.Count, $report.NoIdentity, $report.Unreadable) -ForegroundColor Cyan
+        if ($report.Items.Count -eq 0) { break }
+        Show-AccountabilityPreview -Items $report.Items
+        $proposed = @($report.Items | Where-Object { $_.State -eq 'Proposed' })
+        Write-Host ("{0} proposed, {1} flagged for review (add them with -AddSponsor <agent> -To <user>)." -f $proposed.Count, @($report.Items | Where-Object { $_.State -eq 'Needs review' }).Count) -ForegroundColor Cyan
+        if ($Action -ne 'assign' -or $proposed.Count -eq 0) { Write-Host 'Add -Action assign to apply the proposals.' -ForegroundColor DarkGray; break }
+        if (-not (Confirm-Batch -Count $proposed.Count -Action 'assign accountability for')) { Write-Host 'Cancelled.'; break }
+        Invoke-AccountabilityAssign -Items $proposed
+    }
+    'AddSponsor' {
+        $person = Get-UserInfo $To
+        if (-not $person.Exists -or -not $person.Enabled) { throw "'$To' is not an existing, enabled user." }
+        $targets = @(Resolve-Packages $AddSponsor)
+        $noIdentity = @($targets | Where-Object { -not $_.agentIdentityId })
+        if ($noIdentity.Count) { Write-Warning ("No Entra agent identity, skipped: {0}" -f (($noIdentity | ForEach-Object { $_.displayName }) -join '; ')) }
+        $items = @($targets | Where-Object { $_.agentIdentityId } | ForEach-Object {
+            [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; IdentityId = $_.agentIdentityId; ProposedId = $person.Id; Proposed = $person.Upn; Source = 'Manual'
+                               AddSponsor = -not $AsOwner; AddOwner = [bool]$AsOwner } })
+        Write-Host ("{0} agent identit{1} will get {2} as {3}." -f $items.Count, $(if ($items.Count -eq 1) { 'y' } else { 'ies' }), $person.Upn, $(if ($AsOwner) { 'owner' } else { 'sponsor' })) -ForegroundColor Cyan
+        if ($items.Count -eq 0) { break }
+        if (-not (Confirm-Batch -Count $items.Count -Action 'add accountability for')) { Write-Host 'Cancelled.'; break }
+        Invoke-AccountabilityAssign -Items $items
+    }
     'Ownerless' {
         $report = Get-OwnerReport -Packages @(Get-Packages)
         Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published and {3} ownerless Copilot Studio agent(s) cannot be reassigned through the API." -f
@@ -3382,6 +4000,16 @@ switch ($PSCmdlet.ParameterSetName) {
                 else { @(Import-Csv -LiteralPath $Undo) }
         $changed = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'unblock' })
         $ownerChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'reassign' })
+        $accessChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'restrict' })
+        $accountChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'addsponsor', 'addowner' })
+        if ($accessChanges.Count -gt 0) {
+            $accessChanges | Select-Object DisplayName, @{ n = 'now'; e = { Get-AccessLabel $_.NewAvailableTo } }, @{ n = 'restoreTo'; e = { Get-AccessLabel $_.WasAvailableTo } } | Format-Table -AutoSize | Out-Host
+            if (Confirm-Batch -Count $accessChanges.Count -Action 'restore access for') { Invoke-AccessRestore -Records $accessChanges }
+        }
+        if ($accountChanges.Count -gt 0) {
+            $accountChanges | Select-Object DisplayName, Action, User | Format-Table -AutoSize | Out-Host
+            if (Confirm-Batch -Count $accountChanges.Count -Action 'remove accountability for') { Invoke-AccountabilityRemove -Records $accountChanges }
+        }
         if ($ownerChanges.Count -gt 0) {
             $back = foreach ($r in $ownerChanges) {
                 $prev = Get-UserInfo $r.WasOwner
@@ -3391,7 +4019,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $back = @($back)
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
-        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $catalog = @(Get-Packages)
         $restore = @{ block = @(); unblock = @() }
         foreach ($r in $changed) {
