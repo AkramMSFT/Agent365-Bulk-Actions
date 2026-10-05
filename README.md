@@ -352,14 +352,14 @@ The report lists agents that are new or removed, newly blocked or unblocked, and
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-A Windows desktop window over the same catalog. It opens on every agent with no filter applied.
+A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Export** and **Undo last run** on top; **Apply suggested**, **Restrict access...**, **Assign owner...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
 
 | To do this | Use |
 | --- | --- |
 | Find agents | Search by name, publisher, platform or id. Filter All, Active or Blocked, and optionally Copilot agents only. **Reset filters** clears everything. |
 | Filter by analysis | *Stale*, *Risk* (from alerts, detections or both), *Ownership*, *Blocked*, *Tools*, *Permissions* and *Access* dropdowns. Each defaults to **None**. The matching columns fill in. *Match All* needs every active Stale and Risk filter; *Any* accepts either. |
-| Block or unblock | Tick rows (or **Select visible**), then **Block selected** or **Unblock selected**. A confirmation lists the agents with their active users and last use. **Also disable identity** adds the Entra identity check. |
-| Fix ownership | *Ownership > Needs an owner* lists shared agents with no usable owner and a suggestion; **Apply suggested** applies it. **Assign owner...** opens a searchable Entra directory picker. |
+| Block or unblock | Tick rows (or **Select visible**), then **Block selected** or **Unblock selected**. A confirmation lists the agents with their active users and last use. **Verify identity state** adds a check that the Entra identity ends up disabled (or enabled again after an unblock). |
+| Fix ownership | *Ownership > Needs an owner* lists shared agents with no usable owner and a suggestion; tick the rows and press **Apply suggested** (always on the action bar, enabled once a ticked row has a suggestion). **Assign owner...** opens a searchable Entra directory picker. |
 | Add accountability | *Ownership > Missing an Entra sponsor* (or *sponsor or owner*) lists identities with a gap; **Apply suggested** adds the proposed person after a confirmation. |
 | Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. The *Access* filter lists agents open to everyone, restricted or closed. |
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
