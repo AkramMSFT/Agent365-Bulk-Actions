@@ -1158,17 +1158,16 @@ function Compare-Snapshot {
     param([object]$Old, [object[]]$Current)
     $oldById = @{}; foreach ($o in @($Old.items)) { $oldById[[string]$o.id] = $o }
     $curById = @{}; foreach ($c in $Current) { $curById[[string]$c.id] = $c }
-    $out = [System.Collections.Generic.List[object]]::new()
-    $add = { param($change, $agent, $id, $detail) $out.Add([pscustomobject]@{ Change = $change; Agent = $agent; Id = $id; Detail = $detail }) }
+    $out = @()
     foreach ($c in $Current) {
         $o = $oldById[[string]$c.id]
-        if (-not $o) { & $add 'New' $c.displayName $c.id "$($c.type), $($c.platform)"; continue }
-        if ([bool]$o.isBlocked -ne [bool]$c.isBlocked) { & $add $(if ($c.isBlocked) { 'Blocked' } else { 'Unblocked' }) $c.displayName $c.id '' }
-        if ([string]$o.ownerId -ne [string]$c.ownerId) { & $add 'Owner changed' $c.displayName $c.id "$($o.ownerId) -> $($c.ownerId)" }
-        if ([string]$o.version -ne [string]$c.version) { & $add 'Version changed' $c.displayName $c.id "$($o.version) -> $($c.version)" }
+        if (-not $o) { $out += [pscustomobject]@{ Change = 'New'; Agent = $c.displayName; Id = $c.id; Detail = "$($c.type), $($c.platform)" }; continue }
+        if ([bool]$o.isBlocked -ne [bool]$c.isBlocked) { $out += [pscustomobject]@{ Change = $(if ($c.isBlocked) { 'Blocked' } else { 'Unblocked' }); Agent = $c.displayName; Id = $c.id; Detail = '' } }
+        if ([string]$o.ownerId -ne [string]$c.ownerId) { $out += [pscustomobject]@{ Change = 'Owner changed'; Agent = $c.displayName; Id = $c.id; Detail = "$($o.ownerId) -> $($c.ownerId)" } }
+        if ([string]$o.version -ne [string]$c.version) { $out += [pscustomobject]@{ Change = 'Version changed'; Agent = $c.displayName; Id = $c.id; Detail = "$($o.version) -> $($c.version)" } }
     }
     foreach ($o in @($Old.items)) {
-        if (-not $curById.ContainsKey([string]$o.id)) { & $add 'Removed' $o.displayName $o.id "$($o.type)" }
+        if (-not $curById.ContainsKey([string]$o.id)) { $out += [pscustomobject]@{ Change = 'Removed'; Agent = $o.displayName; Id = $o.id; Detail = "$($o.type)" } }
     }
     $out
 }
@@ -1514,7 +1513,7 @@ function Get-AgentPermissionList {
 # Does a permission list satisfy the filter: any permission, a Microsoft Graph application permission, or an MCP server permission?
 function Test-PermissionMatch {
     param([object[]]$Perms, [string]$Mode)
-    $p = @($Perms)
+    $p = @(Get-ItemList $Perms)
     switch ($Mode) {
         'any'      { $p.Count -gt 0 }
         'graphapp' { @($p | Where-Object { $_.Kind -eq 'Application' -and $_.Resource -eq 'Microsoft Graph' }).Count -gt 0 }
@@ -1550,9 +1549,7 @@ function Get-InventoryRows {
         Get-PermissionsBulk -Items @($Packages | Where-Object { $_.agentIdentityId } | ForEach-Object {
             @{ Key = $_.id; ServicePrincipalId = $_.agentIdentityId; BlueprintAppId = $InfoTable[$_.id.ToLowerInvariant()].BlueprintId } })
     } else { @{} }
-    $i = 0
     foreach ($p in $Packages) {
-        $i++
         $info = $InfoTable[$p.id.ToLowerInvariant()]
         $owner = Get-UserInfo $p.ownerId
         $row = [ordered]@{
@@ -1623,7 +1620,6 @@ function Invoke-HuntingQuery {
 # Build a lookup of  catalog id (lowercased)  ->  last telemetry timestamp, from Defender
 # Advanced Hunting over the retained window (Defender keeps ~30 days).
 function Get-ActivityIndex {
-    param()
     $win = 30   # full retention: the index must reach back past the stale cutoff
     $kql = if ($HuntingQuery) { $HuntingQuery } else { $InventoryKql + @"
 CloudAppEvents
@@ -1849,7 +1845,7 @@ union $legs
 function Get-SevRank { param([string]$S)
     switch ($S) { 'High' { 4 } 'Medium' { 3 } 'Low' { 2 } 'Informational' { 1 } default { 0 } } }
 
-# Return agent packages with >= MinAlerts alerts at/above MinSeverity, annotated with risk info.
+# Return agent packages with at least MinAlerts signals (alerts plus detections) at or above MinSeverity, annotated with risk info.
 function Get-RiskyPackages {
     param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly,
           [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both', [object[]]$Packages)
@@ -1859,12 +1855,9 @@ function Get-RiskyPackages {
         $hit = $null
         foreach ($k in (Get-PackageKeys $p)) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
         if ($hit -and ($hit.AlertCount + $hit.DetectionCount) -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
-            $p | Add-Member -NotePropertyName RiskAlerts     -NotePropertyValue $hit.AlertCount     -Force
-            $p | Add-Member -NotePropertyName RiskDetections -NotePropertyValue $hit.DetectionCount -Force
-            $p | Add-Member -NotePropertyName RiskSeverity   -NotePropertyValue $hit.Severity       -Force
-            $p | Add-Member -NotePropertyName RiskReasons    -NotePropertyValue $hit.Reasons        -Force
-            $p | Add-Member -NotePropertyName RiskCategories -NotePropertyValue $hit.Categories     -Force
-            $p | Add-Member -NotePropertyName RiskLastAlert  -NotePropertyValue $hit.LastAlert      -Force -PassThru
+            Add-Member -InputObject $p -Force -PassThru -NotePropertyMembers ([ordered]@{
+                RiskAlerts = $hit.AlertCount; RiskDetections = $hit.DetectionCount; RiskSeverity = $hit.Severity
+                RiskReasons = $hit.Reasons; RiskCategories = $hit.Categories; RiskLastAlert = $hit.LastAlert })
         }
     }
     # worst first: by severity, then total signals
@@ -1931,11 +1924,12 @@ function Complete-AuditSearch {
     param([string]$Id, [scriptblock]$OnWait, [int]$TimeoutMinutes = 20)
     $base = "https://graph.microsoft.com/v1.0/security/auditLog/queries/$Id"
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes); $interval = 5
-    do {
-        Wait-AuditPoll -Seconds $interval -OnWait $OnWait
+    while ($true) {
         try { $q = Invoke-Graph -Uri $base } catch { throw "Checking an audit search failed: $($_.Exception.Message)" }
+        if ($q.status -notin 'notStarted', 'running' -or (Get-Date) -ge $deadline) { break }
+        Wait-AuditPoll -Seconds $interval -OnWait $OnWait
         if ($interval -lt 15) { $interval += 2 }
-    } while (($q.status -in 'notStarted', 'running') -and (Get-Date) -lt $deadline)
+    }
     if ($q.status -ne 'succeeded') { Write-Warning ("An audit search ended as '{0}'; its records are missing." -f $q.status); return $null }
     if ($q.isRecordCountLimitExceeded) { Write-Warning 'An audit search hit the service record limit; the oldest or newest records in that window may be missing. Use a shorter -AiDays.' }
     $records = New-Object 'System.Collections.Generic.List[object]'
@@ -1968,11 +1962,11 @@ function Get-AiActivityRecords {
             $end = $now.AddDays(-$w * $WindowDays); $start = $now.AddDays(-[Math]::Min($Days, ($w + 1) * $WindowDays))
             foreach ($s in $specs) {
                 $name = 'Agent365-Bulk-Actions AI activity {0} {1:yyyyMMdd-HHmm} w{2}' -f $s.Tag, $now, ($w + 1)
-                @{ Id = (Start-AuditSearch -Name $name -Start $start -End $end -RecordTypes $s.RecordTypes -Operations $s.Operations) }
+                Start-AuditSearch -Name $name -Start $start -End $end -RecordTypes $s.RecordTypes -Operations $s.Operations
             }
         })
-        foreach ($s in $started) {
-            foreach ($rec in @(Complete-AuditSearch -Id $s.Id -OnWait $OnWait)) { if ($rec -and $rec.id) { $all[[string]$rec.id] = $rec } }
+        foreach ($id in $started) {
+            foreach ($rec in @(Complete-AuditSearch -Id $id -OnWait $OnWait)) { if ($rec -and $rec.id) { $all[[string]$rec.id] = $rec } }
         }
     }
     @($all.Values)
@@ -2020,10 +2014,10 @@ function ConvertTo-AiActivity {
     $a = $Record.auditData
     $cd = $a.CopilotEventData
     $resources = @($cd.AccessedResources | Where-Object { $_ })
-    $signals = New-Object 'System.Collections.Generic.List[object]'
-    $tools = New-Object 'System.Collections.Generic.List[string]'
-    $files = New-Object 'System.Collections.Generic.List[string]'
-    $web = New-Object 'System.Collections.Generic.List[string]'
+    $signals = [System.Collections.Generic.List[object]]::new()
+    $tools = [System.Collections.Generic.List[string]]::new()
+    $files = [System.Collections.Generic.List[string]]::new()
+    $web = [System.Collections.Generic.List[string]]::new()
     $search = $false
     foreach ($res in $resources) {
         switch ($res.Type) {
@@ -2050,15 +2044,21 @@ function ConvertTo-AiActivity {
         }
         if ($res.SensitivityLabelId) { $signals.Add(@{ Name = 'Labeled file accessed'; Risk = 'Medium'; Detail = [string]$res.Name }) }
     }
-    if (-not @($signals | Where-Object { $_.Name -eq 'Jailbreak attempt' }).Count -and @($cd.Messages | Where-Object { $_.JailbreakDetected -eq $true }).Count) {
-        $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = '' })
+    $messages = @($cd.Messages | Where-Object { $_ })
+    $prompts = 0; $responses = 0; $flagged = $false
+    foreach ($m in $messages) {
+        if ($m.isPrompt -eq $true) { $prompts++ } elseif ($m.isPrompt -eq $false) { $responses++ }
+        if ($m.JailbreakDetected -eq $true) { $flagged = $true }
     }
-    $risk = if (@($signals | Where-Object { $_.Risk -eq 'High' }).Count) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
+    $high = $false; $jailbreak = $false
+    foreach ($s in $signals) { if ($s.Risk -eq 'High') { $high = $true }; if ($s.Name -eq 'Jailbreak attempt') { $jailbreak = $true } }
+    if ($flagged -and -not $jailbreak) { $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = '' }); $high = $true }
+    $risk = if ($high) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
     $op = [string]$Record.operation
     $kind = if ($op -eq 'CopilotInteraction') { 'Interaction' } elseif ($op -like 'AISpanOutput*') { 'Agent response' } else { $op }
 
     $uniqueTools = @($tools | Select-Object -Unique); $uniqueFiles = @($files | Select-Object -Unique); $uniqueWeb = @($web | Select-Object -Unique)
-    $parts = New-Object 'System.Collections.Generic.List[string]'
+    $parts = [System.Collections.Generic.List[string]]::new()
     if ($kind -eq 'Agent response') {
         $parts.Add($(if ($a.ErrorType) { "Reply failed: $($a.ErrorType)" } else { 'Reply sent' }))
     } else {
@@ -2069,24 +2069,24 @@ function ConvertTo-AiActivity {
         if ($cd.TargetAgentName) { $parts.Add("Handed to $($cd.TargetAgentName)") }
         if (-not $parts.Count) { $parts.Add('Chat turn, no tools or files') }
     }
-    $messages = @($cd.Messages | Where-Object { $_ })
+    $mt = @($cd.ModelTransparencyDetails)[0]
     [pscustomobject]@{
         Time = ConvertTo-AiTime $Record.createdDateTime; User = [string]$Record.userPrincipalName
-        AgentName = [string]$a.AgentName; AgentGuid = [string]$a.AgentId; PlatformAgentId = [string]$a.PlatformAgentId; Blueprint = [string]$a.AgentBlueprintId
+        AgentName = [string]$a.AgentName; AgentGuid = [string]$a.AgentId; PlatformAgentId = [string]$a.PlatformAgentId
         App = $(if ($cd.AppHost) { [string]$cd.AppHost } elseif ($a.ChannelName) { [string]$a.ChannelName } else { [string]$a.Workload })
         Kind = $kind; Risk = $risk
         Summary = ($parts -join '; ')
         Signals = (@($signals | ForEach-Object { $_.Name } | Select-Object -Unique) -join '; ')
         Detail = (@($signals | ForEach-Object { if ($_.Detail) { "$($_.Name): $($_.Detail)" } } | Select-Object -Unique) -join ' | ')
         Tools = ($uniqueTools -join '; '); Files = ($uniqueFiles -join '; '); Web = ($uniqueWeb -join '; ')
-        Model = $(if ($cd.ModelTransparencyDetails) { (@($cd.ModelTransparencyDetails)[0].ModelProviderName, @($cd.ModelTransparencyDetails)[0].ModelName | Where-Object { $_ }) -join ' / ' } else { '' })
-        Prompts = @($messages | Where-Object { $_.isPrompt -eq $true }).Count; Responses = @($messages | Where-Object { $_.isPrompt -eq $false }).Count
+        Model = $(if ($mt) { ($mt.ModelProviderName, $mt.ModelName | Where-Object { $_ }) -join ' / ' } else { '' })
+        Prompts = $prompts; Responses = $responses
         Conversation = $(if ($cd.ConversationId) { [string]$cd.ConversationId } else { [string]$a.ConversationId })
         RecordId = [string]$Record.id; TitleId = ''; Agent = ''
         Extra = [pscustomobject]@{
             Resources = $resources; Thread = [string]$cd.ThreadId; ClientIp = [string]$(if ($a.ClientIP) { $a.ClientIP } else { $Record.clientIp }); Region = [string]$a.ClientRegion
             License = [string]$cd.LicenseType; Plugin = (@($cd.AISystemPlugin | Where-Object { $_ } | ForEach-Object { "$($_.Name) $($_.Id)".Trim() }) -join ', ')
-            TargetAgent = [string]$cd.TargetAgentName; MessageIds = @($messages | ForEach-Object { [string]$_.Id }); Operation = [string]$a.OperationName
+            TargetAgent = [string]$cd.TargetAgentName; Operation = [string]$a.OperationName
             ErrorType = [string]$a.ErrorType; ErrorMessage = [string]$a.ErrorMessage; OutputMessageId = [string]$a.OutputMessageId; Channel = [string]$a.ChannelName
         }
     }
@@ -2098,7 +2098,7 @@ function Get-AiActivityDetailRows {
     $x = $Activity.Extra
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $add = { param($section, $item, $info) if ("$info" -ne '') { $rows.Add([pscustomobject]@{ Section = $section; Item = $item; Info = [string]$info }) } }
-    & $add 'Event' 'Time' $Activity.Time.ToString('yyyy-MM-dd HH:mm:ss')
+    & $add 'Event' 'Time' $(if ($Activity.Time) { $Activity.Time.ToString('yyyy-MM-dd HH:mm:ss') })
     & $add 'Event' 'User' $Activity.User
     & $add 'Event' 'Agent' $(if ($Activity.Agent) { $Activity.Agent } else { $Activity.AgentName })
     & $add 'Event' 'App' $Activity.App
@@ -2171,13 +2171,18 @@ function Get-AiActivitySummary {
     param([object[]]$Activities, [hashtable]$NameById = @{})
     $Activities | Where-Object { $_.TitleId } | Group-Object TitleId | ForEach-Object {
         $rows = @($_.Group)
-        $high = @($rows | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count
+        $high = 0; $med = 0; $responses = 0; $last = $null
+        $users = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($r in $rows) {
+            if ($r.Risk -eq 'High') { $high++ } elseif ($r.Risk -eq 'Medium') { $med++ }
+            if ($r.Kind -eq 'Agent response') { $responses++ }
+            if ($r.User) { [void]$users.Add([string]$r.User) }
+            if ($null -ne $r.Time -and ($null -eq $last -or $r.Time -gt $last)) { $last = $r.Time }
+        }
         $top = @($rows | ForEach-Object { $_.Signals -split '; ' } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join '; '
         [pscustomobject]@{
             TitleId = $_.Name; Agent = $(if ($NameById.ContainsKey($_.Name)) { $NameById[$_.Name] } else { $rows[0].AgentName })
-            Interactions = @($rows | Where-Object { $_.Kind -ne 'Agent response' }).Count; Responses = @($rows | Where-Object { $_.Kind -eq 'Agent response' }).Count
-            Users = @($rows | ForEach-Object { $_.User } | Where-Object { $_ } | Select-Object -Unique).Count
-            LastActivity = ($rows | Sort-Object Time -Descending | Select-Object -First 1).Time
+            Interactions = $rows.Count - $responses; Responses = $responses; Users = $users.Count; LastActivity = $last
             High = $high; Medium = $med; Risk = $(if ($high) { 'High' } elseif ($med) { 'Medium' } else { 'None' }); TopSignals = $top
         }
     } | Sort-Object @{ e = { switch ($_.Risk) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, @{ e = 'High'; Descending = $true }, @{ e = 'Interactions'; Descending = $true }
@@ -2230,15 +2235,15 @@ function Confirm-AgentIdentityState {
     $wantEnabled = -not $WantDisabled
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ($pending.Count -gt 0) {
-        $still = @()
+        $still = [System.Collections.Generic.List[object]]::new()
         $states = Get-AgentIdentityStateMap -AgentIdentityIds @($pending | ForEach-Object { $PackageById[$_.Id].agentIdentityId })
         foreach ($rec in $pending) {
             $state = $states[[string]$PackageById[$rec.Id].agentIdentityId]
             if ($state -eq $wantEnabled) { $rec.Identity = if ($WantDisabled) { 'Disabled (by platform)' } else { 'Enabled (by platform)' } }
             elseif ($null -eq $state) { $rec.Identity = 'Unreadable' }
-            else { $still += $rec }
+            else { $still.Add($rec) }
         }
-        $pending = $still
+        $pending = @($still)
         if ($pending.Count -eq 0 -or (Get-Date) -ge $deadline) { break }
         Start-Sleep -Seconds 3
     }
@@ -2317,23 +2322,21 @@ function Add-PackageUsage {
         $p | Add-Member -NotePropertyName Sessions    -NotePropertyValue $d.totalSessions -Force
         $p | Add-Member -NotePropertyName LastUsed    -NotePropertyValue $(if ($d.lastUsedDateTime) { ([datetimeoffset]$d.lastUsedDateTime).ToString('yyyy-MM-dd') } else { 'never' }) -Force
     }
-    $Packages
 }
 # Preview of the targets with their blast radius (who would lose the agent).
 function Show-ImpactPreview {
     param([object[]]$Packages)
-    Add-PackageUsage $Packages | Out-Null
+    Add-PackageUsage $Packages
     $Packages | Select-Object displayName, id, isBlocked, ActiveUsers, Sessions, LastUsed | Format-Table -AutoSize | Out-Host
 }
 
-# Blocked agents that have stayed blocked at least MinDaysBlocked. The block date comes from this
+# Blocked agents that have stayed blocked at least MinDays days. The block date comes from this
 # tool's own logs and, for the last ~30 days, from the BlockedAgent/UnblockedAgent audit events.
 function Get-DeleteCandidates {
     param([int]$MinDays, [string[]]$HistoryPaths, [switch]$IncludeUnknown,
           [string]$LogDir = (Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'), [object[]]$Packages)
-    $logDir = $LogDir
     $files = @()
-    foreach ($p in @($logDir) + @($HistoryPaths)) {
+    foreach ($p in @($LogDir) + @($HistoryPaths)) {
         if (-not $p -or -not (Test-Path -LiteralPath $p)) { continue }
         $item = Get-Item -LiteralPath $p
         $files += if ($item.PSIsContainer) { @(Get-ChildItem -LiteralPath $p -File | Where-Object { $_.Extension -in '.csv', '.json' }) } else { $item }
@@ -2383,7 +2386,6 @@ $GuiXaml = @'
         WindowStartupLocation="CenterScreen" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Window.Resources>
-    <SolidColorBrush x:Key="Accent" Color="#0F6CBD"/>
     <SolidColorBrush x:Key="Ink" Color="#1F2937"/>
     <SolidColorBrush x:Key="Muted" Color="#6B7280"/>
     <SolidColorBrush x:Key="Line" Color="#E5E7EB"/>
@@ -2600,7 +2602,6 @@ $GuiXaml = @'
                 <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
               </StackPanel>
             </Border>
-            <TextBlock x:Name="MatchNote" Visibility="Collapsed"/>
           </WrapPanel>
           <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
             <TextBlock Text="" Width="84"/>
@@ -2802,7 +2803,7 @@ function New-ConfirmDialog {
     $names = $d.FindName('Names')
     $usage = @{}
     if ($count -le 25) {
-        try { $pk = @($Rows | ForEach-Object { $_.Package }); Add-PackageUsage $pk | Out-Null; foreach ($q in $pk) { $usage[$q.id] = $q } } catch { $null = $_ }
+        try { $pk = @($Rows | ForEach-Object { $_.Package }); Add-PackageUsage $pk; foreach ($q in $pk) { $usage[$q.id] = $q } } catch { $null = $_ }
     }
     foreach ($r in @($Rows) | Select-Object -First 50) {
         $x = $usage[$r.Id]
@@ -3381,7 +3382,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'MatchNote',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -3479,12 +3480,7 @@ function New-ConsoleWindow {
                $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
                $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet -or $null -ne $script:ctx.AccessSet)
     }
-    $script:ctx.MatchNoteText = {
-        $n = 0; foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $n++ } }
-        $script:ui.MatchNote.Text = if ($n -lt 2) { 'applies when both Stale and Risk are set' }
-                                    elseif ($script:ui.MatchAny.IsChecked) { 'agents matching either Stale or Risk' } else { 'agents matching both Stale and Risk' }
-    }
-    $script:ctx.Refilter = { & $script:ctx.MatchNoteText; $script:ctx.View.Refresh(); & $script:ctx.Summary; & $script:ctx.Columns; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
+    $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary; & $script:ctx.Columns; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
 
     $script:ctx.Load = {
         & $script:ctx.Busy 'Loading the catalog...'
