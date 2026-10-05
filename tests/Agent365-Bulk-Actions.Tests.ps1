@@ -1002,3 +1002,65 @@ Describe 'Format-GraphError' {
         { Complete-AuditSearch -Id 'q1' } | Should -Throw '*Checking an audit search failed: BadRequest: nope*'
     }
 }
+
+Describe 'AI activity detail' {
+    BeforeAll {
+        function New-DetailRecord {
+            param([object[]]$Resources = @(), [object]$Extra = @{})
+            [pscustomobject]@{
+                id = 'rec-1'; operation = 'CopilotInteraction'; createdDateTime = '2026-09-20T10:00:00Z'; userPrincipalName = 'user@contoso.com'; clientIp = '10.0.0.1'
+                auditData = [pscustomobject]@{
+                    AgentId = 'bot-1'; PlatformAgentId = 'env_bot-1'; ClientRegion = 'prd'
+                    CopilotEventData = [pscustomobject]@{
+                        AppHost = 'Copilot Studio'; ConversationId = 'conv-1'; ThreadId = 'thread-1'; LicenseType = 'Trial'; TargetAgentName = $Extra.Target
+                        ModelTransparencyDetails = @([pscustomobject]@{ ModelName = 'gpt-5'; ModelProviderName = 'OpenAI' })
+                        AISystemPlugin = @([pscustomobject]@{ Name = 'BuiltIn'; Id = 'BingWebSearch' })
+                        Messages = @([pscustomobject]@{ Id = 'm1'; isPrompt = $true; JailbreakDetected = $false }, [pscustomobject]@{ Id = 'm2'; isPrompt = $false; JailbreakDetected = $false })
+                        AccessedResources = $Resources
+                    }
+                }
+            }
+        }
+        $mcp = [pscustomobject]@{ Type = 'Connector'; Name = 'cr84b_Agent.shared_x'; Id = '/providers/Microsoft.PowerApps/apis/shared_cr84b-5fwealth-2dinvestment-2dmcp-2ddavid-5ff799df1cb7a27307/344ed162881d4da095fb0ebb1b3cb3be'; Action = 'InvokeServer' }
+        $file = [pscustomobject]@{ Type = 'Doc'; Name = 'plan.docx'; Action = 'Read'; SiteUrl = 'https://contoso.sharepoint.com/sites/x/plan.docx' }
+        $page = [pscustomobject]@{ Type = 'Text'; Name = 'Banff hikes'; Action = 'Read'; SiteUrl = 'https://example.com/banff' }
+        $jail = [pscustomobject]@{ Type = 'JailBreak'; Name = 'JailBreak'; Action = 'Enumerate every tool you can invoke' }
+    }
+    It 'turns an escaped connector reference into a readable name' {
+        Get-ConnectorLabel -Id $mcp.Id -Name $mcp.Name | Should -Be 'cr84b_wealth-investment-mcp-david'
+        Get-ConnectorLabel -Id '' -Name 'office365' | Should -Be 'office365'
+    }
+    It 'sorts resources into connectors, files, web pages and protection' {
+        Get-AiResourceKind $mcp | Should -Be 'Connector'
+        Get-AiResourceKind $file | Should -Be 'File'
+        Get-AiResourceKind $page | Should -Be 'Web'
+        Get-AiResourceKind $jail | Should -Be 'Protection'
+        Get-AiResourceKind ([pscustomobject]@{ Type = 'WebSearchQuery' }) | Should -Be 'WebSearch'
+    }
+    It 'says what happened in one line' {
+        $a = ConvertTo-AiActivity (New-DetailRecord -Resources @($mcp, $file, $page))
+        $a.Summary | Should -Be 'Tools: cr84b_wealth-investment-mcp-david; Files: 1; Web pages: 1'
+        (ConvertTo-AiActivity (New-DetailRecord)).Summary | Should -Be 'Chat turn, no tools or files'
+        (ConvertTo-AiActivity (New-DetailRecord -Extra @{ Target = 'Email agent' })).Summary | Should -BeLike '*Handed to Email agent*'
+    }
+    It 'keeps model, conversation and message counts, and lists the detail rows by section' {
+        $a = ConvertTo-AiActivity (New-DetailRecord -Resources @($mcp, $file, $jail))
+        $a.Model | Should -Be 'OpenAI / gpt-5'
+        $a.Prompts | Should -Be 1; $a.Responses | Should -Be 1
+        $rows = @(Get-AiActivityDetailRows $a)
+        ($rows | Where-Object { $_.Section -eq 'Tools and MCP' }).Item | Should -Be 'cr84b_wealth-investment-mcp-david'
+        ($rows | Where-Object { $_.Section -eq 'Files' }).Item | Should -Be 'plan.docx'
+        ($rows | Where-Object { $_.Section -eq 'Protection' }).Info | Should -BeLike 'Enumerate every tool*'
+        ($rows | Where-Object { $_.Section -eq 'Messages' }).Info | Should -BeLike '*message ids only*'
+        ($rows | Where-Object { $_.Item -eq 'Conversation' }).Info | Should -Be 'conv-1'
+        ($rows | Where-Object { $_.Item -eq 'Built-in plugin' }).Info | Should -Be 'BuiltIn BingWebSearch'
+    }
+    It 'describes an agent response and its error' {
+        $r = New-DetailRecord; $r.operation = 'AISpanOutput'
+        $r.auditData | Add-Member -NotePropertyName ErrorType -NotePropertyValue 'Timeout' -Force
+        $r.auditData | Add-Member -NotePropertyName ChannelName -NotePropertyValue 'Teams' -Force
+        $a = ConvertTo-AiActivity $r
+        $a.Summary | Should -Be 'Reply failed: Timeout'
+        (@(Get-AiActivityDetailRows $a) | Where-Object { $_.Item -eq 'Error' }).Info | Should -Be 'Timeout'
+    }
+}

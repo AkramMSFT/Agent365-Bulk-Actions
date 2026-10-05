@@ -1566,22 +1566,50 @@ function Limit-Text {
     if ($t.Length -gt $Max) { $t.Substring(0, $Max - 1) + '...' } else { $t }
 }
 
-# One audit record to one activity row, with the risk signals found in it.
+# A readable name for a Power Platform connector or MCP server reference (the id carries escapes such as -2d for a dash).
+function Get-ConnectorLabel {
+    param([string]$Id, [string]$Name)
+    $raw = if ($Id -match '/apis/([^/]+)') { $Matches[1] } else { $Name }
+    $raw = [regex]::Replace([string]$raw, '-(2d|5f|2e|20)', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    $raw = $raw -replace '^shared_', '' -replace '_[0-9a-fA-F]{16,}$', ''
+    if ($raw) { $raw } else { $Name }
+}
+
+# What an accessed resource is: a connector or MCP server, a protection verdict, a SharePoint or OneDrive file, a web page, or a web search.
+function Get-AiResourceKind {
+    param([object]$Resource)
+    switch ($Resource.Type) {
+        'Connector' { return 'Connector' }
+        { $_ -in 'SecurityWebhook', 'JailBreak', 'IndirectAttack' } { return 'Protection' }
+        'WebSearchQuery' { return 'WebSearch' }
+    }
+    if ($Resource.SiteUrl -match 'sharepoint\.com|onedrive') { return 'File' }
+    if ($Resource.Type -in 'Text', 'Unknown', 'CITATION' -or $Resource.SiteUrl -match '^https?://') { return 'Web' }
+    'Other'
+}
+
+# One audit record to one activity row: what happened, plus the risk signals found in it.
 #   High:   a jailbreak attempt, an indirect prompt injection, or a tool call the runtime protection blocked.
 #   Medium: a protection check that failed (the call was not evaluated), or a sensitivity-labelled file was read.
+# The audit log keeps no prompt or response text (only message ids), apart from the text of a flagged jailbreak or injection.
 function ConvertTo-AiActivity {
     param([object]$Record)
     $a = $Record.auditData
     $cd = $a.CopilotEventData
+    $resources = @($cd.AccessedResources | Where-Object { $_ })
     $signals = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($res in @($cd.AccessedResources)) {
-        if (-not $res) { continue }
+    $tools = New-Object 'System.Collections.Generic.List[string]'
+    $files = New-Object 'System.Collections.Generic.List[string]'
+    $web = New-Object 'System.Collections.Generic.List[string]'
+    $search = $false
+    foreach ($res in $resources) {
         switch ($res.Type) {
             'JailBreak'      { $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = Limit-Text $res.Action }) }
             'IndirectAttack' { $signals.Add(@{ Name = 'Indirect prompt injection'; Risk = 'High'; Detail = "via $($res.Name)" }) }
             'SecurityWebhook' {
                 $why = [string]$res.Action
                 $tool = if ($why -match 'Evaluated tool name: ([^,]+)') { $Matches[1] } else { '' }
+                if ($tool) { $tools.Add("$tool ($($res.Name))") }
                 if ($res.Name -eq 'Block') {
                     $rule = if ($why -match 'blocked by "([^"]+)"') { $Matches[1] } else { 'runtime protection' }
                     $signals.Add(@{ Name = 'Runtime protection blocked'; Risk = 'High'; Detail = "$rule on $tool" })
@@ -1591,6 +1619,12 @@ function ConvertTo-AiActivity {
                 }
             }
         }
+        switch (Get-AiResourceKind $res) {
+            'Connector' { $tools.Add((Get-ConnectorLabel -Id $res.Id -Name $res.Name)) }
+            'File'      { $files.Add([string]$res.Name) }
+            'Web'       { $web.Add($(if ($res.Name) { [string]$res.Name } else { [string]$res.SiteUrl })) }
+            'WebSearch' { $search = $true }
+        }
         if ($res.SensitivityLabelId) { $signals.Add(@{ Name = 'Labeled file accessed'; Risk = 'Medium'; Detail = [string]$res.Name }) }
     }
     if (-not @($signals | Where-Object { $_.Name -eq 'Jailbreak attempt' }).Count -and @($cd.Messages | Where-Object { $_.JailbreakDetected -eq $true }).Count) {
@@ -1599,16 +1633,89 @@ function ConvertTo-AiActivity {
     $risk = if (@($signals | Where-Object { $_.Risk -eq 'High' }).Count) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
     $op = [string]$Record.operation
     $kind = if ($op -eq 'CopilotInteraction') { 'Interaction' } elseif ($op -like 'AISpanOutput*') { 'Agent response' } else { $op }
+
+    $uniqueTools = @($tools | Select-Object -Unique); $uniqueFiles = @($files | Select-Object -Unique); $uniqueWeb = @($web | Select-Object -Unique)
+    $parts = New-Object 'System.Collections.Generic.List[string]'
+    if ($kind -eq 'Agent response') {
+        $parts.Add($(if ($a.ErrorType) { "Reply failed: $($a.ErrorType)" } else { 'Reply sent' }))
+    } else {
+        if ($uniqueTools.Count) { $parts.Add('Tools: ' + ((@($uniqueTools | Select-Object -First 4)) -join ', ') + $(if ($uniqueTools.Count -gt 4) { " +$($uniqueTools.Count - 4)" } else { '' })) }
+        if ($uniqueFiles.Count) { $parts.Add("Files: $($uniqueFiles.Count)") }
+        if ($uniqueWeb.Count) { $parts.Add("Web pages: $($uniqueWeb.Count)") }
+        if ($search) { $parts.Add('Web search') }
+        if ($cd.TargetAgentName) { $parts.Add("Handed to $($cd.TargetAgentName)") }
+        if (-not $parts.Count) { $parts.Add('Chat turn, no tools or files') }
+    }
+    $messages = @($cd.Messages | Where-Object { $_ })
     [pscustomobject]@{
         Time = ConvertTo-AiTime $Record.createdDateTime; User = [string]$Record.userPrincipalName
         AgentName = [string]$a.AgentName; AgentGuid = [string]$a.AgentId; PlatformAgentId = [string]$a.PlatformAgentId; Blueprint = [string]$a.AgentBlueprintId
         App = $(if ($cd.AppHost) { [string]$cd.AppHost } elseif ($a.ChannelName) { [string]$a.ChannelName } else { [string]$a.Workload })
         Kind = $kind; Risk = $risk
+        Summary = ($parts -join '; ')
         Signals = (@($signals | ForEach-Object { $_.Name } | Select-Object -Unique) -join '; ')
         Detail = (@($signals | ForEach-Object { if ($_.Detail) { "$($_.Name): $($_.Detail)" } } | Select-Object -Unique) -join ' | ')
+        Tools = ($uniqueTools -join '; '); Files = ($uniqueFiles -join '; '); Web = ($uniqueWeb -join '; ')
+        Model = $(if ($cd.ModelTransparencyDetails) { (@($cd.ModelTransparencyDetails)[0].ModelProviderName, @($cd.ModelTransparencyDetails)[0].ModelName | Where-Object { $_ }) -join ' / ' } else { '' })
+        Prompts = @($messages | Where-Object { $_.isPrompt -eq $true }).Count; Responses = @($messages | Where-Object { $_.isPrompt -eq $false }).Count
         Conversation = $(if ($cd.ConversationId) { [string]$cd.ConversationId } else { [string]$a.ConversationId })
         RecordId = [string]$Record.id; TitleId = ''; Agent = ''
+        Extra = [pscustomobject]@{
+            Resources = $resources; Thread = [string]$cd.ThreadId; ClientIp = [string]$(if ($a.ClientIP) { $a.ClientIP } else { $Record.clientIp }); Region = [string]$a.ClientRegion
+            License = [string]$cd.LicenseType; Plugin = (@($cd.AISystemPlugin | Where-Object { $_ } | ForEach-Object { "$($_.Name) $($_.Id)".Trim() }) -join ', ')
+            TargetAgent = [string]$cd.TargetAgentName; MessageIds = @($messages | ForEach-Object { [string]$_.Id }); Operation = [string]$a.OperationName
+            ErrorType = [string]$a.ErrorType; ErrorMessage = [string]$a.ErrorMessage; OutputMessageId = [string]$a.OutputMessageId; Channel = [string]$a.ChannelName
+        }
     }
+}
+
+# The full picture of one activity row as Section / Item / Info lines, for the details pane.
+function Get-AiActivityDetailRows {
+    param([object]$Activity)
+    $x = $Activity.Extra
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param($section, $item, $info) if ("$info" -ne '') { $rows.Add([pscustomobject]@{ Section = $section; Item = $item; Info = [string]$info }) } }
+    & $add 'Event' 'Time' $Activity.Time.ToString('yyyy-MM-dd HH:mm:ss')
+    & $add 'Event' 'User' $Activity.User
+    & $add 'Event' 'Agent' $(if ($Activity.Agent) { $Activity.Agent } else { $Activity.AgentName })
+    & $add 'Event' 'App' $Activity.App
+    & $add 'Event' 'Type' $Activity.Kind
+    & $add 'Event' 'Conversation' $Activity.Conversation
+    & $add 'Event' 'Thread' $x.Thread
+    & $add 'Event' 'Client' (@($x.ClientIp, $x.Region | Where-Object { $_ }) -join '  ')
+    & $add 'Event' 'Record id' $Activity.RecordId
+    & $add 'Model' 'Model' $Activity.Model
+    & $add 'Model' 'Built-in plugin' $x.Plugin
+    & $add 'Model' 'Licence' $x.License
+    if ($Activity.Prompts -or $Activity.Responses) {
+        & $add 'Messages' 'Count' ("{0} prompt(s), {1} response(s). The audit log keeps message ids only, not their text." -f $Activity.Prompts, $Activity.Responses)
+    }
+    & $add 'Agent to agent' 'Handed to' $x.TargetAgent
+    if ($Activity.Kind -eq 'Agent response') {
+        & $add 'Response' 'Channel' $x.Channel
+        & $add 'Response' 'Step' $x.Operation
+        & $add 'Response' 'Output message id' $x.OutputMessageId
+        & $add 'Response' 'Error' (@($x.ErrorType, $x.ErrorMessage | Where-Object { $_ }) -join ': ')
+    }
+    foreach ($res in @($x.Resources)) {
+        switch (Get-AiResourceKind $res) {
+            'Connector' { & $add 'Tools and MCP' (Get-ConnectorLabel -Id $res.Id -Name $res.Name) $res.Action }
+            'File'      { & $add 'Files' $res.Name ("{0}{1}  {2}" -f $res.Action, $(if ($res.SensitivityLabelId) { '  (labeled)' } else { '' }), $res.SiteUrl) }
+            'Web'       { & $add 'Web' $(if ($res.Name) { $res.Name } else { $res.Type }) $res.SiteUrl }
+            'WebSearch' { & $add 'Web' 'Web search' 'The agent searched the web.' }
+            'Protection' {
+                switch ($res.Type) {
+                    'JailBreak'      { & $add 'Protection' 'Jailbreak attempt' (Limit-Text $res.Action 1200) }
+                    'IndirectAttack' { & $add 'Protection' "Indirect prompt injection via $($res.Name)" (Limit-Text $res.Action 1200) }
+                    default {
+                        $why = ([string]$res.Action -replace 'Fail close configuration is set to: \w+,?\s*', '' -replace 'Webhook execution duration: (\d+)', '($1 ms)').Trim()
+                        & $add 'Protection' ("Tool check: {0}" -f $res.Name) $why
+                    }
+                }
+            }
+        }
+    }
+    $rows.ToArray()
 }
 
 # Defender's identifiers for each agent (its own id, the bot id, the Entra and observability ids, the source id) to its catalog id.
@@ -2491,13 +2598,14 @@ $DetailXaml = @'
       </TabItem>
       <TabItem x:Name="TabAi" Header="AI activity">
         <Grid>
-          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="210"/></Grid.RowDefinitions>
           <Border Padding="12,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
             <DockPanel>
               <Button x:Name="BtnAiLoad" Content="Load from Purview audit" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Searches the Microsoft Purview audit log. The first search can take minutes; every agent you open afterwards reuses it."/>
               <ComboBox x:Name="AiDaysBox" DockPanel.Dock="Right" SelectedIndex="0" Width="110" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="How far back to search. The service takes about a minute for 7 days and about ten minutes for 30.">
                 <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
               </ComboBox>
+              <Button x:Name="BtnAiConv" Content="Whole conversation" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" IsEnabled="False" ToolTip="Show every event of the highlighted event's conversation in order, or go back to all events."/>
               <CheckBox x:Name="AiRiskyOnly" Content="Risky only" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0"/>
               <TextBlock x:Name="AiNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563" Text="Not loaded yet."/>
             </DockPanel>
@@ -2519,10 +2627,19 @@ $DetailXaml = @'
                   </Style>
                 </DataGridTextColumn.ElementStyle>
               </DataGridTextColumn>
-              <DataGridTextColumn Header="Signals" Binding="{Binding Signals}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
-              <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="2*" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="What happened" Binding="{Binding Summary}" Width="2*" ElementStyle="{StaticResource Wrap}"/>
+              <DataGridTextColumn Header="Signals" Binding="{Binding Signals}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
             </DataGrid.Columns>
           </DataGrid>
+          <Border Grid.Row="2" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+            <DataGrid x:Name="AiDetailGrid" Style="{StaticResource Grid}">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Section" Binding="{Binding Section}" Width="130" ElementStyle="{StaticResource Wrap}"/>
+                <DataGridTextColumn Header="Item" Binding="{Binding Item}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+                <DataGridTextColumn Header="Info" Binding="{Binding Info}" Width="3*" ElementStyle="{StaticResource Wrap}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </Border>
         </Grid>
       </TabItem>
     </TabControl>
@@ -2579,6 +2696,14 @@ function Request-AuditScope {
     Connect-MgGraph -Scopes @(@((Get-MgContext).Scopes) + 'AuditLogsQuery.Read.All' | Select-Object -Unique) -NoWelcome
 }
 
+# Fill the pane under the events with everything known about the highlighted one.
+function Update-AiDetailPane {
+    param([System.Windows.Window]$Window)
+    $item = $Window.FindName('AiGrid').SelectedItem
+    $Window.FindName('AiDetailGrid').ItemsSource = $(if ($item) { @(Get-AiActivityDetailRows $item) } else { @() })
+    $Window.FindName('BtnAiConv').IsEnabled = [bool]($item -and $item.Conversation) -or [bool]$Window.Tag.Conv
+}
+
 # Show the AI activity of one grid row in the details window; -Load reads (or refreshes) the audit log first.
 function Update-AiActivityTab {
     param([System.Windows.Window]$Window, [object]$Row, [switch]$Load)
@@ -2598,16 +2723,25 @@ function Update-AiActivityTab {
         } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
     }
     $cache = $script:AiActivityCache
-    if (-not $cache) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Choose a period and press "Load from Purview audit".'; return }
+    $convButton = $Window.FindName('BtnAiConv')
+    if (-not $cache) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Choose a period and press "Load from Purview audit".'; Update-AiDetailPane -Window $Window; return }
     $mine = @($cache.Activities | Where-Object { $_.TitleId -eq $Row.Id } | Sort-Object Time -Descending)
     $high = @($mine | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($mine | Where-Object { $_.Risk -eq 'Medium' }).Count
-    $shown = @(if ($Window.FindName('AiRiskyOnly').IsChecked) { $mine | Where-Object { $_.Risk -ne 'None' } } else { $mine })
+    $conv = [string]$Window.Tag.Conv
+    if ($conv) {
+        $shown = @($mine | Where-Object { $_.Conversation -eq $conv } | Sort-Object Time)
+        $convButton.Content = 'All events'
+    } else {
+        $shown = @(if ($Window.FindName('AiRiskyOnly').IsChecked) { $mine | Where-Object { $_.Risk -ne 'None' } } else { $mine })
+        $convButton.Content = 'Whole conversation'
+    }
     $grid.ItemsSource = $shown
     $Window.FindName('TabAi').Header = if ($high) { "AI activity ($high high)" } elseif ($med) { "AI activity ($med medium)" } else { 'AI activity' }
-    $note.Text = if ($mine.Count) { "{0} event(s) in the last {1} days: {2} high, {3} medium. Last: {4:yyyy-MM-dd HH:mm}. Risk comes from audit signals, not Insider Risk Management." -f $mine.Count, $cache.Days, $high, $med, $mine[0].Time }
+    $note.Text = if ($conv) { "Conversation {0}: {1} event(s), oldest first. Select one for its detail." -f $conv.Substring(0, [Math]::Min(8, $conv.Length)), $shown.Count }
+                 elseif ($mine.Count) { "{0} event(s) in the last {1} days: {2} high, {3} medium. Last: {4:yyyy-MM-dd HH:mm}. Select an event for its detail. Risk comes from audit signals, not Insider Risk Management." -f $mine.Count, $cache.Days, $high, $med, $mine[0].Time }
                  else { "No AI activity found for this agent in the last $($cache.Days) days." }
+    Update-AiDetailPane -Window $Window
 }
-
 # Build the details window (not yet shown) for one grid row.
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
@@ -2621,6 +2755,14 @@ function New-DetailWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'JSON (*.json)|*.json'; $dlg.FileName = ('{0}.json' -f ($script:detailState.Detail.Name -replace '[^\w\-. ]', '_'))
         if ($dlg.ShowDialog()) { $script:detailState.Detail | ConvertTo-Json -Depth 8 | Set-Content -Path $dlg.FileName -Encoding utf8 }
+    })
+    $d.Tag = @{ Conv = '' }
+    $d.FindName('AiGrid').Add_SelectionChanged({ Update-AiDetailPane -Window $script:detailState.Window })
+    $d.FindName('BtnAiConv').Add_Click({
+        $win = $script:detailState.Window
+        if ($win.Tag.Conv) { $win.Tag.Conv = '' }
+        else { $sel = $win.FindName('AiGrid').SelectedItem; if ($sel -and $sel.Conversation) { $win.Tag.Conv = $sel.Conversation } }
+        Update-AiActivityTab -Window $win -Row $script:detailState.Row
     })
     $d.FindName('BtnAiLoad').Add_Click({ Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row -Load })
     $d.FindName('AiRiskyOnly').Add_Click({ Update-AiActivityTab -Window $script:detailState.Window -Row $script:detailState.Row })
@@ -3153,9 +3295,9 @@ switch ($PSCmdlet.ParameterSetName) {
             foreach ($id in $ids) {
                 $rows = @($mine | Where-Object { $_.TitleId -eq $id })
                 Write-Host ("`n{0}: {1} event(s), {2} high, {3} medium" -f $data.Names[$id], $rows.Count, @($rows | Where-Object { $_.Risk -eq 'High' }).Count, @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count) -ForegroundColor Cyan
-                if ($rows.Count) { $rows | Select-Object Time, User, App, Kind, Risk, Signals, Detail | Format-Table -AutoSize -Wrap | Out-Host }
+                if ($rows.Count) { $rows | Select-Object Time, User, App, Kind, Risk, Summary, Signals | Format-Table -AutoSize -Wrap | Out-Host }
             }
-            Export-ActionLog -Records @($mine | Select-Object Time, Agent, User, App, Kind, Risk, Signals, Detail, Conversation, RecordId)
+            Export-ActionLog -Records @($mine | Select-Object Time, Agent, User, App, Kind, Risk, Summary, Signals, Detail, Tools, Files, Web, Model, Prompts, Responses, Conversation, RecordId)
         } else {
             $sum = @(Get-AiActivitySummary -Activities $acts -NameById $data.Names)
             Write-Host ("`n{0} agent(s) with AI activity; {1} with a high-risk signal, {2} with a medium one." -f $sum.Count, @($sum | Where-Object { $_.Risk -eq 'High' }).Count, @($sum | Where-Object { $_.Risk -eq 'Medium' }).Count) -ForegroundColor Cyan
