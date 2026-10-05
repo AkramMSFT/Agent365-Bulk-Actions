@@ -701,7 +701,11 @@ function Invoke-OwnerReassign {
 # ---------------------------------------------------------------------------------------------
 function Get-AccessLabel {
     param([string]$AvailableTo)
-    switch ($AvailableTo) { 'allowedForAll' { 'Everyone' } 'allowedForSome' { 'Some users or groups' } 'allowedForNone' { 'Nobody' } default { [string]$AvailableTo } }
+    switch ($AvailableTo) {
+        'allowedForAll' { 'Everyone' } 'allowedForSome' { 'Some users or groups' } 'allowedForNone' { 'Nobody' }
+        'acquiredForAll' { 'Everyone' } 'acquiredForSome' { 'Some users or groups' } 'acquiredForNone' { 'Nobody' }
+        default { [string]$AvailableTo }
+    }
 }
 
 # The API values for a target scope: None, Some (named users and groups) or All.
@@ -2835,7 +2839,10 @@ $RestrictXaml = @'
     <TextBlock Text="Restrict who can use the selected agents" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
     <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,10" TextWrapping="Wrap"/>
     <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB" Margin="0,0,0,16">
-      <ListBox x:Name="Names" MaxHeight="96" BorderThickness="0" Background="Transparent" Padding="6,4" ToolTip="The selected agents and who can use each one now. This list is only for review."/>
+      <ListBox x:Name="Names" MaxHeight="96" BorderThickness="0" Background="Transparent" Padding="6,4" ScrollViewer.HorizontalScrollBarVisibility="Disabled" ToolTip="The selected agents and who they are available to and deployed to now. This list is only for review.">
+        <ListBox.ItemContainerStyle><Style TargetType="ListBoxItem"><Setter Property="Focusable" Value="False"/><Setter Property="IsHitTestVisible" Value="False"/></Style></ListBox.ItemContainerStyle>
+        <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding}" TextWrapping="Wrap"/></DataTemplate></ListBox.ItemTemplate>
+      </ListBox>
     </Border>
     <RadioButton GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
     <RadioButton x:Name="OptOwner" GroupName="scope" Margin="0,0,0,8" Content="Its owner only"/>
@@ -2896,7 +2903,10 @@ function New-RestrictDialog {
     $count = @($Rows).Count
     $d.FindName('Info').Text = "$count agent$(if ($count -ne 1) { 's' }) selected. The scope they have now is saved first, so Undo last run puts it back."
     $names = $d.FindName('Names')
-    foreach ($r in @($Rows) | Select-Object -First 40) { [void]$names.Items.Add(('{0}    (now: {1})' -f $r.Name, (Get-AccessLabel $r.Package.availableTo))) }
+    foreach ($r in @($Rows) | Select-Object -First 40) {
+        $deployed = Get-AccessLabel $r.Package.deployedTo
+        [void]$names.Items.Add(('{0}    (available to: {1}; deployed to: {2})' -f $r.Name, (Get-AccessLabel $r.Package.availableTo), $(if ($deployed) { $deployed } else { 'unknown' })))
+    }
     if ($count -gt 40) { [void]$names.Items.Add("... and $($count - 40) more") }
 
     $script:restrictPicker = @{ Window = $d; Search = $d.FindName('PickSearch'); Hint = $d.FindName('PickHint'); Results = $d.FindName('PickResults'); Chosen = $d.FindName('PickChosen'); Note = $d.FindName('Note') }
