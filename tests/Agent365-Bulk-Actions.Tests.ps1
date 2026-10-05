@@ -1358,3 +1358,119 @@ Describe 'Format-GraphError with a real response dump' {
         $m | Should -BeLike '*`[POST /beta/copilot/admin/catalog/packages/T_1/reassign`]'
     }
 }
+Describe 'Lookups and helpers' {
+    It 'Get-Distinct keeps first-seen order and treats case as different, like Select-Object -Unique' {
+        @('b', 'a', 'b', 'A', 'a' | Get-Distinct) | Should -Be @('b', 'a', 'A')
+        @($null, 'x', $null | Get-Distinct).Count | Should -Be 2
+    }
+    It 'Resolve-Packages finds ids and names case-insensitively, rejects duplicates and unknowns, and accepts a supplied catalog' {
+        $cat = @((New-Pkg 'T_abc' 'Alpha'), (New-Pkg 'P_def' 'Beta'), (New-Pkg 'T_g1' 'Dup'), (New-Pkg 'T_g2' 'Dup'))
+        (Resolve-Packages @('t_ABC', 'beta') -Catalog $cat).id | Should -Be @('P_def', 'T_abc')
+        { Resolve-Packages @('Dup') -Catalog $cat } | Should -Throw '*Multiple packages named*'
+        { Resolve-Packages @('Nope') -Catalog $cat } | Should -Throw '*No package matching*'
+        { Resolve-Packages @('T_missing') -Catalog $cat } | Should -Throw '*No package matching*'
+    }
+    It 'Resolve-Packages indexes a large catalog once instead of scanning it per name' {
+        $cat = 1..5000 | ForEach-Object { New-Pkg ('T_{0:D6}' -f $_) "Agent $_" }
+        $names = 1..500 | ForEach-Object { "Agent $($_ * 9)" }
+        $time = Measure-Command { $r = @(Resolve-Packages $names -Catalog $cat) }
+        $r.Count | Should -Be 500
+        $time.TotalSeconds | Should -BeLessThan 3
+    }
+    It 'Select-PackageSet uses the supplied list (filtering Copilot agents on request) and reads the catalog otherwise' {
+        Mock Get-Packages { @((New-Pkg 'T_live' 'Live')) }
+        $a = New-Pkg 'T_a' 'A'; $b = New-Pkg 'T_b' 'B'; $b.supportedHosts = @('Outlook')
+        @(Select-PackageSet -Packages @($a, $b) -Supplied).Count | Should -Be 2
+        (Select-PackageSet -Packages @($a, $b) -Supplied -AgentsOnly).id | Should -Be @('T_a')
+        (Select-PackageSet).id | Should -Be @('T_live')
+        @(Select-PackageSet -Packages @() -Supplied).Count | Should -Be 0
+    }
+    It 'Get-StalePackages reads the supplied catalog and does not call the service' {
+        Mock Get-Packages { throw 'must not read the catalog' }
+        $old = New-Pkg 'T_old' 'Old'; $old | Add-Member -NotePropertyName lastModifiedDateTime -NotePropertyValue '2020-01-01T00:00:00Z'
+        $new = New-Pkg 'T_new' 'New'; $new | Add-Member -NotePropertyName lastModifiedDateTime -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o'))
+        (Get-StalePackages -Days 30 -By modified -Packages @($old, $new)).id | Should -Be @('T_old')
+    }
+    It 'Select-ActionTargets drops what is already in the target state' {
+        $on = New-Pkg 'T_1' 'On' -Blocked $true; $off = New-Pkg 'T_2' 'Off'
+        (Select-ActionTargets @($on, $off) 'block').id | Should -Be @('T_2')
+        (Select-ActionTargets @($on, $off) 'unblock').id | Should -Be @('T_1')
+        @(Select-ActionTargets @($on, $off) 'list').Count | Should -Be 2
+    }
+    It 'New-UserInfo gives found and missing users the same shape' {
+        $f = New-UserInfo 'x' ([pscustomobject]@{ id = 'u1'; userPrincipalName = 'a@x.com'; displayName = 'A'; accountEnabled = $true })
+        $m = New-UserInfo 'u2' $null
+        $f.Exists | Should -BeTrue; $f.IsAgent | Should -BeFalse; $m.Exists | Should -BeFalse; $m.IsAgent | Should -BeFalse
+        ($f.PSObject.Properties.Name -join ',') | Should -Be ($m.PSObject.Properties.Name -join ',')
+        (New-UserInfo 'x' ([pscustomobject]@{ id = 'a1'; '@odata.type' = '#microsoft.graph.agentUser' })).IsAgent | Should -BeTrue
+    }
+    It 'Get-FailureSummary lists the first five failures only' {
+        $recs = 1..7 | ForEach-Object { [pscustomobject]@{ Result = 'Failed'; DisplayName = "A$_"; Error = 'boom' } }
+        $recs += [pscustomobject]@{ Result = 'Done'; DisplayName = 'ok'; Error = '' }
+        ((Get-FailureSummary $recs) -split "`n").Count | Should -Be 5
+        (Get-FailureSummary $recs) | Should -BeLike 'A1: boom*'
+    }
+    It 'Test-PermissionMatch treats a missing list as no permissions' {
+        Test-PermissionMatch -Perms $null -Mode 'any' | Should -BeFalse
+        Test-PermissionMatch -Perms @([pscustomobject]@{ Kind = 'Application'; Resource = 'Microsoft Graph'; Permission = 'X' }) -Mode 'graphapp' | Should -BeTrue
+    }
+    It 'ConvertTo-FieldRows returns an array even for a single row, so a grid can bind to it' {
+        $one = ConvertTo-FieldRows ([ordered]@{ Field = 'only' })
+        $one -is [array] | Should -BeTrue
+        @($one).Count | Should -Be 1
+        (ConvertTo-FieldRows ([ordered]@{})) -is [array] | Should -BeTrue
+        $rows = ConvertTo-FieldRows ([ordered]@{ a = '1'; b = ''; c = '3' })
+        @($rows).Count | Should -Be 2
+    }
+}
+
+Describe 'Output files and logs' {
+    It 'Export-ActionLog writes to a path that contains square brackets' {
+        Mock Write-Host { }
+        foreach ($name in 'run[1].csv', 'run[1].json') {
+            $OutFile = Join-Path $TestDrive $name
+            Export-ActionLog -Records @([pscustomobject]@{ Id = 'T_1'; Result = 'Done' })
+            Test-Path -LiteralPath $OutFile | Should -BeTrue
+        }
+    }
+    It 'Save-Snapshot writes to a path that contains square brackets' {
+        $path = Join-Path $TestDrive 'snap[1].json'
+        Save-Snapshot -Path $path -Packages @((New-Pkg 'T_1' 'One'))
+        (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).count | Should -Be 1
+    }
+}
+
+Describe 'Audit conversion' {
+    It 'matches a policy signal name literally, including text that looks like a wildcard' {
+        Mock Get-AgentInfoTable { @{} }
+        $script:catalog = @((New-Pkg 'T_Abc' 'Alpha'))
+        Mock Get-Packages { $script:catalog }
+        $now = Get-Date
+        $acts = @([pscustomobject]@{ TitleId = 't_abc'; Risk = 'High'; Signals = 'Odd [name]'; Time = $now; Kind = 'Interaction'; User = 'u'; AgentName = '' })
+        Mock Get-AiActivityData { [pscustomobject]@{ Days = 7; Activities = $acts; Names = @{}; Unmapped = 0 } }
+        $doc = '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1, "signals": ["Odd [name]"] } }, "then": { "action": "report" } } ] }' | ConvertFrom-Json
+        (Get-PolicyPlan $doc).Matched.id | Should -Be @('T_Abc')
+        $doc2 = '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1, "signals": ["Odd *"] } }, "then": { "action": "report" } } ] }' | ConvertFrom-Json
+        @((Get-PolicyPlan $doc2).Matched).Count | Should -Be 0
+    }
+    It 'does not fail on an event whose time could not be parsed' {
+        $a = [pscustomobject]@{ Time = $null; Kind = 'Interaction'; User = 'u'; Agent = ''; AgentName = ''; App = ''; Conversation = ''; RecordId = 'r'; Model = ''; Prompts = 0; Responses = 0
+                                Extra = [pscustomobject]@{ Resources = @() } }
+        { Get-AiActivityDetailRows $a } | Should -Not -Throw
+    }
+    It 'counts prompts and responses and flags a jailbreak seen only in a message' {
+        $r = [pscustomobject]@{ id = 'r'; operation = 'CopilotInteraction'; createdDateTime = '2026-09-20T10:00:00Z'; userPrincipalName = 'u@x.com'
+            auditData = [pscustomobject]@{ AgentId = 'bot'; CopilotEventData = [pscustomobject]@{
+                Messages = @([pscustomobject]@{ isPrompt = $true; JailbreakDetected = $true }, [pscustomobject]@{ isPrompt = $false; JailbreakDetected = $false }, [pscustomobject]@{ isPrompt = $false }) } } }
+        $a = ConvertTo-AiActivity $r
+        $a.Prompts | Should -Be 1; $a.Responses | Should -Be 2
+        $a.Risk | Should -Be 'High'; $a.Signals | Should -Be 'Jailbreak attempt'
+    }
+    It 'checks an audit search before sleeping, so a finished search is not delayed' {
+        $script:slept = 0
+        Mock Wait-AuditPoll { $script:slept++ }
+        Mock Invoke-Graph { if ($Method -eq 'DELETE') { return $null }; if ($Uri -like '*/records*') { return @{ value = @(@{ id = 'a' }) } }; @{ status = 'succeeded' } }
+        @(Complete-AuditSearch -Id 'q1').Count | Should -Be 1
+        $script:slept | Should -Be 0
+    }
+}
