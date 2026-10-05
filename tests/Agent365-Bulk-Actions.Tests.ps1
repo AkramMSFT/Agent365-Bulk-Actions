@@ -1483,3 +1483,38 @@ Describe 'Audit conversion' {
         $script:slept | Should -Be 0
     }
 }
+
+Describe 'Graph version per catalog call' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:uris = @()
+        $OutFile = $null
+        $DisableIdentity = $false
+    }
+    It 'reads the catalog from v1.0' {
+        Mock Invoke-Graph { $script:uris += $Uri; @{ value = @() } }
+        $null = Get-Packages
+        $null = Get-Packages -AgentsOnly
+        $script:uris.Count | Should -Be 2
+        $script:uris | ForEach-Object { $_ | Should -BeLike 'https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages*' }
+    }
+    It 'sends block and unblock to beta, the only version that has them' {
+        Mock Invoke-Graph { $script:uris += $Uri }
+        $null = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha') -Action block -PassThru
+        $null = Invoke-PackageAction -Packages @(New-Pkg 'P_2' 'Beta' -Blocked $true) -Action unblock -PassThru
+        $script:uris | Should -Be @('https://graph.microsoft.com/beta/copilot/admin/catalog/packages/P_1/block', 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages/P_2/unblock')
+    }
+    It 'sends reassign to beta' {
+        Mock Invoke-Graph { $script:uris += $Uri }
+        $item = [pscustomobject]@{ Id = 'T_1'; DisplayName = 'Alpha'; CurrentOwnerId = 'o1'; NewOwnerId = 'o2'; NewOwnerUpn = 'new@x.com'; Source = 'test' }
+        $null = Invoke-OwnerReassign -Items @($item) -PassThru
+        $script:uris | Should -Be @('https://graph.microsoft.com/beta/copilot/admin/catalog/packages/T_1/reassign')
+    }
+    It 'reads and changes who can use an agent on v1.0' {
+        Mock Invoke-Graph { $script:uris += '{0} {1}' -f $(if ($Method) { $Method } else { 'GET' }), $Uri; if ($Method -ne 'PATCH') { @{ availableTo = 'allowedForAll'; deployedTo = 'acquiredForAll'; allowedUsersAndGroups = @(); acquireUsersAndGroups = @() } } }
+        $null = Invoke-AvailabilityChange -Packages @(New-Pkg 'T_a' 'Alpha') -To None -PassThru
+        $script:uris | Should -Be @('GET https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a', 'PATCH https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a')
+    }
+}

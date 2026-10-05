@@ -3,7 +3,7 @@
 A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot administrators. It lists, inspects, contains and governs the agents in the organization catalog in bulk, from the command line or from a desktop console.
 
 > [!IMPORTANT]
-> The tool calls Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
+> Block, unblock and reassign, and the Entra agent-identity calls, use Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
 
 ## Contents
 
@@ -105,7 +105,8 @@ The tool signs in with delegated permissions and requests only what the chosen m
 
 | API | Used for |
 | --- | --- |
-| Graph beta `/copilot/admin/catalog/packages` | Listing agents, details, block, unblock, reassign, and the availability scope (PATCH) |
+| Graph `v1.0` `/copilot/admin/catalog/packages` | Listing agents, details and the availability scope (PATCH) |
+| Graph beta `/copilot/admin/catalog/packages` | Block, unblock and reassign, which `v1.0` does not offer |
 | Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections and the per-agent records (tools, MCP servers, sharing) |
 | Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
@@ -208,7 +209,7 @@ For each shared agent the tool decides, in this order:
 3. **Manager** of that person, or of the former owner while the account still exists.
 4. **Flag for review.** Nothing is guessed or defaulted; assign these by hand.
 
-The package API exposes no creator field, so step 2 is the creator substitute and applies only to agents with an Entra identity. Only Copilot Studio shared agents that already have an owner are sent to the reassign API; everything else is skipped with the reason. There is no call that clears an owner: reassigning to a different, valid user is the only operation. Reassignment is delegated-only, so it cannot run unattended.
+The package API exposes no creator field, so step 2 is the creator substitute and applies only to agents with an Entra identity. Only Copilot Studio shared agents that already have an owner are sent to the reassign API; everything else is skipped with the reason. There is no call that clears an owner: reassigning to a different, valid user is the only operation. Reassignment is delegated-only: it needs a signed-in administrator and has no app-only option.
 
 See [Limitations](#limitations) for a service-side failure that can affect Copilot Studio reassignment, and [Entra accountability](#entra-accountability) for an alternative that works on the agent identity.
 
@@ -335,7 +336,7 @@ Declare governance rules once, review the plan, then apply it. See [policy.examp
 
 The `aiActivity` condition matches agents with enough risky events in the window. `days` defaults to 7, `minHigh` to 1 and `minMedium` to 0; at least one minimum must be 1 or more, so a rule cannot match every agent that has any activity. `signals` optionally limits which signals count. The plan shows why each agent matched (for example *3 high, 0 medium in 7 days: Runtime protection blocked x2*), and the audit search runs once per plan however many rules use it.
 
-A rule must have at least one condition, so a typo can never match the whole catalog. Rules that would change nothing (an agent already blocked) are shown but not counted. Write actions need a signed-in administrator and cannot run unattended.
+A rule must have at least one condition, so a typo can never match the whole catalog. Rules that would change nothing (an agent already blocked) are shown but not counted. Write actions need a signed-in administrator; there is no app-only option.
 
 ### Snapshots and change reports
 
@@ -440,10 +441,10 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 ## Limitations
 
-- **Beta APIs.** Everything targets `/beta` and can change without notice.
+- **Beta APIs.** Block, unblock, reassign and the Entra agent-identity calls target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
 - **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
-- **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and cannot run unattended.
+- **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in until it expires; the run then fails and someone signs in again.
 - **Retention.** Advanced Hunting keeps about 30 days. The Purview audit log keeps what your licence allows (180 days or one year).
 - **Audit searches are slow and permanent.** See [AI activity from Purview](#ai-activity-from-purview).
 
@@ -557,4 +558,4 @@ Dot-sourcing the script (`. .\Agent365-Bulk-Actions.ps1`) loads its functions wi
 
 ## Disclaimer
 
-Provided as-is, without warranty of any kind. It targets `/beta` Microsoft Graph APIs that can change without notice. Not an official Microsoft product. Test in a non-production tenant first. See [LICENSE](LICENSE).
+Provided as-is, without warranty of any kind. Part of it targets `/beta` Microsoft Graph APIs that can change without notice. Not an official Microsoft product. Test in a non-production tenant first. See [LICENSE](LICENSE).

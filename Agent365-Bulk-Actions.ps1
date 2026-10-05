@@ -5,16 +5,16 @@
   review risky AI activity, apply policy files, take snapshots, and use a graphical console.
 
 .DESCRIPTION
-  Calls Microsoft Graph beta:
-    GET   /copilot/admin/catalog/packages                 list and details
-    POST  /copilot/admin/catalog/packages/{id}/block      block (and /unblock)
-    POST  /copilot/admin/catalog/packages/{id}/reassign   change the owner
-    PATCH /copilot/admin/catalog/packages/{id}            who can use the agent
+  Calls Microsoft Graph:
+    GET   /v1.0/copilot/admin/catalog/packages                 list and details
+    PATCH /v1.0/copilot/admin/catalog/packages/{id}            who can use the agent
+    POST  /beta/copilot/admin/catalog/packages/{id}/block      block (and /unblock)
+    POST  /beta/copilot/admin/catalog/packages/{id}/reassign   change the owner
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
 
   Writes are delegated-only (no app-only permission exists), so the script signs in an interactive administrator
-  and requests only the permissions the chosen mode needs. Requires an Agent 365 license. /beta is not for production.
+  and requests only the permissions the chosen mode needs. Requires an Agent 365 license. Block, unblock, reassign and the Entra agent-identity calls use /beta, which is not for production.
   Every write previews first, asks once (-Force skips the question) and can write a log (-OutFile) that -Undo reverses.
 
 .PARAMETER TenantId
@@ -265,7 +265,10 @@ $script:LoadOnly = ($MyInvocation.InvocationName -eq '.')
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Accountability') -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
 if ($Action -eq 'assign' -and $PSCmdlet.ParameterSetName -ne 'Accountability') { throw '-Action assign is only valid with -Accountability.' }
 if ($Action -eq 'reassign' -and $PSCmdlet.ParameterSetName -ne 'Ownerless') { throw '-Action reassign is only valid with -Ownerless. Use -Reassign <agents> -To <user> for manual assignment.' }
-$Base = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
+# Reading packages and changing who can use them are on v1.0. Block, unblock and reassign exist only on beta
+# (v1.0 answers "Resource not found for the segment 'block'").
+$Base = 'https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages'
+$BaseBeta = 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages'
 
 # Advanced Hunting keeps ~30 days, so an agent last seen before the cutoff can only be found when
 # the cutoff is inside that window. At 30+ days only "no activity at all in the window" is provable.
@@ -680,7 +683,7 @@ function Invoke-OwnerReassign {
         if (-not (Test-Proceed ("{0} -> {1}" -f $i.DisplayName, $i.NewOwnerUpn) 'Reassign')) { $rec.Result = 'WhatIf' }
         else {
             try {
-                Invoke-Graph -Method POST -Uri "$Base/$($i.Id)/reassign" -Body (@{ userId = $i.NewOwnerId } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+                Invoke-Graph -Method POST -Uri "$BaseBeta/$($i.Id)/reassign" -Body (@{ userId = $i.NewOwnerId } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
                 Write-Host ("  OK   {0}  ->  {1}" -f $i.DisplayName, $i.NewOwnerUpn) -ForegroundColor Green
                 $rec.Result = 'Done'; $ok++
             } catch {
@@ -2293,7 +2296,7 @@ function Invoke-PackageAction {
             if ($pace -gt 0) { Start-Sleep -Milliseconds ([int]($pace * 1000)) }
             $hitsBefore = Get-ThrottleHits
             try {
-                Invoke-Graph -Method POST -Uri "$Base/$($p.id)/$Action" | Out-Null   # 204
+                Invoke-Graph -Method POST -Uri "$BaseBeta/$($p.id)/$Action" | Out-Null   # 204
                 Write-Host ("  OK   {0}  ({1})" -f $p.displayName, $p.id) -ForegroundColor Green
                 $rec.Result = 'Done'; $ok++
             } catch {
