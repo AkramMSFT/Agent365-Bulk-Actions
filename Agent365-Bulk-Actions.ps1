@@ -317,7 +317,8 @@ function Format-GraphError {
     param([string]$Summary, [string]$Detail)
     $request = if ($Detail -match '^\s*(GET|POST|PATCH|PUT|DELETE)\s+https://graph\.microsoft\.com(\S+)') { "$($Matches[1]) $($Matches[2])" } else { '' }
     $service = ''
-    $brace = $Detail.IndexOf('{"')
+    # The body, not the diagnostic header that also holds JSON.
+    $brace = $Detail.IndexOf('{"error"')
     if ($brace -ge 0) {
         try {
             $e = ($Detail.Substring($brace) | ConvertFrom-Json).error
@@ -3689,6 +3690,7 @@ function New-ConsoleWindow {
         & $script:ctx.Idle ("{0}: {1} reassigned, {2} failed. Log: {3}" -f $Label, $done, $failed, $script:OutFile)
         if ($failed) {
             $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            if ($why -match 'FailedDependency|424') { $why += "`n`nThe service reported a failed dependency and gave no reason. Every reassignment that failed this way so far was for an agent whose previous owner was missing or deleted. Set the owner in Copilot Studio itself for those agents." }
             [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some reassignments failed', 'OK', 'Warning')
         }
     }
