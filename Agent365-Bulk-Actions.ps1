@@ -2833,7 +2833,10 @@ $RestrictXaml = @'
         WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <StackPanel Margin="28,24,28,22">
     <TextBlock Text="Restrict who can use the selected agents" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
-    <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
+    <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,10" TextWrapping="Wrap"/>
+    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB" Margin="0,0,0,16">
+      <ListBox x:Name="Names" MaxHeight="96" BorderThickness="0" Background="Transparent" Padding="6,4" ToolTip="The selected agents and who can use each one now. This list is only for review."/>
+    </Border>
     <RadioButton GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
     <RadioButton x:Name="OptOwner" GroupName="scope" Margin="0,0,0,8" Content="Its owner only"/>
     <RadioButton x:Name="OptUsers" GroupName="scope" Margin="0,0,0,6" Content="These users and groups, picked from Entra"/>
@@ -2859,10 +2862,8 @@ $RestrictXaml = @'
       </Border>
     </StackPanel>
     <RadioButton x:Name="OptAll" GroupName="scope" Margin="0,0,0,12" Content="Everyone (reopen the agent)"/>
-    <CheckBox x:Name="Deploy" Margin="0,0,0,12" Content="Also change who the agent is deployed to" ToolTip="Deployment is the set of people it is installed for; availability is the set who may use it."/>
-    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB">
-      <ListBox x:Name="Names" MaxHeight="110" BorderThickness="0" Background="Transparent" Padding="6,4"/>
-    </Border>
+    <CheckBox x:Name="Deploy" Margin="0,0,0,4" Content="Also apply this choice to deployment" ToolTip="Deployment is the set of people the agent is installed for; availability is the set who may use it."/>
+    <TextBlock Margin="22,0,0,0" Foreground="#6B7280" FontSize="12" TextWrapping="Wrap" Text="Deployment follows the choice above: nobody, the same users and groups, or everyone. Leave it unticked to change only who can use the agent."/>
     <TextBlock x:Name="Note" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap" Text="Reverse this with Undo last run, or by choosing Everyone."/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
       <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" MinWidth="100" Margin="0,0,10,0"/>
