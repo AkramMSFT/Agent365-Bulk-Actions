@@ -10,6 +10,7 @@
     PATCH /v1.0/copilot/admin/catalog/packages/{id}            who can use the agent
     POST  /beta/copilot/admin/catalog/packages/{id}/block      block (and /unblock)
     POST  /beta/copilot/admin/catalog/packages/{id}/reassign   change the owner
+    POST  /beta/identityProtection/riskyAgents/confirmCompromised   mark an agent identity compromised (and /dismiss)
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
 
@@ -19,6 +20,10 @@
 
 .PARAMETER TenantId
   Optional. Target a specific tenant (GUID or domain). If omitted, sign-in uses your account's home tenant.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -SignIn
+  Sign in once from a terminal with every permission the tool can use. Later runs, scheduled ones included, reuse the saved session without a prompt.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
@@ -51,6 +56,10 @@
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -Restrict "Contoso HR Agent" -AvailableTo Some -OwnerOnly
   Make an agent available to its owner only (a softer step than blocking; -Undo restores the old scope).
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -ConfirmCompromised "Contoso HR Agent"
+  Confirm the agent's Entra identity as compromised (risk level High). -Undo <log> or -DismissRisk clears it.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -AiActivity -AiDays 7 -RiskyOnly
@@ -159,6 +168,16 @@ param(
     [Parameter(ParameterSetName = 'AddSponsor')]
     [switch]$AsOwner,                        # AddSponsor: add -To as owner instead of sponsor
 
+    [Parameter(ParameterSetName = 'Compromise', Mandatory)]
+    [string[]]$ConfirmCompromised,           # confirm these agents' Entra identities as compromised (Entra ID Protection sets the risk level to High)
+
+    [Parameter(ParameterSetName = 'DismissRisk', Mandatory)]
+    [string[]]$DismissRisk,                  # dismiss the Entra ID Protection risk of these agents' identities
+
+    [Parameter(ParameterSetName = 'Compromise')]
+    [Parameter(ParameterSetName = 'DismissRisk')]
+    [ValidateRange(0, 900)][int]$WaitSeconds = 240,   # Compromise, DismissRisk: seconds to wait for Entra to show the new state (0 = do not wait)
+
     [Parameter(ParameterSetName = 'Policy', Mandatory)]
     [string]$Policy,                         # path to a JSON policy file; prints the plan (no changes without -Apply)
 
@@ -254,6 +273,9 @@ param(
     [Parameter(ParameterSetName = 'Risky')]
     [switch]$Pick,                            # choose WHICH stale/risky agents to act on via the picker
 
+    [Parameter(ParameterSetName = 'SignIn', Mandatory)]
+    [switch]$SignIn,                          # sign in once from a terminal with every permission the tool can use; later runs reuse the saved session
+
     [string]$TenantId,                        # optional: target a specific tenant (default = home tenant)
 
     [switch]$DeviceCode
@@ -285,9 +307,28 @@ if (-not $script:LoadOnly -and -not (Get-Module -ListAvailable -Name Microsoft.G
 }
 if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 
+# Every permission the tool can use. -SignIn asks for all of them once, so no later mode has to prompt.
+$script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
+                      'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
+                      'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All')
+
+# A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
+# non-interactive shell) fails with a message about window handles, which says nothing useful.
+function Get-SignInHelp {
+    param([string]$Message)
+    if ($Message -match 'window handle|InteractiveBrowserCredential|interactive') {
+        return ('There is no saved sign-in that covers the permissions this mode needs, and this session cannot show a sign-in window. ' +
+                'In a terminal on this PC, as the account that runs the tool, run: .\Agent365-Bulk-Actions.ps1 -SignIn. ' +
+                'It signs in once; later runs, scheduled ones included, reuse it. (Original error: ' + $Message.Split("`n")[0].Trim() + ')')
+    }
+    if ($Message -match 'timed out') {
+        return ($Message.Trim() + ' A device code must be entered within two minutes. Run .\Agent365-Bulk-Actions.ps1 -SignIn in a terminal instead, which has no such limit.')
+    }
+    $Message
+}
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
-$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory')) -or
+$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory', 'Compromise', 'DismissRisk')) -or
             ($PSCmdlet.ParameterSetName -eq 'Policy' -and -not $Apply) -or
             ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless', 'Accountability') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
@@ -298,6 +339,8 @@ if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'Age
 if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory', 'AiActivity')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'AiActivity') { $scopes += 'AuditLogsQuery.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Restrict') { $scopes += 'User.Read.All'; if ($AllowGroups) { $scopes += 'Group.Read.All' } }
+if ($PSCmdlet.ParameterSetName -in @('Compromise', 'DismissRisk')) { $scopes += 'IdentityRiskyAgent.ReadWrite.All' }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'confirmcompromised')) { $scopes += 'IdentityRiskyAgent.ReadWrite.All' }
 if ($PSCmdlet.ParameterSetName -in @('Accountability', 'AddSponsor')) {
     $scopes += 'User.Read.All', 'AgentIdentity.Read.All'
     if ($Action -eq 'assign' -or $PSCmdlet.ParameterSetName -eq 'AddSponsor') { $scopes += 'AgentIdentity.ReadWrite.All' }
@@ -310,10 +353,13 @@ if ($PSCmdlet.ParameterSetName -eq 'Policy' -and (Test-Path -LiteralPath $Policy
 }
 if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
+if ($PSCmdlet.ParameterSetName -eq 'SignIn') { $scopes = $script:AllScopes }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
-if (-not $script:LoadOnly) { Connect-MgGraph @connect }
+if (-not $script:LoadOnly) {
+    try { Connect-MgGraph @connect } catch { throw (Get-SignInHelp $_.Exception.Message) }
+}
 
 $script:ThrottleHits = 0   # incremented on every throttled retry; write loops watch it to adapt their pace
 function Add-ThrottleHit { $script:ThrottleHits++ }
@@ -1000,6 +1046,130 @@ function Invoke-AccountabilityRemove {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Entra ID Protection for agents: confirm an agent identity as compromised, or dismiss its risk.
+# Confirming sets the risk level to High; a Conditional Access policy that blocks high agent risk then enforces it.
+# These calls exist on beta only.
+# ---------------------------------------------------------------------------------------------
+$script:RiskBase = 'https://graph.microsoft.com/beta/identityProtection/riskyAgents'
+
+# Entra's current risk record per agent identity. An identity Entra has never flagged has no record (404): that is "none".
+# An identity that cannot be read (for example without the Security roles) maps to $null.
+function Get-AgentRiskStates {
+    param([string[]]$IdentityIds)
+    $states = @{}
+    $ids = @($IdentityIds | Where-Object { $_ } | Get-Distinct)
+    if ($ids.Count -eq 0) { return $states }
+    $res = Invoke-GraphBatch -Version beta -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = "/identityProtection/riskyAgents/$_" } })
+    foreach ($id in $ids) {
+        $r = $res[$id]
+        $states[$id] = if ($r -and $r.Status -eq 200) { [pscustomobject]@{ Level = [string]$r.Body.riskLevel; State = [string]$r.Body.riskState; Detail = [string]$r.Body.riskDetail } }
+                       elseif ($r -and $r.Status -eq 404) { [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = '' } }
+                       else { $null }
+    }
+    $states
+}
+
+function Format-AgentRisk {
+    param([object]$State)
+    if (-not $State) { return 'unknown' }
+    if ($State.State -in 'none', '') { return 'not flagged' }
+    '{0} ({1})' -f $State.Level, $State.State
+}
+
+function Show-RiskPreview {
+    param([object[]]$Packages, [hashtable]$States)
+    $Packages | Select-Object @{ n = 'agent'; e = { $_.displayName } }, @{ n = 'platform'; e = { $_.platform } },
+        @{ n = 'Entra risk now'; e = { Format-AgentRisk $States[[string]$_.agentIdentityId] } } | Format-Table -AutoSize | Out-Host
+}
+
+# What to know before dismissing: an identity Entra had flagged before it was confirmed loses that earlier risk too, and a
+# confirmation Entra had not shown yet may still appear after the dismissal, so it needs another -DismissRisk later.
+function Get-DismissNote {
+    param([object[]]$Records)
+    $notes = @()
+    $was = @($Records | Where-Object { [string]$_.WasRiskState -eq 'atRisk' } | ForEach-Object { $_.DisplayName })
+    if ($was.Count) { $notes += 'Already at risk in Entra before it was confirmed: {0}. Dismissing clears that earlier risk too.' -f ($was -join ', ') }
+    $unseen = @($Records | Where-Object { [string]$_.Verified -eq 'False' } | ForEach-Object { $_.DisplayName })
+    if ($unseen.Count) { $notes += 'Entra had not shown the confirmation yet for: {0}. If it appears later, dismiss it again.' -f ($unseen -join ', ') }
+    $notes -join ' '
+}
+# Confirm each agent's Entra identity as compromised, or dismiss its risk. The state before is read first and logged; an
+# identity already in the target state is skipped. Entra applies the change a minute or two after it accepts the request, so
+# the new state is read back for up to -WaitSeconds. One that has not shown it by then is logged as accepted but not verified.
+function Invoke-AgentRiskAction {
+    param([object[]]$Packages, [ValidateSet('confirmCompromised', 'dismiss')][string]$Action = 'confirmCompromised',
+          [ValidateRange(0, 900)][int]$WaitSeconds = 240, [switch]$PassThru)
+    $targets = @($Packages | Where-Object { $_.agentIdentityId })
+    if ($targets.Count -eq 0) { Write-Host 'Nothing to change.'; return }
+    $who = (Get-MgContext).Account
+    $confirm = $Action -eq 'confirmCompromised'
+    $expected = if ($confirm) { 'confirmedCompromised' } else { 'dismissed' }
+    Write-Host ("`n{0} {1} agent identit{2}:" -f $(if ($confirm) { 'Confirm as compromised' } else { 'Dismiss the risk of' }), $targets.Count, $(if ($targets.Count -eq 1) { 'y' } else { 'ies' })) -ForegroundColor Cyan
+    $before = Get-AgentRiskStates @($targets | ForEach-Object { $_.agentIdentityId })
+    $recs = New-Object 'System.Collections.Generic.List[object]'; $sent = New-Object 'System.Collections.Generic.List[object]'; $skip = 0; $fail = 0
+    foreach ($p in $targets) {
+        $idn = [string]$p.agentIdentityId
+        $prev = $before[$idn]
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action.ToLowerInvariant()
+            Id = $p.id; DisplayName = $p.displayName; IdentityId = $idn
+            WasRiskLevel = $(if ($prev) { $prev.Level } else { '' }); WasRiskState = $(if ($prev) { $prev.State } else { '' })
+            NowRiskLevel = ''; NowRiskState = ''; Verified = ''; Result = ''; Error = ''
+        }
+        $already = if (-not $prev) { $false } elseif ($confirm) { $prev.State -eq 'confirmedCompromised' } else { $prev.State -notin 'atRisk', 'confirmedCompromised' }
+        if ($already) {
+            Write-Host ("  SKIP {0}  (Entra risk: {1})" -f $p.displayName, (Format-AgentRisk $prev)) -ForegroundColor DarkGray
+            $rec.Result = 'Skipped'; $skip++
+        }
+        elseif (-not (Test-Proceed ("{0}: {1}" -f $p.displayName, $(if ($confirm) { 'confirm as compromised' } else { 'dismiss the risk' })) 'Change Entra risk')) { $rec.Result = 'WhatIf' }
+        else {
+            try {
+                Invoke-Graph -Method POST -Uri "$script:RiskBase/$Action" -Body (@{ agentIds = @($idn) } | ConvertTo-Json -Compress) -ContentType 'application/json' | Out-Null
+                $rec.Result = 'Done'; $rec.Verified = $false; $sent.Add($rec)
+            } catch {
+                $msg = $_.Exception.Message
+                if ($msg -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $msg += ' (this needs the Security Administrator role and the IdentityRiskyAgent.ReadWrite.All permission)' }
+                Write-Host ("  FAIL {0}  -> {1}" -f $p.displayName, $msg) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $msg; $fail++
+            }
+        }
+        $recs.Add($rec)
+    }
+    if ($sent.Count -gt 0 -and $WaitSeconds -gt 0) {
+        Write-Host ("Entra applies this a minute or two after it accepts it. Checking for up to {0} seconds " -f $WaitSeconds) -ForegroundColor DarkGray -NoNewline
+        $rounds = [math]::Ceiling($WaitSeconds / 10)
+        for ($round = 0; $round -le $rounds; $round++) {
+            $waiting = @($sent | Where-Object { -not $_.Verified })
+            if ($waiting.Count -eq 0) { break }
+            if ($round -gt 0) { Write-Host '.' -ForegroundColor DarkGray -NoNewline; Start-Sleep -Seconds 10 }
+            $now = Get-AgentRiskStates @($waiting | ForEach-Object { $_.IdentityId })
+            foreach ($rec in $waiting) {
+                $s = $now[[string]$rec.IdentityId]
+                if (-not $s) { continue }
+                $rec.NowRiskLevel = $s.Level; $rec.NowRiskState = $s.State
+                if ($s.State -eq $expected) { $rec.Verified = $true }
+            }
+        }
+        Write-Host ''
+    }
+    $seen = 0
+    foreach ($rec in $sent) {
+        if ($rec.Verified) { $seen++; Write-Host ("  OK   {0}  ->  Entra risk: {1}" -f $rec.DisplayName, (Format-AgentRisk ([pscustomobject]@{ Level = $rec.NowRiskLevel; State = $rec.NowRiskState }))) -ForegroundColor Green }
+        else { Write-Host ("  SENT {0}  accepted by Entra; the new state is not visible yet and can take a few minutes" -f $rec.DisplayName) -ForegroundColor Yellow }
+    }
+    Write-Host ("Done: {0} {1} ({2} seen in Entra), {3} already in that state, {4} failed." -f $sent.Count, $(if ($confirm) { 'confirmed' } else { 'dismissed' }), $seen, $skip, $fail) -ForegroundColor Cyan
+    if ($sent.Count -gt $seen) { Write-Host 'Check the Risky agents report in Microsoft Entra in a few minutes to see the new state.' -ForegroundColor Yellow }
+    $log = @($recs | ForEach-Object { [pscustomobject]$_ })
+    Export-ActionLog -Records $log
+    if ($PassThru) { $log }
+}
+
+# Undo for a confirmation: dismiss the risk of the identities a logged run confirmed. The API has no call back to the state before.
+function Invoke-AgentRiskDismiss {
+    param([object[]]$Records, [ValidateRange(0, 900)][int]$WaitSeconds = 240, [switch]$PassThru)
+    $packages = @($Records | ForEach-Object { [pscustomobject]@{ id = $_.Id; displayName = $_.DisplayName; agentIdentityId = $_.IdentityId; platform = '' } })
+    Invoke-AgentRiskAction -Packages $packages -Action dismiss -WaitSeconds $WaitSeconds -PassThru:$PassThru
+}# ---------------------------------------------------------------------------------------------
 # Policy file: declare rules once, review the plan, apply it. Conditions inside a rule combine
 # with AND (or OR when "match": "any"). Without -Apply nothing is changed.
 # ---------------------------------------------------------------------------------------------
@@ -2733,7 +2903,15 @@ $GuiXaml = @'
         <StackPanel Grid.Row="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,10,0,0">
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Adds the suggested owner (or sponsor) to the ticked agents. Choose an Ownership filter first: Needs an owner, Missing an Entra sponsor, or Missing a sponsor or owner. Only rows that show a suggestion can be applied."/>
           <Button x:Name="BtnRestrict" Content="Restrict access..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Narrow who can use the selected agents (nobody, their owner, named users and groups) or reopen them. A softer step than Block; the old scope is saved for Undo."/>
-          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
+          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
+          <Button x:Name="BtnCompromise" Content="Entra risk &#9662;" Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Entra ID Protection actions for the selected agents' identities: confirm them as compromised (risk level High, which a Conditional Access policy that blocks high agent risk then enforces) or clear that flag. Needs the Security Administrator role.">
+            <Button.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="Confirm as compromised..." ToolTip="Entra sets the risk level to High. Undo last run dismisses it."/>
+                <MenuItem Header="Clear the compromised flag..." ToolTip="Dismiss the Entra risk of the selected agents. Entra shows them as dismissed afterwards."/>
+              </ContextMenu>
+            </Button.ContextMenu>
+          </Button>
         </StackPanel>
         <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
           <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
@@ -3401,7 +3579,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -3450,7 +3628,7 @@ function New-ConsoleWindow {
     $script:ctx.Summary = {
         $script:ctx.SummaryTimer.Stop()
         $total = 0; $blocked = 0; $selected = 0
-        $canBlock = $false; $canUnblock = $false; $canAssign = $false; $canApply = $false
+        $canBlock = $false; $canUnblock = $false; $canAssign = $false; $canApply = $false; $canCompromise = $false
         foreach ($r in $script:ctx.Rows) {
             $total++
             if ($r.IsBlocked) { $blocked++ }
@@ -3459,6 +3637,7 @@ function New-ConsoleWindow {
             if ($r.IsBlocked) { $canUnblock = $true } else { $canBlock = $true }
             if (-not $canAssign -and (Test-Reassignable $r.Package)) { $canAssign = $true }
             if (-not $canApply -and $script:ctx.Suggest.ContainsKey($r.Id)) { $canApply = $true }
+            if (-not $canCompromise -and $r.Package.agentIdentityId) { $canCompromise = $true }
         }
         $shown = @($script:ctx.View).Count
         $script:ui.CountTotal.Text = $total
@@ -3470,6 +3649,7 @@ function New-ConsoleWindow {
         $script:ui.BtnUndo.IsEnabled = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
         $script:ui.BtnAssign.IsEnabled = $canAssign
         $script:ui.BtnApplyOwner.IsEnabled = $canApply
+        $script:ui.BtnCompromise.IsEnabled = $canCompromise
         $script:ui.BtnRestrict.IsEnabled = $selected -gt 0
         $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
         $script:ui.EmptyText.Text = if ($total -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
@@ -3908,6 +4088,83 @@ function New-ConsoleWindow {
         }
     })
 
+    # The Entra risk of the ticked agents, after asking for the permission. Returns $null (having said why) when it cannot be read.
+    $script:ctx.ReadRisk = {
+        param([object[]]$Rows)
+        try {
+            if (-not (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All')) { & $script:ctx.Busy 'Granting access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.ReadWrite.All' }
+            & $script:ctx.Busy 'Reading the Entra risk of the selected agents...'
+            Get-AgentRiskStates @($Rows | ForEach-Object { $_.Package.agentIdentityId })
+        } catch { & $script:ctx.Idle 'Could not read agent risk.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Entra agent risk', 'OK', 'Error'); $null }
+    }
+    $script:ctx.RiskList = {
+        param([object[]]$Rows, [hashtable]$States)
+        $list = ($Rows | Select-Object -First 12 | ForEach-Object { "  - {0}    (Entra risk now: {1})" -f $_.Name, (Format-AgentRisk $States[[string]$_.Package.agentIdentityId]) }) -join "`n"
+        if ($Rows.Count -gt 12) { $list += "`n  ... and $($Rows.Count - 12) more" }
+        $list
+    }
+
+    $script:ctx.ConfirmCompromised = {
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $_.Package.agentIdentityId })
+        if ($rows.Count -eq 0) { return }
+        $states = & $script:ctx.ReadRisk $rows
+        if ($null -eq $states) { return }
+        $pending = @($rows | Where-Object { $s = $states[[string]$_.Package.agentIdentityId]; -not $s -or $s.State -ne 'confirmedCompromised' })
+        if ($pending.Count -eq 0) { & $script:ctx.Idle 'Those agents are already confirmed as compromised.'; return }
+        $text = "Confirm $($pending.Count) agent$(if ($pending.Count -ne 1) { 's' }) as compromised in Microsoft Entra?`n`n$(& $script:ctx.RiskList $pending $states)`n`nEntra sets the risk level to High. A Conditional Access policy that blocks high agent risk then blocks them. Undo last run dismisses the risk."
+        if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Warning', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
+        & $script:ctx.NewLogPath 'compromise'
+        & $script:ctx.Busy ("Confirming {0} agent(s) as compromised..." -f $pending.Count)
+        $recs = @(Invoke-AgentRiskAction -Packages @($pending | ForEach-Object { $_.Package }) -Action confirmCompromised -WaitSeconds 0 -PassThru)
+        foreach ($rec in @($recs | Where-Object { $_.Result -in 'Done', 'Skipped' })) {
+            $row = $script:ctx.RowById[[string]$rec.Id]
+            if ($row) { $row.Checked = $false }
+        }
+        $script:ctx.LastRun = @($recs | Where-Object { $_.Result -eq 'Done' })
+        $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("Compromised: {0} accepted by Entra, {1} failed. Entra shows the new state in the Risky agents report within a few minutes. Log: {2}" -f $script:ctx.LastRun.Count, $failed.Count, $script:OutFile)
+        if ($failed.Count) {
+            $why = Get-FailureSummary $failed
+            [void][Windows.MessageBox]::Show("$($failed.Count) agent(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
+        }
+    }
+
+    $script:ctx.ClearCompromised = {
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $_.Package.agentIdentityId })
+        if ($rows.Count -eq 0) { return }
+        $states = & $script:ctx.ReadRisk $rows
+        if ($null -eq $states) { return }
+        $pending = @($rows | Where-Object { $s = $states[[string]$_.Package.agentIdentityId]; -not $s -or $s.State -in 'atRisk', 'confirmedCompromised' })
+        if ($pending.Count -eq 0) { & $script:ctx.Idle 'None of the selected agents has an active Entra risk to clear.'; return }
+        $text = "Clear the Entra risk of $($pending.Count) agent$(if ($pending.Count -ne 1) { 's' })?`n`n$(& $script:ctx.RiskList $pending $states)`n`nThis dismisses the risk, whether it was confirmed by an administrator or raised by Entra, so a Conditional Access policy that blocks high agent risk stops blocking them. Entra then shows them as dismissed, and the earlier detection stays in its history. Entra applies it within a few minutes."
+        if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
+        & $script:ctx.NewLogPath 'clear-risk'
+        & $script:ctx.Busy ("Clearing the Entra risk of {0} agent(s)..." -f $pending.Count)
+        $recs = @(Invoke-AgentRiskAction -Packages @($pending | ForEach-Object { $_.Package }) -Action dismiss -WaitSeconds 0 -PassThru)
+        foreach ($rec in @($recs | Where-Object { $_.Result -in 'Done', 'Skipped' })) {
+            $row = $script:ctx.RowById[[string]$rec.Id]
+            if ($row) { $row.Checked = $false }
+        }
+        # A dismissal cannot be undone, so it is not offered to Undo last run.
+        $script:ctx.LastRun = @()
+        $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("Clear flag: {0} accepted by Entra, {1} had no active risk, {2} failed. Entra shows it within a few minutes. Log: {3}" -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count, $failed.Count, $script:OutFile)
+        if ($failed.Count) {
+            $why = Get-FailureSummary $failed
+            [void][Windows.MessageBox]::Show("$($failed.Count) agent(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
+        }
+    }
+
+    $script:ui.BtnCompromise.Add_Click({
+        $m = $script:ui.BtnCompromise.ContextMenu
+        $m.PlacementTarget = $script:ui.BtnCompromise
+        $m.Placement = 'Top'
+        $m.IsOpen = $true
+    })
+    $script:ui.BtnCompromise.ContextMenu.Items[0].Add_Click({ & $script:ctx.ConfirmCompromised })
+    $script:ui.BtnCompromise.ContextMenu.Items[1].Add_Click({ & $script:ctx.ClearCompromised })
     $script:ui.BtnAssign.Add_Click({
         $checked = @($script:ctx.Rows | Where-Object { $_.Checked })
         $rows = @($checked | Where-Object { Test-Reassignable $_.Package })
@@ -3948,7 +4205,16 @@ function New-ConsoleWindow {
             & $script:ctx.Idle ("Restored access for {0} agent(s)." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count)
             return
         }
-        if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
+        if ($done.Count -gt 0 -and $done[0].Action -eq 'confirmcompromised') {
+            $note = Get-DismissNote $done
+            $ask = "Dismiss the compromised flag of $($done.Count) agent$(if ($done.Count -ne 1) { 's' }) in Microsoft Entra?" + $(if ($note) { "`n`n$note" } else { '' })
+            if ([Windows.MessageBox]::Show($ask, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            $recs = @(Invoke-AgentRiskDismiss -Records $done -WaitSeconds 0 -PassThru)
+            $script:ctx.LastRun = @()
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("Dismissal accepted for {0} agent(s), {1} had no Entra risk to dismiss. Entra shows it within a few minutes." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count)
+            return
+        }        if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
             if ([Windows.MessageBox]::Show("Remove the sponsor or owner added to $($done.Count) agent identit$(if ($done.Count -eq 1) { 'y' } else { 'ies' })?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
             Invoke-AccountabilityRemove -Records $done
             $script:ctx.LastRun = @()
@@ -4117,6 +4383,40 @@ switch ($PSCmdlet.ParameterSetName) {
         if (-not (Confirm-Batch -Count $items.Count -Action 'add accountability for')) { Write-Host 'Cancelled.'; break }
         Invoke-AccountabilityAssign -Items $items
     }
+    'SignIn' {
+        $c = Get-MgContext
+        Write-Host ("Signed in as {0} (tenant {1})." -f $c.Account, $c.TenantId) -ForegroundColor Green
+        $missing = @($script:AllScopes | Where-Object { @($c.Scopes) -notcontains $_ })
+        if ($missing.Count) { Write-Warning ("Not granted, so the modes that need them will ask again: {0}" -f ($missing -join ', ')) }
+        Write-Host 'The session is saved for this Windows account. Later runs, scheduled ones included, reuse it without a prompt until it expires or is revoked.' -ForegroundColor Cyan
+    }    'Compromise' {
+        $targets = @(Resolve-Packages $ConfirmCompromised)
+        $noIdentity = @($targets | Where-Object { -not $_.agentIdentityId })
+        if ($noIdentity.Count) { Write-Warning ("No Entra agent identity, skipped: {0}" -f (($noIdentity | ForEach-Object { $_.displayName }) -join '; ')) }
+        $withId = @($targets | Where-Object { $_.agentIdentityId })
+        if ($withId.Count -eq 0) { break }
+        $states = Get-AgentRiskStates @($withId | ForEach-Object { $_.agentIdentityId })
+        Show-RiskPreview -Packages $withId -States $states
+        $pending = @($withId | Where-Object { $s = $states[[string]$_.agentIdentityId]; -not $s -or $s.State -ne 'confirmedCompromised' })
+        if ($pending.Count -eq 0) { Write-Host 'Every one is already confirmed as compromised.'; break }
+        Write-Host ("{0} agent identit{1} will be confirmed as compromised. Entra sets the risk level to High, and a Conditional Access policy that blocks high agent risk then blocks them. -Undo or -DismissRisk clears it." -f
+            $pending.Count, $(if ($pending.Count -eq 1) { 'y' } else { 'ies' })) -ForegroundColor Yellow
+        if (-not (Confirm-Batch -Count $pending.Count -Action 'confirm as compromised')) { Write-Host 'Cancelled.'; break }
+        Invoke-AgentRiskAction -Packages $withId -Action confirmCompromised -WaitSeconds $WaitSeconds
+    }
+    'DismissRisk' {
+        $targets = @(Resolve-Packages $DismissRisk)
+        $noIdentity = @($targets | Where-Object { -not $_.agentIdentityId })
+        if ($noIdentity.Count) { Write-Warning ("No Entra agent identity, skipped: {0}" -f (($noIdentity | ForEach-Object { $_.displayName }) -join '; ')) }
+        $withId = @($targets | Where-Object { $_.agentIdentityId })
+        if ($withId.Count -eq 0) { break }
+        $states = Get-AgentRiskStates @($withId | ForEach-Object { $_.agentIdentityId })
+        Show-RiskPreview -Packages $withId -States $states
+        $pending = @($withId | Where-Object { $s = $states[[string]$_.agentIdentityId]; -not $s -or $s.State -in 'atRisk', 'confirmedCompromised' })
+        if ($pending.Count -eq 0) { Write-Host 'None of them has an active risk to dismiss.'; break }
+        if (-not (Confirm-Batch -Count $pending.Count -Action 'dismiss the Entra risk of')) { Write-Host 'Cancelled.'; break }
+        Invoke-AgentRiskAction -Packages $withId -Action dismiss -WaitSeconds $WaitSeconds
+    }
     'Ownerless' {
         $report = Get-OwnerReport -Packages @(Get-Packages)
         Write-Host ("`nShared agents: {0} have a valid owner, {1} need attention. {2} org-published and {3} ownerless Copilot Studio agent(s) cannot be reassigned through the API." -f
@@ -4158,6 +4458,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $ownerChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'reassign' })
         $accessChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'restrict' })
         $accountChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'addsponsor', 'addowner' })
+        $riskChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'confirmcompromised' })
         if ($accessChanges.Count -gt 0) {
             $accessChanges | Select-Object DisplayName, @{ n = 'now'; e = { Get-AccessLabel $_.NewAvailableTo } }, @{ n = 'restoreTo'; e = { Get-AccessLabel $_.WasAvailableTo } } | Format-Table -AutoSize | Out-Host
             if (Confirm-Batch -Count $accessChanges.Count -Action 'restore access for') { Invoke-AccessRestore -Records $accessChanges }
@@ -4165,6 +4466,12 @@ switch ($PSCmdlet.ParameterSetName) {
         if ($accountChanges.Count -gt 0) {
             $accountChanges | Select-Object DisplayName, Action, User | Format-Table -AutoSize | Out-Host
             if (Confirm-Batch -Count $accountChanges.Count -Action 'remove accountability for') { Invoke-AccountabilityRemove -Records $accountChanges }
+        }
+        if ($riskChanges.Count -gt 0) {
+            $riskChanges | Select-Object DisplayName, @{ n = 'before'; e = { $_.WasRiskState } }, @{ n = 'now'; e = { $_.NowRiskState } } | Format-Table -AutoSize | Out-Host
+            $note = Get-DismissNote $riskChanges
+            if ($note) { Write-Warning $note }
+            if (Confirm-Batch -Count $riskChanges.Count -Action 'dismiss the compromised flag of') { Invoke-AgentRiskDismiss -Records $riskChanges }
         }
         if ($ownerChanges.Count -gt 0) {
             Initialize-UserCache -Ids @($ownerChanges | ForEach-Object { $_.WasOwner })
@@ -4176,7 +4483,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $back = @($back)
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
-        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $byId = @{}
         foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
         $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
