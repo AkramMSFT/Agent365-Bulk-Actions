@@ -295,6 +295,21 @@ DSPM's **Activity Explorer > AI activities** tab has no API of its own. It is a 
 
 In the console, select an agent and press **AI activity...** (or open **Details...** and use the **AI activity** tab). Pick a period, press **Load from Purview audit**, and the events appear with the risk coloured. The search is tenant-wide and is reused by every agent you open afterwards. **Risky only** hides the routine events.
 
+Each event reads as one line under **What happened** (for example *Tools: a365outlookmailmcp, UniversalSearchTool; Files: 1; Web pages: 3*, or *Handed to Email communication agent*). Select an event and the pane underneath lists everything the record holds, by section:
+
+- **Event**: time, user, app, conversation and thread ids, client address and region.
+- **Model**: the model and provider, any built-in plugin (such as Bing web search) and the licence.
+- **Tools and MCP**: each connector or MCP server the agent called, with the action.
+- **Files**: SharePoint and OneDrive files read, with their address and whether they carry a sensitivity label.
+- **Web**: pages the agent cited or read, and whether it searched the web.
+- **Protection**: the runtime-protection verdict for every tool call (Allow, Block or Fail) with the detection rule, the tool and the duration, plus the text of any flagged jailbreak or injected instruction.
+- **Messages and Response**: how many prompts and responses the turn had; for an agent response, the channel, the step and any error.
+
+**Whole conversation** lists every event of the highlighted event's conversation, oldest first, so you can follow what led to a block. **All events** returns to the full list. Exports (`-ForAgent ... -OutFile`) include the same columns.
+
+> [!NOTE]
+> **The audit log does not hold the prompt and response text.** It keeps message ids only, apart from the text of a flagged jailbreak or injection. Microsoft's Interaction Export API, which returns prompts and responses, excludes agents built in Copilot Studio, and DSPM shows the text only through its own capture policy in the portal. For the conversation text itself, open the event in Purview (Activity Explorer or eDiscovery) using the conversation id shown here.
+
 | Signal | Where it comes from in the audit record | Risk |
 | --- | --- | --- |
 | Jailbreak attempt | A `JailBreak` entry in the accessed resources, or a message flagged `JailbreakDetected` | High |
