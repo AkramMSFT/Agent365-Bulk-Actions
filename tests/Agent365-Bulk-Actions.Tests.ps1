@@ -1414,6 +1414,15 @@ Describe 'Lookups and helpers' {
         Test-PermissionMatch -Perms $null -Mode 'any' | Should -BeFalse
         Test-PermissionMatch -Perms @([pscustomobject]@{ Kind = 'Application'; Resource = 'Microsoft Graph'; Permission = 'X' }) -Mode 'graphapp' | Should -BeTrue
     }
+    It 'Get-AccessLabel names both availability and deployment values and passes unknown ones through' {
+        Get-AccessLabel 'allowedForAll' | Should -Be 'Everyone'
+        Get-AccessLabel 'allowedForNone' | Should -Be 'Nobody'
+        Get-AccessLabel 'acquiredForNone' | Should -Be 'Nobody'
+        Get-AccessLabel 'acquiredForSome' | Should -Be 'Some users or groups'
+        Get-AccessLabel 'acquiredForAll' | Should -Be 'Everyone'
+        Get-AccessLabel '' | Should -Be ''
+        Get-AccessLabel 'somethingNew' | Should -Be 'somethingNew'
+    }
     It 'ConvertTo-FieldRows returns an array even for a single row, so a grid can bind to it' {
         $one = ConvertTo-FieldRows ([ordered]@{ Field = 'only' })
         $one -is [array] | Should -BeTrue
