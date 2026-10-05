@@ -3,7 +3,7 @@
 A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot administrators. It lists, inspects, contains and governs the agents in the organization catalog in bulk, from the command line or from a desktop console.
 
 > [!IMPORTANT]
-> Block, unblock and reassign, and the Entra agent-identity calls, use Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
+> Block, unblock and reassign, and the Entra agent-identity and agent-risk calls, use Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
 
 ## Contents
 
@@ -23,6 +23,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Restrict who can use an agent](#restrict-who-can-use-an-agent)
   - [AI activity from Purview](#ai-activity-from-purview)
   - [Contain and clean up](#contain-and-clean-up)
+  - [Respond to a compromised agent](#respond-to-a-compromised-agent)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -46,6 +47,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
+| Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
 | Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
 | Console | A desktop window with filters, a details window and buttons for all of the above | `-Gui` |
@@ -64,17 +66,22 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 # 1. Save Agent365-Bulk-Actions.ps1 to a folder and open PowerShell 7 there
 cd C:\Path\To\Scripts
 
-# 2. List the Copilot agents (signs you in and asks for consent on first run)
+# 2. Sign in once from the terminal (every permission the tool can use; later runs reuse it without a prompt)
+.\Agent365-Bulk-Actions.ps1 -SignIn
+
+# 3. List the Copilot agents
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
-# 3. Preview a change before making it
+# 4. Preview a change before making it
 .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf
 
-# 4. Or open the console
+# 5. Or open the console
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-Add `-TenantId <guid-or-domain>` to target a specific tenant, and `-DeviceCode` if the interactive sign-in misbehaves. Everything that changes something prints what it will do, asks once (use `-Force` to skip the question) and can write a log with `-OutFile`.
+**Signing in.** `-SignIn` starts the sign-in from the terminal and keeps the session for your Windows account. Microsoft Entra offers no way to type an administrator's password into a terminal (accounts with multi-factor authentication cannot use it, and this tool never handles a password), so the sign-in itself is completed in the Microsoft sign-in window that opens. After that, every mode, scheduled runs included, reuses the saved session silently until it expires or is revoked. A run that cannot show a window and has no saved session stops with a message that tells you to run `-SignIn`. `-DeviceCode` prints a code instead of opening a window, but the code must be entered within two minutes.
+
+Add `-TenantId <guid-or-domain>` to target a specific tenant. Everything that changes something prints what it will do, asks once (use `-Force` to skip the question) and can write a log with `-OutFile`.
 
 ## Permissions
 
@@ -88,6 +95,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `User.Read.All`, `AgentIdentity.Read.All` | Ownership, accountability, inventory and the console |
 | `AgentIdentity.EnableDisable.All` | `-DisableIdentity` when the tool has to disable an identity itself, and the console |
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
+| `IdentityRiskyAgent.ReadWrite.All` | Reading an agent identity's Entra risk and confirming it compromised or dismissing the risk. Needs the Security Administrator role. The console asks for it only when you use that action. |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
 | `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
@@ -96,7 +104,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 
 - **Preview first.** `-WhatIf` shows what would happen. `-Action list` shows the matched set without acting.
 - **One confirmation per batch.** Each write mode lists its targets and asks once. `-Force` skips the question. A selection made in a picker counts as confirmation.
-- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners, access scope, and removes sponsors or owners the run added.
+- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners and access scope, removes sponsors or owners the run added, and dismisses a compromised flag the run set.
 - **Agents already in the target state are skipped.**
 - **Throttling is handled.** HTTP 429 and transient 5xx responses are retried with the service's delay; large reads are batched and writes are paced.
 - **Errors say why.** A failed call shows the service's own error code and message and the request that failed.
@@ -109,6 +117,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | Graph beta `/copilot/admin/catalog/packages` | Block, unblock and reassign, which `v1.0` does not offer |
 | Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections and the per-agent records (tools, MCP servers, sharing) |
 | Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
+| Graph beta `/identityProtection/riskyAgents` | Reading an agent identity's risk, confirming it compromised or dismissing the risk |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
 
 On each run the tool ensures the `Microsoft.Graph.Authentication` module is present, signs in requesting only the permissions the chosen mode needs, reads the catalog, resolves your targets, applies the action and prints an `OK` or `FAIL` line per agent.
@@ -301,6 +310,21 @@ Things to know:
 - **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
 - **`-DeleteCandidates`** deletes nothing: the catalog API has no delete, and a block lasts until someone reverses it. It lists blocked agents that have stayed blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files and the console's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add others with `-History`) and from the `BlockedAgent` audit events Defender keeps for about 30 days. Agents whose block date is unknown are skipped unless you add `-IncludeUnknown`. Delete them in the admin center (Agents > All agents > Delete, then Deleted > Permanently delete), or through the Power Platform API for Copilot Studio agents.
 
+### Respond to a compromised agent
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -ConfirmCompromised "Contoso HR Agent" -WhatIf       # show each agent's current Entra risk, change nothing
+.\Agent365-Bulk-Actions.ps1 -ConfirmCompromised "Contoso HR Agent" -OutFile .\compromised.csv
+.\Agent365-Bulk-Actions.ps1 -Undo .\compromised.csv                               # dismiss the flag again
+.\Agent365-Bulk-Actions.ps1 -DismissRisk "Contoso HR Agent"                       # dismiss an active risk, with or without a log
+```
+
+- **What it does.** It marks the agent's Entra identity as compromised in Microsoft Entra ID Protection. Entra sets the risk level to High and records an admin-confirmed detection. A Conditional Access policy that blocks high agent risk then blocks the agent; without such a policy the flag alone blocks nothing. To stop the package as well, block it (`-Block`, or **Block selected** in the console).
+- **Preview.** The tool shows each agent's current Entra risk (not flagged, at risk, dismissed, confirmed compromised) before it asks once. An identity that is already confirmed is skipped. An agent with no Entra agent identity is left out with a warning.
+- **Entra applies it with a delay.** Entra accepts the request at once and shows the new state a minute or two later. The tool reads it back for up to `-WaitSeconds` (default 240; 0 does not wait). An agent that has not shown the state by then is logged as accepted but not verified (`Verified` is `False`), and the console does not wait at all. Check the Risky agents report in Microsoft Entra, or run the command again, to see it.
+- **Undo dismisses the risk.** Entra has no call that returns an agent to the state before, so `-Undo` and **Undo last run** dismiss the risk: the agent ends up *dismissed*, and the admin-confirmed detection stays in Entra's detection history (kept for 90 days). If Entra had already flagged the agent before you confirmed it, dismissing clears that earlier risk too, and the tool warns about it. A confirmation Entra had not shown yet when the log was written may still appear after an undo; dismiss it again then. To clear a flag without a log, use `-DismissRisk` or, in the console, **Entra risk > Clear the compromised flag...**; dismissing cannot itself be undone.
+- **Requirements.** The Security Administrator role and the `IdentityRiskyAgent.ReadWrite.All` permission. The call is beta only.
+
 ### Policy file
 
 Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
@@ -365,7 +389,8 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. Tick **Also apply this choice to deployment** to make who the agent is installed for follow the same choice (nobody, the same users and groups, or everyone); there is no separate deployment list. The *Access* filter lists agents open to everyone, restricted or closed. |
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
-| Undo | **Undo last run** reverses the previous block, unblock, access change or sponsor addition. |
+| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. |
+| Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
 
 Each write action saves a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
@@ -383,13 +408,16 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-Unblock` | names and/or ids | Unblock packages. |
 | `-Select` | switch | Pick agents from a grid or numbered menu, then apply `-Action`. |
 | `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent in a CSV with an `Id` or `DisplayName` column. |
-| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners). |
+| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners, compromised flags). |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-Risky` | switch | Act on agents with Defender AI-security alerts or detections. |
 | `-Ownerless` | switch | Propose owners for shared agents whose owner is missing. Add `-Action reassign` to apply. |
 | `-Reassign` | names and/or ids | Assign these agents to the user in `-To`. |
 | `-Accountability` | switch | List Entra identities with no valid sponsor; `-Action assign` adds the proposals. |
 | `-AddSponsor` | names and/or ids | Add `-To` as sponsor (or owner with `-AsOwner`) of these agents' identities. |
+| `-SignIn` | none | Sign in once with every permission the tool can use; later runs reuse the saved session. |
+| `-ConfirmCompromised` | names and/or ids | Confirm these agents' Entra identities as compromised (risk level High). |
+| `-DismissRisk` | names and/or ids | Dismiss the Entra risk of these agents' identities. |
 | `-Restrict` | names and/or ids | Change who can use these agents. |
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
@@ -410,7 +438,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-WhatIf` | any write | switch | Show what would change; change nothing. |
 | `-OutFile` | most modes | path (.csv or .json) | Write a result log, or export the result. |
 | `-TenantId` | all | GUID or domain | Target a specific tenant. |
-| `-DeviceCode` | all | switch | Device-code sign-in when interactive sign-in misbehaves. |
+| `-DeviceCode` | all | switch | Print a device code instead of opening a sign-in window. The code expires after two minutes; `-SignIn` is the more reliable route. |
 | `-DisableIdentity` | block, unblock | switch | Verify the Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
 | `-Impact` | block, unblock, stale, risky | switch | Show active users, sessions and last use before acting. |
 | `-StaleDays` | `-Stale` | 1 to 3650 | Age threshold in days. |
@@ -424,6 +452,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-To` | reassign, AddSponsor | UPN or object id | The person to assign. |
 | `-AsOwner` | `-AddSponsor` | switch | Add as owner instead of sponsor. |
 | `-IncludeOwners` | `-Accountability` | switch | Also look for identities with no owner. |
+| `-WaitSeconds` | `-ConfirmCompromised`, `-DismissRisk` | integer 0 to 900, default 240 | How long to wait for Entra to show the new state. 0 does not wait. |
 | `-AvailableTo` | `-Restrict` | `None` (default), `Some`, `All` | Nobody, named users and groups (or the owner), or everyone. |
 | `-AllowUsers`, `-AllowGroups` | `-Restrict` | UPNs or ids; names or ids | Who the agents stay available to (with `-AvailableTo Some`). |
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
@@ -441,10 +470,11 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 ## Limitations
 
-- **Beta APIs.** Block, unblock, reassign and the Entra agent-identity calls target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
+- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls and the Entra agent-risk calls target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
 - **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
-- **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in until it expires; the run then fails and someone signs in again.
+- **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in (create it with `-SignIn`, as the account that runs the task) until it expires; the run then fails with a message to run `-SignIn` again.
+- **Entra applies risk changes with a delay.** Confirming an agent as compromised, or dismissing its risk, shows up a minute or two after Entra accepts it. See [Respond to a compromised agent](#respond-to-a-compromised-agent).
 - **Retention.** Advanced Hunting keeps about 30 days. The Purview audit log keeps what your licence allows (180 days or one year).
 - **Audit searches are slow and permanent.** See [AI activity from Purview](#ai-activity-from-purview).
 
@@ -456,9 +486,11 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | "No package named 'X'" | Run `-List` for the exact display name or id. |
 | "Multiple packages named 'X'" | Two packages share the name; pass the exact `P_` or `T_` id. |
 | Advanced Hunting query failed | Check `ThreatHunting.Read.All` consent, an E5 or Defender license and Security for AI onboarding, or use `-By modified`. |
-| Sign-in or WAM prompt misbehaves | Re-run with `-DeviceCode`. |
+| "No saved sign-in ... cannot show a sign-in window" | Run `.\Agent365-Bulk-Actions.ps1 -SignIn` in a terminal, as the same Windows account that runs the tool. |
+| The sign-in window does not appear | Look behind other windows. If it still does not open, `-DeviceCode` prints a code instead; enter it within two minutes. |
 | `-StaleDays` of 30 or more seems to under-report | Expected: telemetry covers about 30 days. Use `-By modified` or `-IncludeNeverSeen`. |
 | Audit search is refused | Grant `AuditLogsQuery.Read.All` (admin consent) and hold a Purview audit role. |
+| Confirm compromised says "accepted" but the state is not visible | Entra applies it a minute or two after accepting it. Check the Risky agents report in Microsoft Entra, or raise `-WaitSeconds`. The Security Administrator role and `IdentityRiskyAgent.ReadWrite.All` are required. |
 | Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
 ## Appendix: hunting queries

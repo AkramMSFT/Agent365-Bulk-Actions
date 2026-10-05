@@ -1518,3 +1518,182 @@ Describe 'Graph version per catalog call' {
         $script:uris | Should -Be @('GET https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a', 'PATCH https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a')
     }
 }
+
+Describe 'Entra agent risk' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        Mock Start-Sleep { }
+        $script:posts = @()
+        $script:pkg = [pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'id1'; platform = 'Foundry' }
+        $script:clean = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = '' }
+        $script:confirmed = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = 'adminConfirmedAgentCompromised' }
+    }
+    It 'reads every identity in one beta batch: a missing record means not flagged, other errors mean unknown' {
+        Mock Invoke-GraphBatch {
+            @{ 'a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ riskLevel = 'high'; riskState = 'atRisk'; riskDetail = 'none' } }
+               'b' = [pscustomobject]@{ Status = 404; Body = $null }
+               'c' = [pscustomobject]@{ Status = 403; Body = $null } }
+        }
+        $s = Get-AgentRiskStates @('a', 'b', 'c', 'a', '')
+        Should -Invoke Invoke-GraphBatch -Times 1 -ParameterFilter { @($Requests).Count -eq 3 -and $Version -eq 'beta' }
+        $s['a'].Level | Should -Be 'high'; $s['a'].State | Should -Be 'atRisk'
+        $s['b'].State | Should -Be 'none'
+        $s['c'] | Should -BeNullOrEmpty
+        (Get-AgentRiskStates @()).Count | Should -Be 0
+    }
+    It 'describes a state in words' {
+        Format-AgentRisk $null | Should -Be 'unknown'
+        Format-AgentRisk $script:clean | Should -Be 'not flagged'
+        Format-AgentRisk $script:confirmed | Should -Be 'high (confirmedCompromised)'
+    }
+    It 'confirms an identity as compromised and logs the state before and after' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; if ($script:reads -eq 1) { @{ 'id1' = $script:clean } } else { @{ 'id1' = $script:confirmed } } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Action | Should -Be 'confirmcompromised'
+        $log[0].WasRiskState | Should -Be 'none'
+        $log[0].NowRiskState | Should -Be 'confirmedCompromised'; $log[0].NowRiskLevel | Should -Be 'high'
+        $script:posts.Count | Should -Be 1
+        $script:posts[0].Uri | Should -Be 'https://graph.microsoft.com/beta/identityProtection/riskyAgents/confirmCompromised'
+        @(($script:posts[0].Body | ConvertFrom-Json).agentIds) | Should -Be @('id1')
+    }
+    It 'sends a single identity as a one-item list' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Body = $Body } }
+        $null = Invoke-AgentRiskAction -Packages @($script:pkg)
+        $script:posts[0].Body | Should -Be '{"agentIds":["id1"]}'
+    }
+    It 'skips an identity that is already confirmed and sends nothing' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Skipped'
+        $script:posts.Count | Should -Be 0
+    }
+    It 'changes nothing when the proceed check says no (-WhatIf)' {
+        Mock Test-Proceed { $false }
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'WhatIf'
+        $script:posts.Count | Should -Be 0
+    }
+    It 'records a failure with the role that is needed, and keeps going' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean; 'id2' = $script:clean } }
+        Mock Invoke-Graph { if ($Body -match 'id1') { throw 'Forbidden' } }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $log = @(Invoke-AgentRiskAction -Packages $two -PassThru)
+        ($log | Where-Object Id -eq 'T_1').Result | Should -Be 'Failed'
+        ($log | Where-Object Id -eq 'T_1').Error | Should -BeLike '*Security Administrator*'
+        ($log | Where-Object Id -eq 'T_2').Result | Should -Be 'Done'
+    }
+    It 'leaves out agents that have no Entra identity' {
+        Mock Get-AgentRiskStates { throw 'must not read' }
+        Mock Invoke-Graph { throw 'must not call' }
+        $none = [pscustomobject]@{ id = 'T_9'; displayName = 'NoIdentity'; agentIdentityId = ''; platform = '' }
+        Invoke-AgentRiskAction -Packages @($none) -PassThru | Should -BeNullOrEmpty
+    }
+    It 'dismisses only an identity that has an active risk' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed; 'id2' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $log = @(Invoke-AgentRiskAction -Packages $two -Action dismiss -PassThru)
+        ($log | Where-Object Id -eq 'T_1').Result | Should -Be 'Done'
+        ($log | Where-Object Id -eq 'T_2').Result | Should -Be 'Skipped'
+        $script:posts.Count | Should -Be 1
+        $script:posts[0].Uri | Should -Be 'https://graph.microsoft.com/beta/identityProtection/riskyAgents/dismiss'
+    }
+    It 'undoes a logged confirmation by dismissing the risk of the same identities' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $rec = [pscustomobject]@{ Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = 'id1'; WasRiskState = 'none' }
+        $log = @(Invoke-AgentRiskDismiss -Records @($rec) -PassThru)
+        $log[0].Action | Should -Be 'dismiss'
+        $script:posts[0].Uri | Should -BeLike '*/riskyAgents/dismiss'
+        @(($script:posts[0].Body | ConvertFrom-Json).agentIds) | Should -Be @('id1')
+    }
+    It 'warns that dismissing also clears a risk Entra had already raised' {
+        Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'none' }) | Should -Be ''
+        $note = Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'atRisk' }, [pscustomobject]@{ DisplayName = 'Beta'; WasRiskState = 'none' })
+        $note | Should -BeLike '*Alpha*'
+        $note | Should -Not -BeLike '*Beta*'
+    }
+}
+
+Describe 'Entra agent risk: waiting for Entra to apply a change' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        Mock Start-Sleep { }
+        Mock Invoke-Graph { }
+        $script:pkg = [pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'id1'; platform = 'Foundry' }
+        $script:clean = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = '' }
+        $script:confirmed = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = 'adminConfirmedAgentCompromised' }
+    }
+    It 'keeps checking until Entra shows the new state, then marks it verified' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; if ($script:reads -le 4) { @{ 'id1' = $script:clean } } else { @{ 'id1' = $script:confirmed } } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeTrue
+        $log[0].NowRiskState | Should -Be 'confirmedCompromised'
+        Should -Invoke Start-Sleep -Times 3
+    }
+    It 'logs a request Entra accepted but never showed as done and not verified, instead of claiming success' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -WaitSeconds 30 -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeFalse
+        $log[0].NowRiskState | Should -Be 'none'
+        Should -Invoke Start-Sleep -Times 3
+    }
+    It 'does not read the state back at all with -WaitSeconds 0' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -WaitSeconds 0 -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeFalse
+        Should -Invoke Get-AgentRiskStates -Times 1
+        Should -Invoke Start-Sleep -Times 0
+    }
+    It 'checks all pending identities together rather than one read each' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; $h = @{}; foreach ($i in $IdentityIds) { $h[$i] = $(if ($script:reads -eq 1) { $script:clean } else { $script:confirmed }) }; $h }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $null = Invoke-AgentRiskAction -Packages $two -PassThru
+        Should -Invoke Get-AgentRiskStates -Times 1 -ParameterFilter { @($IdentityIds).Count -eq 2 }
+        Should -Invoke Get-AgentRiskStates -Times 2
+    }
+    It 'tells the person to dismiss again when a confirmation was not yet visible' {
+        $note = Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'none'; Verified = 'False' }, [pscustomobject]@{ DisplayName = 'Beta'; WasRiskState = 'none'; Verified = 'True' })
+        $note | Should -BeLike '*Alpha*dismiss it again*'
+        $note | Should -Not -BeLike '*Beta*'
+    }
+}
+
+Describe 'Sign-in help' {
+    It 'turns the window-handle error of a non-interactive session into instructions' {
+        $msg = "InteractiveBrowserCredential authentication failed: A window handle must be configured. See`nhttps://aka.ms/msal-net-wam#parent-window-handles"
+        $help = Get-SignInHelp $msg
+        $help | Should -BeLike '*-SignIn*'
+        $help | Should -BeLike '*no saved sign-in*'
+        $help | Should -BeLike '*A window handle must be configured*'
+        $help | Should -Not -BeLike '*aka.ms*'
+    }
+    It 'explains the two-minute device code limit' {
+        Get-SignInHelp 'Authentication timed out after 120 seconds due to inactivity. Please try again.' | Should -BeLike '*two minutes*-SignIn*'
+    }
+    It 'leaves any other error as it is' {
+        Get-SignInHelp 'AADSTS50076: multi-factor authentication is required' | Should -Be 'AADSTS50076: multi-factor authentication is required'
+    }
+    It 'asks -SignIn for every permission the modes use, including the newest' {
+        foreach ($scope in 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'AgentIdentity.ReadWrite.All', 'AuditLogsQuery.Read.All', 'Group.Read.All', 'IdentityRiskyAgent.ReadWrite.All') {
+            $script:AllScopes | Should -Contain $scope
+        }
+        @($script:AllScopes | Select-Object -Unique).Count | Should -Be @($script:AllScopes).Count
+    }
+}
