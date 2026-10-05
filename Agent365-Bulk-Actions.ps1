@@ -2744,7 +2744,7 @@ if (-not ('AgentRow' -as [type])) {
                    'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int', 'Availability:string'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
-        "private $t _$n; public $t $n { get { return _$n; } set { _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
+        "private $t _$n; public $t $n { get { return _$n; } set { if (_$n == value) return; _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
     }
     Add-Type -ReferencedAssemblies System.ObjectModel -TypeDefinition @"
 using System.ComponentModel;
@@ -2828,10 +2828,10 @@ $RestrictXaml = @'
   <StackPanel Margin="28,24,28,22">
     <TextBlock Text="Restrict who can use the selected agents" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
     <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
-    <RadioButton x:Name="OptNone" GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
+    <RadioButton GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
     <RadioButton x:Name="OptOwner" GroupName="scope" Margin="0,0,0,8" Content="Its owner only"/>
     <RadioButton x:Name="OptUsers" GroupName="scope" Margin="0,0,0,6" Content="These users and groups, picked from Entra"/>
-    <StackPanel x:Name="PickPanel" Margin="22,0,0,8" IsEnabled="{Binding IsChecked, ElementName=OptUsers}">
+    <StackPanel Margin="22,0,0,8" IsEnabled="{Binding IsChecked, ElementName=OptUsers}">
       <DockPanel>
         <Border DockPanel.Dock="Right" Background="#E5E7EB" CornerRadius="7" Padding="1" Margin="8,0,0,0" VerticalAlignment="Center">
           <StackPanel Orientation="Horizontal">
@@ -2911,9 +2911,10 @@ function New-RestrictDialog {
         try {
             if ($kind -eq 'group' -and -not (Test-GraphScope 'Group.Read.All')) {
                 $q.Note.Text = 'Granting group read access: finish the sign-in window...'
+                $q.Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
                 Request-GraphScope 'Group.Read.All'
             }
-            $found = if ($kind -eq 'group') { @(Find-DirectoryGroups -Text $q.Search.Text) } else { @(Find-DirectoryUsers -Text $q.Search.Text) }
+            $found = @(if ($kind -eq 'group') { Find-DirectoryGroups -Text $q.Search.Text } else { Find-DirectoryUsers -Text $q.Search.Text })
             $q.Results.Items.Clear()
             foreach ($f in $found) {
                 $item = New-Object Windows.Controls.ListBoxItem
@@ -3108,7 +3109,7 @@ $DetailXaml = @'
       </StackPanel>
     </Border>
     <TabControl x:Name="Tabs" Grid.Row="1" Margin="16,12,16,0" Background="White" BorderBrush="#E5E7EB">
-      <TabItem x:Name="TabOverview" Header="Overview">
+      <TabItem Header="Overview">
         <DataGrid x:Name="OvGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="220" ElementStyle="{StaticResource Wrap}"/>
@@ -3116,7 +3117,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabSharing" Header="Sharing">
+      <TabItem Header="Sharing">
         <DataGrid x:Name="ShGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="280" ElementStyle="{StaticResource Wrap}"/>
@@ -3155,7 +3156,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabIdentity" Header="Identity">
+      <TabItem Header="Identity">
         <DataGrid x:Name="IdGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
@@ -3163,7 +3164,7 @@ $DetailXaml = @'
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
-      <TabItem x:Name="TabUsage" Header="Usage">
+      <TabItem Header="Usage">
         <DataGrid x:Name="UsGrid" Style="{StaticResource Grid}">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Field" Binding="{Binding Field}" Width="260" ElementStyle="{StaticResource Wrap}"/>
@@ -3241,36 +3242,36 @@ $DetailXaml = @'
 
 function ConvertTo-FieldRows {
     param($Dictionary)
-    @($Dictionary.Keys | ForEach-Object { [pscustomobject]@{ Field = $_; Value = [string]$Dictionary[$_] } } | Where-Object { $_.Value -ne '' })
+    , @($Dictionary.Keys | ForEach-Object { [pscustomobject]@{ Field = $_; Value = [string]$Dictionary[$_] } } | Where-Object { $_.Value -ne '' })
 }
 
 # Fill the details window from a detail object.
 function Set-DetailWindowContent {
     param([System.Windows.Window]$Window, [object]$Detail)
-    $f = { param($n) $Window.FindName($n) }
-    (& $f 'Title').Text = $Detail.Name
-    (& $f 'Subtitle').Text = ('{0}   |   {1}   |   {2}' -f $Detail.Overview.Kind, $Detail.Overview.Platform, $Detail.Overview.Status)
-    (& $f 'OvGrid').ItemsSource = ConvertTo-FieldRows $Detail.Overview
-    (& $f 'ShGrid').ItemsSource = ConvertTo-FieldRows $Detail.Sharing
+    $Window.FindName('Title').Text = $Detail.Name
+    $Window.FindName('Subtitle').Text = ('{0}   |   {1}   |   {2}' -f $Detail.Overview.Kind, $Detail.Overview.Platform, $Detail.Overview.Status)
+    $Window.FindName('OvGrid').ItemsSource = ConvertTo-FieldRows $Detail.Overview
+    $Window.FindName('ShGrid').ItemsSource = ConvertTo-FieldRows $Detail.Sharing
     $tools = @($Detail.McpServers | ForEach-Object { [pscustomobject]@{ Kind = 'MCP server'; Name = $_.Name; Type = $_.Type; Authentication = $_.Authentication; Approval = $_.Approval; Description = $_.Description } }) +
              @($Detail.Tools | ForEach-Object { [pscustomobject]@{ Kind = 'Tool'; Name = $_.Name; Type = $_.Type; Authentication = $_.Authentication; Approval = $_.Approval; Description = $_.Description } })
-    (& $f 'ToolGrid').ItemsSource = $tools
-    (& $f 'TabTools').Header = "Tools and MCP ($($tools.Count))"
+    $Window.FindName('ToolGrid').ItemsSource = $tools
+    $Window.FindName('TabTools').Header = "Tools and MCP ($($tools.Count))"
     $data = @($Detail.DataSources | ForEach-Object { [pscustomobject]@{ Kind = 'Data source'; Value = $_ } }) +
             @($Detail.Capabilities | ForEach-Object { [pscustomobject]@{ Kind = 'Capability'; Value = $_ } }) +
             @($Detail.ConnectedAgents | ForEach-Object { [pscustomobject]@{ Kind = 'Connected agent'; Value = $_ } }) +
             @($Detail.Endpoints | ForEach-Object { [pscustomobject]@{ Kind = 'Endpoint'; Value = $_ } })
-    (& $f 'DataGrid2').ItemsSource = $data
-    (& $f 'TabData').Header = "Data ($($data.Count))"
-    (& $f 'PermGrid').ItemsSource = @($Detail.Permissions)
-    (& $f 'TabPerms').Header = "Permissions ($(@($Detail.Permissions).Count))"
-    (& $f 'IdGrid').ItemsSource = ConvertTo-FieldRows $Detail.Identity
-    (& $f 'UsGrid').ItemsSource = ConvertTo-FieldRows $Detail.Usage
-    (& $f 'RiskGrid').ItemsSource = ConvertTo-FieldRows $Detail.Risk
+    $Window.FindName('DataGrid2').ItemsSource = $data
+    $Window.FindName('TabData').Header = "Data ($($data.Count))"
+    $perms = @($Detail.Permissions)
+    $Window.FindName('PermGrid').ItemsSource = $perms
+    $Window.FindName('TabPerms').Header = "Permissions ($($perms.Count))"
+    $Window.FindName('IdGrid').ItemsSource = ConvertTo-FieldRows $Detail.Identity
+    $Window.FindName('UsGrid').ItemsSource = ConvertTo-FieldRows $Detail.Usage
+    $Window.FindName('RiskGrid').ItemsSource = ConvertTo-FieldRows $Detail.Risk
     $riskSeverity = $Detail.Risk['Severity']
-    (& $f 'TabRisk').Header = if ($riskSeverity) { "Risk ($riskSeverity)" } else { 'Risk' }
-    $noPerms = if (@($Detail.Permissions).Count -eq 0) { 'No permissions found for the agent identity or its blueprint.' } else { '' }
-    (& $f 'Note').Text = $noPerms
+    $Window.FindName('TabRisk').Header = if ($riskSeverity) { "Risk ($riskSeverity)" } else { 'Risk' }
+    $noPerms = if ($perms.Count -eq 0) { 'No permissions found for the agent identity or its blueprint.' } else { '' }
+    $Window.FindName('Note').Text = $noPerms
 }
 
 # Some actions need a scope the console does not ask for at sign-in (reading the audit log or groups, writing agent identity sponsors); ask only when used.
@@ -3284,7 +3285,7 @@ function Request-GraphScope {
 function Update-AiDetailPane {
     param([System.Windows.Window]$Window)
     $item = $Window.FindName('AiGrid').SelectedItem
-    $Window.FindName('AiDetailGrid').ItemsSource = $(if ($item) { @(Get-AiActivityDetailRows $item) } else { @() })
+    $Window.FindName('AiDetailGrid').ItemsSource = @(if ($item) { Get-AiActivityDetailRows $item })
     $Window.FindName('BtnAiConv').IsEnabled = [bool]($item -and $item.Conversation) -or [bool]$Window.Tag.Conv
 }
 
@@ -3296,7 +3297,7 @@ function Update-AiActivityTab {
         try {
             $days = [int]$Window.FindName('AiDaysBox').SelectedItem.Tag
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; Request-GraphScope 'AuditLogsQuery.Read.All' }
+            if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; & $script:ctx.Pump; Request-GraphScope 'AuditLogsQuery.Read.All' }
             $dispatcher = $script:w.Dispatcher   # a closure cannot see $script: variables, so hand it the dispatcher directly
             $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
             $info = if ($script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
@@ -3309,7 +3310,11 @@ function Update-AiActivityTab {
     $cache = $script:AiActivityCache
     $convButton = $Window.FindName('BtnAiConv')
     if (-not $cache) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Choose a period and press "Load from Purview audit".'; Update-AiDetailPane -Window $Window; return }
-    $mine = @($cache.Activities | Where-Object { $_.TitleId -eq $Row.Id } | Sort-Object Time -Descending)
+    if ($Window.Tag.MineAt -ne $cache.At) {
+        $Window.Tag.Mine = @($cache.Activities | Where-Object { $_.TitleId -eq $Row.Id } | Sort-Object Time -Descending)
+        $Window.Tag.MineAt = $cache.At
+    }
+    $mine = $Window.Tag.Mine
     $high = @($mine | Where-Object { $_.Risk -eq 'High' }).Count; $med = @($mine | Where-Object { $_.Risk -eq 'Medium' }).Count
     $conv = [string]$Window.Tag.Conv
     if ($conv) {
@@ -3340,7 +3345,7 @@ function New-DetailWindow {
         $dlg.Filter = 'JSON (*.json)|*.json'; $dlg.FileName = ('{0}.json' -f ($script:detailState.Detail.Name -replace '[^\w\-. ]', '_'))
         if ($dlg.ShowDialog()) { $script:detailState.Detail | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
     })
-    $d.Tag = @{ Conv = '' }
+    $d.Tag = @{ Conv = ''; Mine = @(); MineAt = $null }
     $d.FindName('AiGrid').Add_SelectionChanged({ Update-AiDetailPane -Window $script:detailState.Window })
     $d.FindName('BtnAiConv').Add_Click({
         $win = $script:detailState.Window
@@ -3365,6 +3370,12 @@ function New-DetailWindow {
     $d
 }
 
+# The first few failed records of a write action, one line each, for the message box.
+function Get-FailureSummary {
+    param([object[]]$Records)
+    (@($Records | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n")
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
@@ -3374,7 +3385,7 @@ function New-ConsoleWindow {
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; UI = $script:ui; Rows = $null; View = $null; RowById = @{}; Bulk = $false; InfoTable = $null; ToolsSet = $null; PermSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; RowById = @{}; Bulk = $false; Resetting = $false; Loaded = $false; OwnerMode = 'owner'; InfoTable = $null; ToolsSet = $null; PermSet = $null; AccessSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -3382,6 +3393,32 @@ function New-ConsoleWindow {
     $script:ctx.Pump = { $script:w.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
     $script:ctx.Busy = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = [Windows.Input.Cursors]::Wait; & $script:ctx.Pump }
     $script:ctx.Idle = { param($msg) $script:ui.Status.Text = $msg; $script:w.Cursor = $null }
+    # A filter that could not run: reset its dropdown, restore the grid and say why.
+    $script:ctx.FilterFailed = {
+        param([string]$Box, [string]$Status, [string]$Title, [string]$Detail)
+        $script:ui[$Box].SelectedIndex = 0; & $script:ctx.Refilter
+        & $script:ctx.Idle $Status; [void][Windows.MessageBox]::Show($Detail, $Title, 'OK', 'Error')
+    }
+    # The log file a write action in the console saves to.
+    $script:ctx.NewLogPath = {
+        param([string]$Prefix)
+        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $script:OutFile = Join-Path $dir ('{0}-{1:yyyyMMdd-HHmmss}.csv' -f $Prefix, (Get-Date))
+    }
+    # Mark the rows an owner or sponsor report lists, with the suggestion for each.
+    $script:ctx.ApplyOwnerReport = {
+        param($Items)
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($i in $Items) {
+            [void]$set.Add($i.Id)
+            $row = $script:ctx.RowById[[string]$i.Id]
+            if (-not $row) { continue }
+            $row.OwnerNote = $i.Reason
+            if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
+        }
+        $script:ctx.OwnerSet = $set
+    }
 
     # Row events only schedule a summary refresh; it runs once after a burst of changes settles.
     $script:ctx.SummaryTimer = New-Object Windows.Threading.DispatcherTimer
@@ -3391,40 +3428,45 @@ function New-ConsoleWindow {
     $script:ctx.BulkChange = { param([scriptblock]$Change) $script:ctx.Bulk = $true; try { & $Change } finally { $script:ctx.Bulk = $false }; & $script:ctx.Summary }
 
     $script:ctx.Summary = {
-        $rows = @($script:ctx.Rows)
-        $checked = @($rows | Where-Object { $_.Checked })
-        $script:ui.CountTotal.Text = $rows.Count
-        $script:ui.CountBlocked.Text = @($rows | Where-Object { $_.IsBlocked }).Count
-        $script:ui.CountShown.Text = @($script:ctx.View).Count
-        $script:ui.SelectedText.Text = if ($checked.Count) { "$($checked.Count) selected" } else { 'None selected' }
-        $script:ui.BtnBlock.IsEnabled   = @($checked | Where-Object { -not $_.IsBlocked }).Count -gt 0
-        $script:ui.BtnUnblock.IsEnabled = @($checked | Where-Object { $_.IsBlocked }).Count -gt 0
-        $script:ui.BtnUndo.IsEnabled    = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
-        $script:ui.BtnAssign.IsEnabled  = @($checked | Where-Object { Test-Reassignable $_.Package }).Count -gt 0
-        $script:ui.BtnApplyOwner.IsEnabled = @($checked | Where-Object { $script:ctx.Suggest.ContainsKey($_.Id) }).Count -gt 0
-        $script:ui.BtnRestrict.IsEnabled = $checked.Count -gt 0
-        $shown = [int]$script:ui.CountShown.Text
+        $script:ctx.SummaryTimer.Stop()
+        $total = 0; $blocked = 0; $selected = 0
+        $canBlock = $false; $canUnblock = $false; $canAssign = $false; $canApply = $false
+        foreach ($r in $script:ctx.Rows) {
+            $total++
+            if ($r.IsBlocked) { $blocked++ }
+            if (-not $r.Checked) { continue }
+            $selected++
+            if ($r.IsBlocked) { $canUnblock = $true } else { $canBlock = $true }
+            if (-not $canAssign -and (Test-Reassignable $r.Package)) { $canAssign = $true }
+            if (-not $canApply -and $script:ctx.Suggest.ContainsKey($r.Id)) { $canApply = $true }
+        }
+        $shown = @($script:ctx.View).Count
+        $script:ui.CountTotal.Text = $total
+        $script:ui.CountBlocked.Text = $blocked
+        $script:ui.CountShown.Text = $shown
+        $script:ui.SelectedText.Text = if ($selected) { "$selected selected" } else { 'None selected' }
+        $script:ui.BtnBlock.IsEnabled = $canBlock
+        $script:ui.BtnUnblock.IsEnabled = $canUnblock
+        $script:ui.BtnUndo.IsEnabled = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
+        $script:ui.BtnAssign.IsEnabled = $canAssign
+        $script:ui.BtnApplyOwner.IsEnabled = $canApply
+        $script:ui.BtnRestrict.IsEnabled = $selected -gt 0
         $script:ui.EmptyNote.Visibility = if ($shown -eq 0) { 'Visible' } else { 'Collapsed' }
-        $script:ui.EmptyText.Text = if ($rows.Count -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
+        $script:ui.EmptyText.Text = if ($total -eq 0) { 'No agents loaded.' } else { 'No agents match the current filters.' }
     }
-
     $script:ctx.Filter = {
         param($o)
         if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
         if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
-        if ($script:ctx.OwnerSet   -and -not $script:ctx.OwnerSet.Contains($o.Id))   { return $false }
-        if ($script:ctx.BlockedSet -and -not $script:ctx.BlockedSet.Contains($o.Id)) { return $false }
-        if ($null -ne $script:ctx.ToolsSet -and -not $script:ctx.ToolsSet.Contains($o.Id)) { return $false }
-        if ($null -ne $script:ctx.PermSet  -and -not $script:ctx.PermSet.Contains($o.Id))  { return $false }
-        if ($null -ne $script:ctx.AccessSet -and -not $script:ctx.AccessSet.Contains($o.Id)) { return $false }
-        if ($null -ne $script:ctx.OwnerSet   -and $script:ctx.OwnerSet.Count -eq 0)   { return $false }
-        if ($null -ne $script:ctx.BlockedSet -and $script:ctx.BlockedSet.Count -eq 0) { return $false }
-        $sets = @(); foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $sets += , $s } }
-        if ($sets.Count) {
-            $hits = @($sets | Where-Object { $_.Contains($o.Id) }).Count
+        foreach ($s in $script:ctx.OwnerSet, $script:ctx.BlockedSet, $script:ctx.ToolsSet, $script:ctx.PermSet, $script:ctx.AccessSet) {
+            if ($null -ne $s -and -not $s.Contains($o.Id)) { return $false }
+        }
+        $active = 0; $hits = 0
+        foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $active++; if ($s.Contains($o.Id)) { $hits++ } } }
+        if ($active) {
             if ($script:ui.MatchAny.IsChecked) { if ($hits -eq 0) { return $false } }
-            elseif ($hits -ne $sets.Count) { return $false }
+            elseif ($hits -ne $active) { return $false }
         }
         $q = $script:ui.Search.Text.Trim()
         if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Kind, $o.ToolsText, $o.Mcp, $o.Id) -join ' ').ToLowerInvariant().Contains($q.ToLowerInvariant())) { return $false }
@@ -3451,6 +3493,10 @@ function New-ConsoleWindow {
             & $script:ctx.Busy ("Resolving owners of {0} agents..." -f $pkgs.Count)
             Initialize-UserCache -Ids @($pkgs | ForEach-Object { $_.ownerId })
             $script:ctx.Rows.Clear(); $script:ctx.RowById = @{}; & $script:ctx.ResetFilters
+            $onRowChanged = { param($s, $e)
+                if ($script:ctx.Bulk) { return }
+                if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { $script:ctx.SummaryTimer.Stop(); $script:ctx.SummaryTimer.Start() }
+            }
             foreach ($p in ($pkgs | Sort-Object displayName)) {
                 $r = New-Object AgentRow
                 $r.Id = $p.id; $r.Name = $p.displayName; $r.Publisher = $p.publisher
@@ -3462,11 +3508,8 @@ function New-ConsoleWindow {
                 $r.IsBlocked = [bool]$p.isBlocked
                 $r.Modified = if ($p.lastModifiedDateTime) { ([datetimeoffset]$p.lastModifiedDateTime).ToString('yyyy-MM-dd') } else { '' }
                 $r.Package = $p
-                $r.IdleSort = -1; $r.RiskSort = 0; $r.AlertsSort = 0
-                $r.add_PropertyChanged({ param($s, $e)
-                    if ($script:ctx.Bulk) { return }
-                    if ($e.PropertyName -eq 'Checked' -or $e.PropertyName -eq 'IsBlocked') { $script:ctx.SummaryTimer.Stop(); $script:ctx.SummaryTimer.Start() }
-                })
+                $r.IdleSort = -1
+                $r.add_PropertyChanged($onRowChanged)
                 $script:ctx.Rows.Add($r)
                 $script:ctx.RowById[$r.Id] = $r
             }
@@ -3556,10 +3599,7 @@ function New-ConsoleWindow {
             $script:ctx.PermSet = $set
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} agent(s): {1}. Only agents with an Entra identity were checked ({2})." -f $set.Count, $script:ui.PermBox.SelectedItem.Content.ToLowerInvariant(), $withIdentity.Count)
-        } catch {
-            $script:ui.PermBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Permissions scan failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Permissions', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'PermBox' 'Permissions scan failed.' 'Permissions' $_.Exception.Message }
     }
     # Copy Defender's declared tools, MCP servers, sharing and channels onto the grid rows.
     $script:ctx.FillInfo = {
@@ -3608,26 +3648,15 @@ function New-ConsoleWindow {
         & $script:ctx.ClearOwner
         $ownerTag = [string]$script:ui.OwnerBox.SelectedItem.Tag
         if ($ownerTag -in 'nosponsor', 'noboth') { & $script:ctx.RunSponsor ($ownerTag -eq 'noboth'); return }
-        if (-not [string]$script:ui.OwnerBox.SelectedItem.Tag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Ownership filter cleared.'; return }
+        if (-not $ownerTag) { & $script:ctx.Refilter; & $script:ctx.Idle 'Ownership filter cleared.'; return }
         & $script:ctx.Busy 'Checking owners of shared agents...'
         try {
             $report = Get-OwnerReport -Packages @($script:ctx.Rows | ForEach-Object { $_.Package })
-            $set = New-Object 'System.Collections.Generic.HashSet[string]'
-            foreach ($i in $report.Items) {
-                [void]$set.Add($i.Id)
-                $row = $script:ctx.RowById[[string]$i.Id]
-                if (-not $row) { continue }
-                $row.OwnerNote = $i.Reason
-                if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
-            }
-            $script:ctx.OwnerSet = $set
+            & $script:ctx.ApplyOwnerReport $report.Items
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} shared agent(s) need an owner: {1} with a suggestion, {2} to assign manually. {3} org-published and {4} ownerless Copilot Studio agent(s) cannot be reassigned through the API." -f
                 $report.Items.Count, $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.OrgPublished, $report.NoOwner)
-        } catch {
-            $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Ownership check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Ownership', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'OwnerBox' 'Ownership check failed.' 'Ownership' $_.Exception.Message }
     }
 
     # Agent identities with no sponsor (and, when asked, no owner), each with who the resolver would add.
@@ -3637,22 +3666,11 @@ function New-ConsoleWindow {
         try {
             $report = Get-AccountabilityReport -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -IncludeOwners:$WithOwners
             $script:ctx.OwnerMode = 'sponsor'
-            $set = New-Object 'System.Collections.Generic.HashSet[string]'
-            foreach ($i in $report.Items) {
-                [void]$set.Add($i.Id)
-                $row = $script:ctx.RowById[[string]$i.Id]
-                if (-not $row) { continue }
-                $row.OwnerNote = $i.Reason
-                if ($i.State -eq 'Proposed') { $row.Suggested = "$($i.Proposed)  ($($i.Source))"; $script:ctx.Suggest[$i.Id] = $i } else { $row.Suggested = 'Needs review' }
-            }
-            $script:ctx.OwnerSet = $set
+            & $script:ctx.ApplyOwnerReport $report.Items
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} agent identit{1} need a {2}: {3} with a suggestion, {4} to add by hand. {5} agent(s) have no Entra identity and {6} could not be read. Press Apply suggested to add them." -f
                 $report.Items.Count, $(if ($report.Items.Count -eq 1) { 'y' } else { 'ies' }), $(if ($WithOwners) { 'sponsor or owner' } else { 'sponsor' }), $script:ctx.Suggest.Count, ($report.Items.Count - $script:ctx.Suggest.Count), $report.NoIdentity, $report.Unreadable)
-        } catch {
-            $script:ui.OwnerBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Sponsor check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Sponsors', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'OwnerBox' 'Sponsor check failed.' 'Sponsors' $_.Exception.Message }
     }
 
     # Add the suggested sponsor (and owner) to the selected rows' agent identities.
@@ -3665,9 +3683,7 @@ function New-ConsoleWindow {
         try {
             if (-not (Test-GraphScope 'AgentIdentity.ReadWrite.All')) { & $script:ctx.Busy 'Granting write access to agent identities: finish the sign-in window...'; Request-GraphScope 'AgentIdentity.ReadWrite.All' }
         } catch { & $script:ctx.Idle 'Sign-in failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Sign-in', 'OK', 'Error'); return }
-        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        $script:OutFile = Join-Path $dir ('accountability-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.NewLogPath 'accountability'
         & $script:ctx.Busy ("Adding accountability for {0} agent(s)..." -f $items.Count)
         $recs = @(Invoke-AccountabilityAssign -Items $items -PassThru)
         foreach ($rec in $recs) {
@@ -3680,7 +3696,7 @@ function New-ConsoleWindow {
         & $script:ctx.Refilter
         & $script:ctx.Idle ("Accountability: {0} added, {1} failed. Log: {2}" -f $script:ctx.LastRun.Count, $failed.Count, $script:OutFile)
         if ($failed.Count) {
-            $why = ($failed | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            $why = Get-FailureSummary $failed
             [void][Windows.MessageBox]::Show("$($failed.Count) change(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
         }
     }
@@ -3693,7 +3709,7 @@ function New-ConsoleWindow {
         & $script:ctx.Busy 'Looking up when agents were blocked...'
         try {
             $days = [int]$tag
-            $found = @(Get-DeleteCandidates -MinDays $days -IncludeUnknown:($days -eq 0))
+            $found = @(Get-DeleteCandidates -MinDays $days -IncludeUnknown:($days -eq 0) -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }))
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($c in $found) {
                 [void]$set.Add($c.Id)
@@ -3705,18 +3721,13 @@ function New-ConsoleWindow {
             $script:ctx.BlockedSet = $set
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} agent(s) blocked {1}. Delete them in the admin center (Agents > All agents > Delete); the catalog API has no delete." -f $found.Count, $(if ($days -eq 0) { 'for any time' } else { "$days+ days" }))
-        } catch {
-            $script:ui.BlockedBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Blocked filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Blocked filter', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'BlockedBox' 'Blocked filter failed.' 'Blocked filter' $_.Exception.Message }
     }
 
     # Reassign the given rows through the shared reassign routine and refresh the Owner column.
     $script:ctx.ReassignRows = {
         param([object[]]$Items, [string]$Label)
-        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        $script:OutFile = Join-Path $dir ('owners-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.NewLogPath 'owners'
         & $script:ctx.Busy ("Reassigning {0} agent(s)..." -f $Items.Count)
         $recs = @(Invoke-OwnerReassign -Items $Items -PassThru)
         foreach ($rec in $recs) {
@@ -3728,7 +3739,7 @@ function New-ConsoleWindow {
         & $script:ctx.Refilter
         & $script:ctx.Idle ("{0}: {1} reassigned, {2} failed. Log: {3}" -f $Label, $done, $failed, $script:OutFile)
         if ($failed) {
-            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            $why = Get-FailureSummary $recs
             if ($why -match 'FailedDependency|424') { $why += "`n`nThe service reported a failed dependency and gave no reason. The service can refuse Copilot Studio reassignments even for an agent with a valid owner, and even when reassigning to its current owner, so it is not about who the owners are. Try Assign new owner in the Microsoft 365 admin center, or set the owner in Copilot Studio itself." }
             [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some reassignments failed', 'OK', 'Warning')
         }
@@ -3743,7 +3754,7 @@ function New-ConsoleWindow {
         & $script:ctx.Busy ("Finding agents with no {0} for {1}+ days..." -f $(if ($by -eq 'activity') { 'activity' } else { 'manifest change' }), $days)
         try {
             $never = [bool]$script:ui.NeverSeenBox.IsChecked -and $by -eq 'activity'
-            $found = @(Get-StalePackages -Days $days -By $by -IncludeNeverSeen:$never)
+            $found = @(Get-StalePackages -Days $days -By $by -IncludeNeverSeen:$never -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }))
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($m in $found) {
                 [void]$set.Add($m.id)
@@ -3758,10 +3769,7 @@ function New-ConsoleWindow {
             $script:ctx.StaleSet = $set
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} agent(s) match the stale filter." -f $found.Count)
-        } catch {
-            $script:ui.StaleBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Stale filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Stale filter', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'StaleBox' 'Stale filter failed.' 'Stale filter' $_.Exception.Message }
     }
 
     # Run the risky finder for the current dropdown value (or clear it for "None").
@@ -3771,7 +3779,7 @@ function New-ConsoleWindow {
         if (-not $sev) { & $script:ctx.Refilter; & $script:ctx.Idle 'Risk filter cleared.'; return }
         & $script:ctx.Busy "Finding agents with risk signals at $sev or above..."
         try {
-            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev -Source ([string]$script:ui.SignalBox.SelectedItem.Tag))
+            $found = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $sev -Source ([string]$script:ui.SignalBox.SelectedItem.Tag) -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }))
             $set = New-Object 'System.Collections.Generic.HashSet[string]'
             foreach ($m in $found) {
                 [void]$set.Add($m.id)
@@ -3785,10 +3793,7 @@ function New-ConsoleWindow {
             $script:ctx.RiskSet = $set
             & $script:ctx.Refilter
             & $script:ctx.Idle ("{0} agent(s) flagged by {1} at {2} or above (last 30 days)." -f $found.Count, $script:ui.SignalBox.SelectedItem.Content.ToLowerInvariant(), $sev)
-        } catch {
-            $script:ui.RiskBox.SelectedIndex = 0; & $script:ctx.Refilter
-            & $script:ctx.Idle 'Risk filter failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Risk filter', 'OK', 'Error')
-        }
+        } catch { & $script:ctx.FilterFailed 'RiskBox' 'Risk filter failed.' 'Risk filter' $_.Exception.Message }
     }
     $script:ctx.Confirm = {
         param([object[]]$Rows, [string]$Verb)
@@ -3798,11 +3803,9 @@ function New-ConsoleWindow {
     $script:ctx.Apply = {
         param([string]$Verb, [object[]]$Rows)
         if (-not (& $script:ctx.Confirm $Rows $Verb)) { return }
-        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        $script:OutFile = Join-Path $dir ('run-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.NewLogPath 'run'
         $script:DisableIdentity = [bool]$script:ui.IdentityBox.IsChecked
-        & $script:ctx.Busy ("{0}ing {1} agent(s)..." -f $Verb.TrimEnd('e'), $Rows.Count)
+        & $script:ctx.Busy ("{0}ing {1} agent(s)..." -f $Verb, $Rows.Count)
         $recs = @(Invoke-PackageAction -Packages @($Rows | ForEach-Object { $_.Package | Add-Member -NotePropertyName isBlocked -NotePropertyValue $_.IsBlocked -Force -PassThru }) -Action $Verb.ToLowerInvariant() -PassThru)
         foreach ($rec in $recs) {
             if ($rec.Result -eq 'Done') {
@@ -3815,7 +3818,7 @@ function New-ConsoleWindow {
         & $script:ctx.Refilter
         & $script:ctx.Idle ("{0}: {1} done, {2} failed. Log: {3}" -f $Verb, $done, $failed, $script:OutFile)
         if ($failed) {
-            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            $why = Get-FailureSummary $recs
             [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some actions failed', 'OK', 'Warning')
         }
     }
@@ -3823,7 +3826,7 @@ function New-ConsoleWindow {
     # ---- wiring ----
 
     $script:ui.BtnRefresh.Add_Click({ & $script:ctx.Load })
-    $script:ui.Search.Add_TextChanged({ & $script:ctx.Refilter })
+    $script:ui.Search.Add_TextChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.Refilter } })
     foreach ($b in 'FltAll', 'FltActive', 'FltBlocked') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
     $script:ui.AgentsOnlyBox.Add_Click({ & $script:ctx.Refilter })
     foreach ($b in 'MatchAll', 'MatchAny') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
@@ -3873,9 +3876,7 @@ function New-ConsoleWindow {
         if ($rows.Count -eq 0) { return }
         $choice = Read-RestrictChoice -Rows $rows -Owner $script:w
         if (-not $choice) { return }
-        $dir = Join-Path $env:LOCALAPPDATA 'Agent365-Bulk-Actions\logs'
-        New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        $script:OutFile = Join-Path $dir ('access-{0:yyyyMMdd-HHmmss}.csv' -f (Get-Date))
+        & $script:ctx.NewLogPath 'access'
         & $script:ctx.Busy ("Changing who can use {0} agent(s)..." -f $rows.Count)
         $recs = @(Invoke-AvailabilityChange -Packages @($rows | ForEach-Object { $_.Package }) -To $choice.To -Entities $choice.Entities -OwnerOnly:$choice.OwnerOnly -IncludeDeployment:$choice.Deploy -PassThru)
         foreach ($rec in $recs) {
@@ -3888,7 +3889,7 @@ function New-ConsoleWindow {
         $done = $script:ctx.LastRun.Count; $failed = @($recs | Where-Object { $_.Result -eq 'Failed' }).Count; $same = @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count
         & $script:ctx.Idle ("Access: {0} changed, {1} already set, {2} failed. Log: {3}" -f $done, $same, $failed, $script:OutFile)
         if ($failed) {
-            $why = ($recs | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n"
+            $why = Get-FailureSummary $recs
             [void][Windows.MessageBox]::Show("$failed agent(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
         }
     })
@@ -3921,7 +3922,6 @@ function New-ConsoleWindow {
 
     $script:ui.BtnUndo.Add_Click({
         $done = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' })
-        $back = @($done | ForEach-Object { $script:ctx.RowById[[string]$_.Id] } | Where-Object { $_ })
         if ($done.Count -gt 0 -and $done[0].Action -eq 'restrict') {
             if ([Windows.MessageBox]::Show("Restore the previous access of $($done.Count) agent(s)?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
             $recs = @(Invoke-AccessRestore -Records $done -PassThru)
@@ -3942,6 +3942,7 @@ function New-ConsoleWindow {
             & $script:ctx.Idle 'Removed the sponsors and owners that were added.'
             return
         }
+        $back = @($done | ForEach-Object { $script:ctx.RowById[[string]$_.Id] } | Where-Object { $_ })
         if ($back.Count -eq 0) { return }
         $verb = if ($done[0].Action -eq 'block') { 'Unblock' } else { 'Block' }
         & $script:ctx.Apply $verb $back
@@ -3962,11 +3963,21 @@ function New-ConsoleWindow {
     $script:ctx
 }
 
+# When blocking, drop agents that are already blocked; when unblocking, keep only the blocked ones.
+function Select-ActionTargets {
+    param([object[]]$Packages, [string]$Action)
+    switch ($Action) {
+        'block'   { @($Packages | Where-Object { -not $_.isBlocked }) }
+        'unblock' { @($Packages | Where-Object { $_.isBlocked }) }
+        default   { @($Packages) }
+    }
+}
+
 function Show-Console {
     if (($null -ne $IsWindows -and -not $IsWindows) -or [Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         throw '-Gui needs Windows and a single-threaded apartment. Start it with: pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui'
     }
-    $script:ctx = New-ConsoleWindow
+    $null = New-ConsoleWindow
     $script:ctx.Window.Add_ContentRendered({ if (-not $script:ctx.Loaded) { $script:ctx.Loaded = $true; & $script:ctx.Load } })
     [void]$script:ctx.Window.ShowDialog()
 }
@@ -3997,7 +4008,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $acts = @($data.Activities | Where-Object { $_.Time -ge $cutoff -and $_.TitleId })
         if ($RiskyOnly) { $acts = @($acts | Where-Object { $_.Risk -ne 'None' }) }
         if ($ForAgent) {
-            $ids = @(Resolve-Packages $ForAgent | ForEach-Object { $_.id })
+            $ids = @(Resolve-Packages $ForAgent -Catalog $pk | ForEach-Object { $_.id })
             $mine = @($acts | Where-Object { $ids -contains $_.TitleId } | Sort-Object Time -Descending)
             foreach ($id in $ids) {
                 $rows = @($mine | Where-Object { $_.TitleId -eq $id })
@@ -4027,7 +4038,7 @@ switch ($PSCmdlet.ParameterSetName) {
     'Policy' {
         if (-not (Test-Path -LiteralPath $Policy)) { throw "Policy file not found: $Policy" }
         $doc = Get-Content -Raw -LiteralPath $Policy | ConvertFrom-Json
-        Write-Host ("Policy: {0} ({1} rule(s))" -f $(if ($doc.name) { $doc.name } else { $Policy }), @($doc.rules).Count) -ForegroundColor Cyan
+        Write-Host ("Policy: {0} ({1} rule(s))" -f $(if ($doc.name) { $doc.name } else { $Policy }), @($doc.rules | Where-Object { $_ }).Count) -ForegroundColor Cyan
         Invoke-PolicyPlan -Plan @(Get-PolicyPlan -PolicyDoc $doc) -Apply:$Apply
     }
     'Snapshot' {
@@ -4111,11 +4122,12 @@ switch ($PSCmdlet.ParameterSetName) {
         $owner = Get-UserInfo $To
         if (-not $owner.Exists -or -not $owner.Enabled) { throw "'$To' is not an existing, enabled user." }
         $targets = @(Resolve-Packages $Reassign)
-        $skipped = @($targets | Where-Object { -not (Test-Reassignable $_) })
+        $sendable = @($targets | Where-Object { Test-Reassignable $_ })
+        $skipped = @($targets | Where-Object { $sendable -notcontains $_ })
         if ($skipped.Count) {
             Write-Warning ("Skipped (the service only reassigns Copilot Studio shared agents that already have an owner): {0}" -f (($skipped | ForEach-Object { "$($_.displayName) [$(Get-ReassignBlock $_)]" }) -join '; '))
         }
-        $items = @($targets | Where-Object { (Test-Reassignable $_) -and $_.ownerId -ne $owner.Id } | ForEach-Object {
+        $items = @($sendable | Where-Object { $_.ownerId -ne $owner.Id } | ForEach-Object {
             [pscustomobject]@{ Id = $_.id; DisplayName = $_.displayName; Platform = $_.platform; CurrentOwnerId = $_.ownerId; CurrentOwner = ''
                                State = 'Manual'; Reason = ''; Proposed = $owner.Upn; Source = 'Manual'; NewOwnerId = $owner.Id; NewOwnerUpn = $owner.Upn } })
         Write-Host ("{0} agent(s) will be assigned to {1}." -f $items.Count, $owner.Upn) -ForegroundColor Cyan
@@ -4141,6 +4153,7 @@ switch ($PSCmdlet.ParameterSetName) {
             if (Confirm-Batch -Count $accountChanges.Count -Action 'remove accountability for') { Invoke-AccountabilityRemove -Records $accountChanges }
         }
         if ($ownerChanges.Count -gt 0) {
+            Initialize-UserCache -Ids @($ownerChanges | ForEach-Object { $_.WasOwner })
             $back = foreach ($r in $ownerChanges) {
                 $prev = Get-UserInfo $r.WasOwner
                 if (-not $prev.Exists -or -not $prev.Enabled) { Write-Warning ('Cannot restore the owner of {0}: the previous owner no longer exists or is disabled.' -f $r.DisplayName); continue }
@@ -4150,13 +4163,14 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
         if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
-        $catalog = @(Get-Packages)
-        $restore = @{ block = @(); unblock = @() }
+        $byId = @{}
+        foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
+        $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
         foreach ($r in $changed) {
-            $pkg = $catalog | Where-Object { $_.id -eq $r.Id } | Select-Object -First 1
+            $pkg = $byId[[string]$r.Id]
             if (-not $pkg) { Write-Warning "Package $($r.Id) no longer exists; skipped."; continue }
             $wasBlocked = [string]$r.WasBlocked -eq 'True'
-            $restore[$(if ($wasBlocked) { 'block' } else { 'unblock' })] += $pkg
+            $restore[$(if ($wasBlocked) { 'block' } else { 'unblock' })].Add($pkg)
         }
         Write-Host ("Undo restores {0} package(s) to their state before the logged run." -f ($restore.block.Count + $restore.unblock.Count)) -ForegroundColor Cyan
         foreach ($verb in 'block', 'unblock') {
@@ -4200,9 +4214,7 @@ switch ($PSCmdlet.ParameterSetName) {
     }
     'Stale'   {
         $matched = @(Get-StalePackages -Days $StaleDays -By $By -AgentsOnly:$AgentsOnly -IncludeNeverSeen:$IncludeNeverSeen)
-        # When blocking, drop ones already blocked; when unblocking, only the blocked ones.
-        if     ($Action -eq 'block')   { $matched = @($matched | Where-Object { -not $_.isBlocked }) }
-        elseif ($Action -eq 'unblock') { $matched = @($matched | Where-Object { $_.isBlocked }) }
+        $matched = @(Select-ActionTargets $matched $Action)
 
         $basisText = if ($By -eq 'activity') {
             if ($IncludeNeverSeen) { 'no activity (incl. never-seen)' } else { 'reported but idle' }
@@ -4227,8 +4239,7 @@ switch ($PSCmdlet.ParameterSetName) {
     }
     'Risky'   {
         $matched = @(Get-RiskyPackages -Days $RiskDays -MinAlerts $MinAlerts -MinSeverity $MinSeverity -AgentsOnly:$AgentsOnly -Source $RiskSource)
-        if     ($Action -eq 'block')   { $matched = @($matched | Where-Object { -not $_.isBlocked }) }
-        elseif ($Action -eq 'unblock') { $matched = @($matched | Where-Object { $_.isBlocked }) }
+        $matched = @(Select-ActionTargets $matched $Action)
 
         Write-Host ("`nAgents with >= {0} risk signal(s) (source: {5}) at/above {1} severity in {2} days: {3} match(es){4}." -f
             $MinAlerts, $MinSeverity, $RiskDays, $matched.Count,
