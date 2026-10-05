@@ -1295,3 +1295,23 @@ Describe 'Policy: AI activity and restrict' {
         Should -Invoke Invoke-AvailabilityChange -Times 1 -ParameterFilter { $To -eq 'None' -and $IncludeDeployment -and @($Packages).Count -eq 1 }
     }
 }
+
+Describe 'Find-DirectoryGroups' {
+    It 'searches by name or mail prefix, labels the group kind and sorts by name' {
+        $script:uri = ''
+        Mock Invoke-Graph {
+            $script:uri = $Uri
+            @{ value = @(
+                @{ id = 'g2'; displayName = 'Zeta'; mail = $null; groupTypes = @(); securityEnabled = $true },
+                @{ id = 'g1'; displayName = 'Alpha'; mail = 'a@x.com'; groupTypes = @('Unified'); securityEnabled = $false }) }
+        }
+        $g = @(Find-DirectoryGroups -Text "O'Neil")
+        $g.Name | Should -Be @('Alpha', 'Zeta')
+        $g[0].Kind | Should -Be 'Microsoft 365'; $g[1].Kind | Should -Be 'Security'
+        [uri]::UnescapeDataString($script:uri) | Should -BeLike "*startswith(displayName,'O''Neil') or startswith(mail,'O''Neil')*"
+    }
+    It 'lists groups when no text is given' {
+        Mock Invoke-Graph { @{ value = @() } }
+        @(Find-DirectoryGroups -Text '').Count | Should -Be 0
+    }
+}

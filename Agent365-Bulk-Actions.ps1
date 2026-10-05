@@ -2784,20 +2784,39 @@ function New-ConfirmDialog {
 $RestrictXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Restrict access" Width="560" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        Title="Restrict access" Width="580" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
   <StackPanel Margin="28,24,28,22">
     <TextBlock Text="Restrict who can use the selected agents" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
     <TextBlock x:Name="Info" Foreground="#4B5563" Margin="0,4,0,14" TextWrapping="Wrap"/>
     <RadioButton x:Name="OptNone" GroupName="scope" IsChecked="True" Margin="0,0,0,8" Content="Nobody: the agent stays in the catalog, no one can use it"/>
     <RadioButton x:Name="OptOwner" GroupName="scope" Margin="0,0,0,8" Content="Its owner only"/>
-    <RadioButton x:Name="OptUsers" GroupName="scope" Margin="0,0,0,6" Content="These users and groups"/>
-    <TextBox x:Name="Users" AcceptsReturn="True" Height="72" Margin="22,0,0,8" Padding="6" BorderBrush="#D1D5DB" VerticalScrollBarVisibility="Auto"
-             IsEnabled="{Binding IsChecked, ElementName=OptUsers}" ToolTip="One per line: an email address, or group:Group name (or group:object id)"/>
+    <RadioButton x:Name="OptUsers" GroupName="scope" Margin="0,0,0,6" Content="These users and groups, picked from Entra"/>
+    <StackPanel x:Name="PickPanel" Margin="22,0,0,8" IsEnabled="{Binding IsChecked, ElementName=OptUsers}">
+      <DockPanel>
+        <Border DockPanel.Dock="Right" Background="#E5E7EB" CornerRadius="7" Padding="1" Margin="8,0,0,0" VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal">
+            <RadioButton x:Name="KindUsers" Content="Users" GroupName="kind" IsChecked="True" Style="{DynamicResource Seg}" ToolTip="Search people"/>
+            <RadioButton x:Name="KindGroups" Content="Groups" GroupName="kind" Style="{DynamicResource Seg}" ToolTip="Search groups (asks for group read access the first time)"/>
+          </StackPanel>
+        </Border>
+        <Grid>
+          <TextBox x:Name="PickSearch" Padding="8,6" BorderBrush="#D1D5DB"/>
+          <TextBlock x:Name="PickHint" Text="Search the directory by name or email" Foreground="#9CA3AF" IsHitTestVisible="False" Margin="10,0,0,0" VerticalAlignment="Center"/>
+        </Grid>
+      </DockPanel>
+      <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Margin="0,6,0,0" Background="#F9FAFB">
+        <ListBox x:Name="PickResults" Height="104" BorderThickness="0" Background="Transparent" Padding="2" ToolTip="Double-click to add"/>
+      </Border>
+      <TextBlock Text="Selected (double-click to remove)" Foreground="#4B5563" FontSize="12" Margin="0,8,0,3"/>
+      <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="6" Background="White">
+        <ListBox x:Name="PickChosen" Height="64" BorderThickness="0" Background="Transparent" Padding="2"/>
+      </Border>
+    </StackPanel>
     <RadioButton x:Name="OptAll" GroupName="scope" Margin="0,0,0,12" Content="Everyone (reopen the agent)"/>
     <CheckBox x:Name="Deploy" Margin="0,0,0,12" Content="Also change who the agent is deployed to" ToolTip="Deployment is the set of people it is installed for; availability is the set who may use it."/>
     <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB">
-      <ListBox x:Name="Names" MaxHeight="130" BorderThickness="0" Background="Transparent" Padding="6,4"/>
+      <ListBox x:Name="Names" MaxHeight="110" BorderThickness="0" Background="Transparent" Padding="6,4"/>
     </Border>
     <TextBlock x:Name="Note" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap" Text="Reverse this with Undo last run, or by choosing Everyone."/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
@@ -2808,8 +2827,23 @@ $RestrictXaml = @'
 </Window>
 '@
 
-# Ask how to restrict the selected rows. Returns @{ To; OwnerOnly; Entities; Deploy }, or $null when cancelled.
-function Read-RestrictChoice {
+# Groups by name prefix (enabled or not: a group has no sign-in state).
+function Find-DirectoryGroups {
+    param([string]$Text, [int]$Top = 40)
+    $uri = "https://graph.microsoft.com/v1.0/groups?`$top=$Top&`$select=id,displayName,mail,groupTypes,securityEnabled"
+    $q = $Text.Trim()
+    if ($q) {
+        $e = $q.Replace("'", "''")
+        $uri += "&`$filter=" + [uri]::EscapeDataString("startswith(displayName,'$e') or startswith(mail,'$e')")
+    }
+    $r = Invoke-Graph -Uri $uri
+    @($r.value | Sort-Object displayName | ForEach-Object {
+        [pscustomobject]@{ Id = $_.id; Name = $_.displayName; Mail = $_.mail; Kind = $(if (@($_.groupTypes) -contains 'Unified') { 'Microsoft 365' } elseif ($_.securityEnabled) { 'Security' } else { 'Distribution' }) }
+    })
+}
+
+# Build the restrict dialog (not shown yet). The users and groups come from a searchable list over the directory.
+function New-RestrictDialog {
     param([object[]]$Rows, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($RestrictXaml)
     if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
@@ -2818,25 +2852,79 @@ function Read-RestrictChoice {
     $names = $d.FindName('Names')
     foreach ($r in @($Rows) | Select-Object -First 40) { [void]$names.Items.Add(('{0}    (now: {1})' -f $r.Name, (Get-AccessLabel $r.Package.availableTo))) }
     if ($count -gt 40) { [void]$names.Items.Add("... and $($count - 40) more") }
-    $script:restrictDialog = $d; $script:restrictResult = $null
+
+    $script:restrictPicker = @{ Window = $d; Search = $d.FindName('PickSearch'); Hint = $d.FindName('PickHint'); Results = $d.FindName('PickResults'); Chosen = $d.FindName('PickChosen'); Note = $d.FindName('Note') }
+    $script:restrictResult = $null
+    $p = $script:restrictPicker
+    $p.Kind = { if ($script:restrictPicker.Window.FindName('KindGroups').IsChecked) { 'group' } else { 'user' } }
+    $p.AddItem = {
+        param($entity)
+        $c = $script:restrictPicker.Chosen
+        if (@($c.Items | Where-Object { $_.Tag.resourceId -eq $entity.resourceId }).Count) { return }
+        $item = New-Object Windows.Controls.ListBoxItem
+        $item.Content = ('{0}: {1}' -f (Get-Culture).TextInfo.ToTitleCase($entity.resourceType), $entity.Label); $item.Tag = $entity; $item.Padding = '6,3'
+        [void]$c.Items.Add($item)
+    }
+    $p.Run = {
+        $q = $script:restrictPicker
+        $kind = & $q.Kind
+        $q.Note.Text = 'Searching...'
+        try {
+            if ($kind -eq 'group' -and -not (Test-GraphScope 'Group.Read.All')) {
+                $q.Note.Text = 'Granting group read access: finish the sign-in window...'
+                Request-GraphScope 'Group.Read.All'
+            }
+            $found = if ($kind -eq 'group') { @(Find-DirectoryGroups -Text $q.Search.Text) } else { @(Find-DirectoryUsers -Text $q.Search.Text) }
+            $q.Results.Items.Clear()
+            foreach ($f in $found) {
+                $item = New-Object Windows.Controls.ListBoxItem
+                if ($kind -eq 'group') { $item.Content = ('{0}    ({1})' -f $f.Name, $f.Kind); $item.Tag = [pscustomobject]@{ resourceType = 'group'; resourceId = $f.Id; Label = $f.Name } }
+                else { $item.Content = ('{0}    ({1})' -f $f.Name, $f.Upn); $item.Tag = [pscustomobject]@{ resourceType = 'user'; resourceId = $f.Id; Label = $f.Upn } }
+                $item.Padding = '6,3'
+                [void]$q.Results.Items.Add($item)
+            }
+            $q.Note.Text = if ($found.Count -eq 0) { "No matching $($kind)s." } elseif ($found.Count -ge 40) { 'Showing the first 40. Type more to narrow the list. Double-click to add.' } else { "$($found.Count) $kind(s). Double-click to add." }
+        } catch {
+            $q.Note.Text = 'Could not read the directory: ' + $_.Exception.Message
+            if ($kind -eq 'group') { $q.Window.FindName('KindUsers').IsChecked = $true }
+        }
+    }
+    $timer = New-Object Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(350)
+    $p.Timer = $timer
+    $timer.Add_Tick({ $script:restrictPicker.Timer.Stop(); & $script:restrictPicker.Run })
+    $p.Search.Add_TextChanged({
+        $script:restrictPicker.Hint.Visibility = if ($script:restrictPicker.Search.Text) { 'Collapsed' } else { 'Visible' }
+        $script:restrictPicker.Timer.Stop(); $script:restrictPicker.Timer.Start()
+    })
+    $d.FindName('KindUsers').Add_Checked({ $script:restrictPicker.Results.Items.Clear(); & $script:restrictPicker.Run })
+    $d.FindName('KindGroups').Add_Checked({ $script:restrictPicker.Results.Items.Clear(); & $script:restrictPicker.Run })
+    $d.FindName('OptUsers').Add_Checked({ if ($script:restrictPicker.Results.Items.Count -eq 0) { & $script:restrictPicker.Run } })
+    $p.Results.Add_MouseDoubleClick({ $sel = $script:restrictPicker.Results.SelectedItem; if ($sel) { & $script:restrictPicker.AddItem $sel.Tag } })
+    $p.Chosen.Add_MouseDoubleClick({ $sel = $script:restrictPicker.Chosen.SelectedItem; if ($sel) { $script:restrictPicker.Chosen.Items.Remove($sel) } })
+
     $d.FindName('BtnOk').Add_Click({
-        $dlg = $script:restrictDialog; $note = $dlg.FindName('Note')
+        $dlg = $script:restrictPicker.Window; $note = $dlg.FindName('Note')
         try {
             $to = 'None'; $ownerOnly = $false; $entities = @()
             if ($dlg.FindName('OptOwner').IsChecked) { $to = 'Some'; $ownerOnly = $true }
             elseif ($dlg.FindName('OptUsers').IsChecked) {
                 $to = 'Some'
-                $lines = @($dlg.FindName('Users').Text -split '[\r\n;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-                if (-not $lines.Count) { throw 'Enter at least one user or group.' }
-                $groups = @($lines | Where-Object { $_ -like 'group:*' } | ForEach-Object { $_.Substring(6).Trim() })
-                $users = @($lines | Where-Object { $_ -notlike 'group:*' })
-                $entities = @(Resolve-AccessEntities -Users $users -Groups $groups)
+                $entities = @($script:restrictPicker.Chosen.Items | ForEach-Object { $_.Tag })
+                if (-not $entities.Count) { throw 'Pick at least one user or group: search, then double-click a result.' }
             }
             elseif ($dlg.FindName('OptAll').IsChecked) { $to = 'All' }
             $script:restrictResult = @{ To = $to; OwnerOnly = $ownerOnly; Entities = $entities; Deploy = [bool]$dlg.FindName('Deploy').IsChecked }
             $dlg.DialogResult = $true
         } catch { $note.Text = $_.Exception.Message; $note.Foreground = '#B91C1C' }
     })
+    $d
+}
+
+# Ask how to restrict the selected rows. Returns @{ To; OwnerOnly; Entities; Deploy }, or $null when cancelled.
+function Read-RestrictChoice {
+    param([object[]]$Rows, [System.Windows.Window]$Owner)
+    $d = New-RestrictDialog -Rows $Rows -Owner $Owner
     if ($d.ShowDialog()) { $script:restrictResult } else { $null }
 }
 
