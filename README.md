@@ -1,170 +1,204 @@
 # Agent365-Bulk-Actions
 
-A single PowerShell tool for **Agent 365 / Microsoft 365 Copilot** administrators to **list, block, unblock, and bulk‑retire stale agents** in the organization catalog, through the Microsoft Graph **Copilot Package Management API**.
-
-Beyond one‑off actions, it can bulk‑block **stale** agents — those that have stopped sending usage telemetry, or whose package manifest hasn't been updated in a set number of days.
+A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot administrators. It lists, inspects, contains and governs the agents in the organization catalog in bulk, from the command line or from a desktop console.
 
 > [!IMPORTANT]
-> This tool targets the Microsoft Graph **`/beta`** endpoint, which Microsoft does not recommend for production automation. Validate in a lab tenant before using it against production.
+> The tool calls Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
 
----
+## Contents
 
-## What you can do with it
+- [Features](#features)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Permissions](#permissions)
+- [Safety model](#safety-model)
+- [How it works](#how-it-works)
+- [Guides](#guides)
+  - [Find and inspect agents](#find-and-inspect-agents)
+  - [Block, unblock and undo](#block-unblock-and-undo)
+  - [Find stale agents](#find-stale-agents)
+  - [Find risky agents](#find-risky-agents)
+  - [Ownership](#ownership)
+  - [Entra accountability](#entra-accountability)
+  - [Restrict who can use an agent](#restrict-who-can-use-an-agent)
+  - [AI activity from Purview](#ai-activity-from-purview)
+  - [Contain and clean up](#contain-and-clean-up)
+  - [Policy file](#policy-file)
+  - [Snapshots and change reports](#snapshots-and-change-reports)
+  - [Graphical console](#graphical-console)
+- [Parameter reference](#parameter-reference)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Appendix: hunting queries](#appendix-hunting-queries)
+- [Development](#development)
+- [Disclaimer](#disclaimer)
 
-- **List** every agent and see which are already blocked.
-- **Block / unblock** one or many agents by display name and/or `P_` id in a single command.
-- **Pick** agents interactively from a grid or numbered menu — no need to type names.
-- Find and **block stale agents** by inactivity (Defender telemetry) or by manifest age.
-- **Preview everything first** with a dry run (`-WhatIf` or `-Action list`) before changing anything.
-- Find **risky** agents from alerts and from Defender detections that never raised an alert.
-- Fix **ownership** gaps: propose an owner for orphaned shared agents, or assign one by hand.
-- **Contain** agents by also disabling their Entra identity, and see each agent's blast radius first.
-- Track **delete candidates** (agents that stayed blocked) for clean-up in the admin center.
-- Run a repeatable **policy file**, keep **snapshots**, and **undo** a run from its log.
-- **Restrict who can use an agent** (nobody, its owner, named users and groups) as a softer step than blocking, with the old scope saved for undo.
-- Give agents with no accountable person a **sponsor** (and optionally an owner) on their Entra identity, derived from the owner chain.
-- Drive a **policy** from the AI activity signals, for example restrict any agent with repeated runtime-protection blocks.
-- See the **risky AI activity of each agent** (jailbreak attempts, prompt injection, blocked tool calls) from the Purview audit log.
-- See the **full record of any agent** (sharing, tools, MCP servers, permissions, identity) and export an inventory.
-- Use the **graphical console** (`-Gui`) for all of the above.
+## Features
 
-> Blocking is fully reversible — the same tool re‑enables an agent with `-Unblock`.
+| Area | What it does | Main parameters |
+| --- | --- | --- |
+| Inventory | List every agent, show the full record of one, export one row per agent with tools, MCP servers, sharing and permissions | `-List`, `-Detail`, `-Inventory` |
+| Block and unblock | Block or unblock agents by name or id, from a picker, or from a CSV; reverse any run from its log | `-Block`, `-Unblock`, `-Select`, `-FromCsv`, `-Undo` |
+| Stale agents | Find agents with no usage telemetry, or an old manifest, and block them | `-Stale` |
+| Risky agents | Find agents with Defender AI-security alerts or detections, ranked by severity, and block them | `-Risky` |
+| Ownership | Propose an owner for shared agents whose owner is missing, or assign one by hand | `-Ownerless`, `-Reassign` |
+| Accountability | Give Entra agent identities a sponsor (and optionally an owner), proposed from the owner chain | `-Accountability`, `-AddSponsor` |
+| Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
+| AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
+| Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
+| Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
+| Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
+| Console | A desktop window with filters, a details window and buttons for all of the above | `-Gui` |
 
-## How it works
+## Requirements
 
-The script wraps three Graph beta endpoints:
+- An **Agent 365 license** on the tenant (the catalog API returns packages only with it).
+- **PowerShell 7 or later** is recommended. The `Microsoft.Graph.Authentication` module installs itself on first run.
+- An administrator who can consent to the permissions listed below, for example an AI Administrator or Global Administrator.
+- Stale-by-activity, risky agents, inventory details and policies also read **Defender Advanced Hunting**: a Microsoft Defender or Microsoft 365 E5 license with Security for AI onboarded.
+- The console needs Windows.
 
-```
-GET  /beta/copilot/admin/catalog/packages              (list)
-POST /beta/copilot/admin/catalog/packages/{id}/block   (block)
-POST /beta/copilot/admin/catalog/packages/{id}/unblock (unblock)
-```
-
-`block` / `unblock` are **delegated‑only** (there is no app‑only permission), so the script signs an administrator in interactively and requests `CopilotPackages.ReadWrite.All`. Read‑only actions use `CopilotPackages.Read.All`. Activity‑based staleness additionally queries **Defender Advanced Hunting** (`/security/runHuntingQuery`), which needs `ThreatHunting.Read.All`.
-
-On each run the script: ensures the `Microsoft.Graph.Authentication` module is installed → signs you in requesting only the scopes the chosen action needs → retrieves the catalog → resolves your targets → applies the action and prints an `OK`/`FAIL` summary.
-
-## Prerequisites
-
-- **Agent 365 license** on the tenant (required for the catalog API to return packages).
-- For activity‑based staleness: a **Microsoft Defender / Microsoft 365 E5** license with **Security for AI** onboarded.
-- **PowerShell 7+** recommended. The `Microsoft.Graph.Authentication` module installs automatically on first run.
-- An account able to consent to the scopes below (e.g. **AI Administrator**).
-
-### Permissions (delegated scopes)
-
-| Scope | When it is requested |
-| --- | --- |
-| `CopilotPackages.Read.All` | Read‑only actions (`-List`, or any mode with `-Action list`) |
-| `CopilotPackages.ReadWrite.All` | Blocking or unblocking agents |
-| `ThreatHunting.Read.All` | Activity‑based staleness (`-Stale -By activity`) |
-| `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities (`-Accountability -Action assign`, `-AddSponsor`, and **Apply suggested** on the sponsor filters). Needs the Agent ID Administrator role. The console asks for it only when you use that button. |
-| `Group.Read.All` | Naming a group in `-AllowGroups` or a policy rule |
-| `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, and the *AI activity* tab in the console). Needs admin consent and a Purview audit role (for example Audit Reader). |
-
-## Getting started
+## Quick start
 
 ```powershell
-# 1. Save Agent365-Bulk-Actions.ps1 to a folder and cd into it
+# 1. Save Agent365-Bulk-Actions.ps1 to a folder and open PowerShell 7 there
 cd C:\Path\To\Scripts
 
-# 2. Run any command below. On first run it installs the Graph auth module
-#    (if needed) and opens a sign-in prompt. Sign in and consent to the scopes.
-.\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
-```
-
-Pass `-TenantId <guid-or-domain>` to target a specific tenant (otherwise your account's home tenant is used). On a machine where interactive/WAM sign‑in misbehaves, add `-DeviceCode`.
-
-## What "stale" means
-
-Two ways to measure staleness, chosen with `-By`:
-
-| `-By` | Needs Defender? | What "stale" means |
-| --- | --- | --- |
-| `activity` *(default)* | Yes | Reported telemetry before, but idle beyond the cutoff (max provable window ~30 days). |
-| `modified` | No | Package manifest (`lastModifiedDateTime`) not updated within the cutoff. |
-
-By default, activity mode only treats agents that **have** reported telemetry but gone idle as stale — built‑ins/add‑ins that never emit telemetry are skipped. Add `-IncludeNeverSeen` to also flag agents with zero telemetry.
-
-> [!IMPORTANT]
-> Advanced Hunting keeps only about **30 days** of data, so `-By activity` can only detect agents that reported within the last 30 days and then went quiet. Use `-StaleDays` below 30 for that. With `-StaleDays` of 30 or more, the script stops with an explanation unless you add `-IncludeNeverSeen`, in which case "stale" means "no activity in the last 30 days". Use `-By modified` for longer horizons.
-
-Telemetry is matched to catalog packages through `AgentsInfo`: a package `id` equals the agent's `titleId`, and the registry id, Entra agent id, observability id, source id and bot id seen in events all resolve to that `titleId`. Display names are never used for matching.
-
-## Scenarios
-
-```powershell
-# List all Copilot agents and their blocked state
+# 2. List the Copilot agents (signs you in and asks for consent on first run)
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
-# Block specific agents by name and/or package id (P_ or T_), comma-separated
-.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent","Northwind Sales Agent","P_19ae1zz1-..."
-.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf                   # preview, changes nothing
-.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -Force -OutFile .\blocked.csv   # no prompt, keep a log
+# 3. Preview a change before making it
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf
 
-# Pick agents from a list (grid or numbered menu). Default action = block.
-.\Agent365-Bulk-Actions.ps1 -Select -AgentsOnly
-.\Agent365-Bulk-Actions.ps1 -Select -Action unblock -AgentsOnly
-
-# Preview stale agents (safe dry run — changes nothing)
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -Action list
-
-# Block stale agents by inactivity (preview + confirm; -Force skips the prompt)
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -AgentsOnly
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -Force
-
-# Compute the stale set, then hand-pick which to block
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -Pick -AgentsOnly
-
-# Also treat agents that never reported telemetry as stale (sweeps the whole catalog)
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -IncludeNeverSeen -Action list
-
-# Stale by manifest age instead of telemetry (no Defender needed)
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -By modified -AgentsOnly
-
-# List RISKY agents (those with Defender AI-security alerts), then block them
-.\Agent365-Bulk-Actions.ps1 -Risky -Action list                 # dry run: severity, alert count, and WHY
-.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Action list   # only High-severity agents
-.\Agent365-Bulk-Actions.ps1 -Risky -RiskDays 30 -MinAlerts 2 -MinSeverity Medium -AgentsOnly
-.\Agent365-Bulk-Actions.ps1 -Risky -Pick                        # pick which risky agents to block
-
-# Undo
-.\Agent365-Bulk-Actions.ps1 -Unblock "Contoso HR Agent","Northwind Sales Agent"
-
-# Block every agent listed in a CSV (Id or DisplayName column), keeping a log
-.\Agent365-Bulk-Actions.ps1 -FromCsv .\agents.csv -OutFile .\run.csv
-
-# Reverse that whole run later, using its log
-.\Agent365-Bulk-Actions.ps1 -Undo .\run.csv
-```
-
-### Graphical console
-
-```powershell
+# 4. Or open the console
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-Opens a Windows desktop window over the same catalog. It needs Windows and PowerShell 7 (or Windows PowerShell 5.1) in single-threaded mode, which `pwsh` uses by default.
+Add `-TenantId <guid-or-domain>` to target a specific tenant, and `-DeviceCode` if the interactive sign-in misbehaves. Everything that changes something prints what it will do, asks once (use `-Force` to skip the question) and can write a log with `-OutFile`.
 
-- **Browse**: the window opens on every agent in the catalog with no filter applied. Search by name, publisher, platform or id; filter All / Active / Blocked; optionally limit to Copilot agents.
-- **Filter**: the *Stale* and *Risk* dropdowns default to **None**. Pick a value to narrow the grid (no activity for 7 to 29 days, not modified for 30 to 365 days, or risk severity from Informational up to High, taken from alerts, detections or both); the matching columns fill in. The *Match* toggle controls how Stale and Risk combine: **All** (the default) needs both, **Any** accepts either. Search, status and Copilot-only always narrow on top. **Reset filters** returns everything to the unfiltered view.
-- **Act**: tick rows (or *Select visible*), then **Block selected** or **Unblock selected**. A "Confirm the action" dialog lists the agents and offers Cancel (the default) or the matching Block or Unblock button. Each action writes a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
-- **Ownership and blocked-for filters**: *Ownership > Needs an owner* lists shared agents with no usable owner, with a suggested replacement. Select rows and use **Apply suggested**, or **Assign owner...** to pick anyone from your Entra directory: type a name or email to search, click a person, then Assign. *Blocked* shows how long agents have stayed blocked (delete candidates). The grid shows only the columns relevant to the filters you turned on.
-- **Also disable identity** next to Block and Unblock adds the Entra identity step. The confirmation dialog shows each agent's active users and last use.
-- **Access and accountability**: the *Access* filter shows who each agent is available to; **Restrict access...** narrows or reopens it for the ticked agents. *Ownership > Missing an Entra sponsor* lists identities with no accountable person, and **Apply suggested** adds the proposed sponsor.
-- **Undo last run** reverses the previous block, unblock, access change or sponsor addition in the window. **Export** saves what the grid shows as CSV or JSON.
+## Permissions
 
-### Ownership: ownerless and orphaned agents
+The tool signs in with delegated permissions and requests only what the chosen mode needs.
+
+| Permission | Needed for |
+| --- | --- |
+| `CopilotPackages.Read.All` | Read-only modes (`-List`, `-Detail`, `-Inventory`, `-Snapshot`, and any mode with `-Action list`) |
+| `CopilotPackages.ReadWrite.All` | Blocking, unblocking, reassigning and restricting agents |
+| `ThreatHunting.Read.All` | Activity-based staleness, risky agents, inventory details, delete candidates, policies |
+| `User.Read.All`, `AgentIdentity.Read.All` | Ownership, accountability, inventory and the console |
+| `AgentIdentity.EnableDisable.All` | `-DisableIdentity` when the tool has to disable an identity itself, and the console |
+| `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
+| `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
+| `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
+| `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
+
+## Safety model
+
+- **Preview first.** `-WhatIf` shows what would happen. `-Action list` shows the matched set without acting.
+- **One confirmation per batch.** Each write mode lists its targets and asks once. `-Force` skips the question. A selection made in a picker counts as confirmation.
+- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners, access scope, and removes sponsors or owners the run added.
+- **Agents already in the target state are skipped.**
+- **Throttling is handled.** HTTP 429 and transient 5xx responses are retried with the service's delay; large reads are batched and writes are paced.
+- **Errors say why.** A failed call shows the service's own error code and message and the request that failed.
+
+## How it works
+
+| API | Used for |
+| --- | --- |
+| Graph beta `/copilot/admin/catalog/packages` | Listing agents, details, block, unblock, reassign, and the availability scope (PATCH) |
+| Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections and the per-agent records (tools, MCP servers, sharing) |
+| Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
+| Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
+
+On each run the tool ensures the `Microsoft.Graph.Authentication` module is present, signs in requesting only the permissions the chosen mode needs, reads the catalog, resolves your targets, applies the action and prints an `OK` or `FAIL` line per agent.
+
+## Guides
+
+### Find and inspect agents
 
 ```powershell
-# Preview shared agents whose owner is missing or gone, with a proposed replacement (changes nothing)
-.\Agent365-Bulk-Actions.ps1 -Ownerless
+.\Agent365-Bulk-Actions.ps1 -List -AgentsOnly                         # catalog with blocked state
+.\Agent365-Bulk-Actions.ps1 -Detail "Contoso HR Agent"                # everything about one agent
+.\Agent365-Bulk-Actions.ps1 -Detail "T_<guid>" -OutFile .\agent.json  # save it as JSON
+.\Agent365-Bulk-Actions.ps1 -Inventory -OutFile .\inventory.csv       # one row per agent
+.\Agent365-Bulk-Actions.ps1 -Inventory -Deep -WithPermissions -OutFile .\inventory-full.csv
+```
 
-# Apply the proposals (asks first; -WhatIf previews, -OutFile keeps a log)
-.\Agent365-Bulk-Actions.ps1 -Ownerless -Action reassign -OutFile .\owners.csv
+The picture is assembled from four places, because no single API holds all of it:
 
-# Manual assignment for agents the tool flagged for review
-.\Agent365-Bulk-Actions.ps1 -Reassign "HR Policy Assistant","Hesham-TEST" -To alex@contoso.com
+| Source | What it provides |
+| --- | --- |
+| Catalog package | Kind (shared by a creator, org-published, Microsoft, partner), platform, publisher, version, dates, owner, who can use it, deployment, usage |
+| Defender `AgentsInfo` | Declared tools (type, authentication, approval mode), MCP servers, data sources, capabilities, channels, model, sharing, publish and lifecycle status |
+| Entra | The agent identity, its owners and sponsors, and the permissions held by the identity and inherited from its blueprint |
+| Defender alerts and detections | The agent's risk signals for the last 30 days |
+
+`-Inventory` makes one catalog call and one Defender query. `-Deep` adds one call per agent for usage and availability, and `-WithPermissions` adds the identity's permissions, so both take longer on a large catalog. Fields a tenant does not populate are left blank.
+
+The **Platform** column shows the catalog's platform when it names one (Copilot Studio, Foundry, Microsoft 365 Copilot Agent Builder, Amazon Bedrock, SharePoint). Agents onboarded through the Agent 365 SDK are reported as `Not Available` by the catalog and `Other` by Defender, so they are recognised by their Entra agent identity and shown as **A365 SDK agent**; remaining store packages show as **Microsoft 365 app**.
+
+### Block, unblock and undo
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent","Northwind Sales Agent"   # by name or package id (P_ or T_)
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf                   # preview only
+.\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -Force -OutFile .\blocked.csv
+.\Agent365-Bulk-Actions.ps1 -Unblock "Contoso HR Agent"
+.\Agent365-Bulk-Actions.ps1 -Select -AgentsOnly                                 # pick from a list, then block
+.\Agent365-Bulk-Actions.ps1 -Select -Action unblock -AgentsOnly                 # pick from a list, then unblock
+.\Agent365-Bulk-Actions.ps1 -FromCsv .\agents.csv -OutFile .\run.csv            # every agent in a CSV (Id or DisplayName column)
+.\Agent365-Bulk-Actions.ps1 -Undo .\run.csv                                     # reverse a whole run from its log
+```
+
+Blocking is fully reversible with `-Unblock`.
+
+### Find stale agents
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -Action list         # preview
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -AgentsOnly          # block (preview, then confirm)
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -Pick                # choose which matches to block
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 30 -IncludeNeverSeen -Action list
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 90 -By modified -AgentsOnly   # manifest age, no Defender needed
+```
+
+| `-By` | Needs Defender | What stale means |
+| --- | --- | --- |
+| `activity` (default) | Yes | The agent reported telemetry in the last 30 days but has been idle for `-StaleDays`. |
+| `modified` | No | The package manifest has not changed for `-StaleDays`. |
+
+Advanced Hunting keeps about 30 days of data, so `-By activity` can only prove idleness inside that window. With `-StaleDays` of 30 or more the tool stops with an explanation unless you add `-IncludeNeverSeen`, which then means "no activity in the last 30 days"; use `-By modified` for longer horizons. By default, agents that never reported telemetry (built-ins and add-ins) are not treated as stale.
+
+Telemetry is matched to catalog packages through `AgentsInfo`: a package id equals the agent's `titleId`, and the agent id, Entra agent id, observability id, source id and bot id seen in events all resolve to it. Display names are never used for matching.
+
+### Find risky agents
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Risky -Action list                        # severity, signal count and why
+.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Action list
+.\Agent365-Bulk-Actions.ps1 -Risky -MinAlerts 2 -MinSeverity Medium -AgentsOnly
+.\Agent365-Bulk-Actions.ps1 -Risky -Pick                               # choose which to block
+.\Agent365-Bulk-Actions.ps1 -Risky -RiskSource Detections -Action list
+```
+
+Results carry **severity**, **alerts**, **detections**, **why** (alert titles and detection types), **categories** and the date of the last signal, worst first. Two kinds of signal are read from Advanced Hunting, because Defender can detect something without raising an alert:
+
+| Signal | Source | Tied to an agent by | Severity |
+| --- | --- | --- | --- |
+| Alert | `AlertInfo` with `AlertEvidence` (entity `AIAgent`) | The agent id in the evidence | The alert's own severity |
+| Real-time protection detection | `BehaviorEntities` (entity `AIAgent`) for `BehaviorAgentRTPAudit` and `BehaviorAgentRTPBlock`, with the block reason from `BehaviorInfo` | The Entra agent id in the entity | Block: High. Audit: Medium |
+| Prompt Shield detection | `BehaviorInfo` for `BehaviorPromptShieldJailbreakBlock` and `BehaviorPromptShieldJailbreakDetect` | The agent name, only when it is unique in `AgentsInfo` | Block: High. Detect: Medium |
+
+Behaviors carry no severity of their own, so the table is the mapping the tool applies: a block means an attack was stopped, an audit or detect means it was seen but not stopped. `-RiskSource Both|Alerts|Detections` chooses the signals.
+
+Not every signal can be attributed to a catalog agent. Defender for AI Services alerts name an Azure AI account rather than an agent, real-time block records can lack an agent identity, and a Prompt Shield record whose agent name is missing or duplicated is skipped. Run `-Risky -Action list` first, and override the default query with `-HuntingQuery` if it does not fit your tenant (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id).
+
+### Ownership
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Ownerless                                            # preview proposals, changes nothing
+.\Agent365-Bulk-Actions.ps1 -Ownerless -Action reassign -OutFile .\owners.csv     # apply the proposals
+.\Agent365-Bulk-Actions.ps1 -Reassign "Contoso HR Agent" -To alex@contoso.com     # by hand
 ```
 
 For each shared agent the tool decides, in this order:
@@ -172,199 +206,58 @@ For each shared agent the tool decides, in this order:
 1. **Keep** the current owner when the account exists and is enabled.
 2. **Agent identity owner**: the person registered as owner of the agent's Entra identity, the closest available record of who created it.
 3. **Manager** of that person, or of the former owner while the account still exists.
-4. **Flag for review.** Nothing is guessed or defaulted; assign these yourself with `-Reassign ... -To ...`.
+4. **Flag for review.** Nothing is guessed or defaulted; assign these by hand.
 
-Notes:
+The package API exposes no creator field, so step 2 is the creator substitute and applies only to agents with an Entra identity. Only Copilot Studio shared agents that already have an owner are sent to the reassign API; everything else is skipped with the reason. There is no call that clears an owner: reassigning to a different, valid user is the only operation. Reassignment is delegated-only, so it cannot run unattended.
 
-- The package API exposes no creator field, so step 2 is the creator substitute. It only applies to agents that have an Entra identity.
-- Only **shared** agents can be reassigned; `-Reassign` skips anything else with a warning, and the GUI button stays off until a shared agent is selected (the API answers 500 for other package types). Microsoft documents reassignment for shared Agent Builder and Copilot Studio agents; org-published (line-of-business) agents without an owner are counted but not acted on.
-- Reassign is **delegated-only** (the API has no application permission), so it cannot run unattended.
-- **Known problem in the test tenant:** every reassignment of a Copilot Studio agent failed with HTTP 424 ("An error occurred while reassigning the agent"), including an agent with a valid owner and a reassignment to its own current owner, so it is not caused by a missing owner or by the person chosen. Agents in a second environment fail too, with a clearer message: "The agent could not be reassigned in Power Platform ... please contact support and include the TraceResponse header", so the service is calling Power Platform and Power Platform refuses; the signed-in account was a Global Administrator and AI Administrator. For a support case, use the `request-id` and `client-request-id` values from the response (the TraceResponse header is not passed through to the caller). Try **Assign new owner** in the Microsoft 365 admin center (Agents > All agents), which one guide reports fails in environments with an IP firewall, or set the owner in Copilot Studio. Check with one agent before relying on this mode in your tenant.
-- The mode needs `User.Read.All` and `AgentIdentity.Read.All` in addition to `CopilotPackages.ReadWrite.All`.
+See [Limitations](#limitations) for a service-side failure that can affect Copilot Studio reassignment, and [Entra accountability](#entra-accountability) for an alternative that works on the agent identity.
 
-### Entra accountability: sponsors and owners
+### Entra accountability
 
-The package reassign API only applies to Copilot Studio agents, answers 424 for an agent that has no owner, and in the test tenant answered 424 for every Copilot Studio agent (see the note under Ownership). But every agent that has an Entra identity can carry a **sponsor** (the person accountable for why the agent exists and whether it is still needed; Microsoft requires at least one) and **owners** (technical administrators). Those relationships sit on the identity and can be filled in there.
+Every agent that has an Entra identity can carry a **sponsor** (the person accountable for why the agent exists and whether it is still needed; Microsoft requires at least one) and **owners** (technical administrators). These relationships live on the identity, so they can be filled in even when the package reassign API cannot help.
 
 ```powershell
-.\Agent365-Bulk-Actions.ps1 -Accountability                          # identities with no valid sponsor, and who would be added
-.\Agent365-Bulk-Actions.ps1 -Accountability -IncludeOwners           # also identities with no owner
-.\Agent365-Bulk-Actions.ps1 -Accountability -Action assign           # add the proposed people (one confirmation)
-.\Agent365-Bulk-Actions.ps1 -AddSponsor 'Contoso Hotel Concierge - HS' -To someone@contoso.com      # by hand, for the ones flagged for review
-.\Agent365-Bulk-Actions.ps1 -AddSponsor 'Agent' -To someone@contoso.com -AsOwner
+.\Agent365-Bulk-Actions.ps1 -Accountability                       # identities with no valid sponsor, and who would be added
+.\Agent365-Bulk-Actions.ps1 -Accountability -IncludeOwners        # also identities with no owner
+.\Agent365-Bulk-Actions.ps1 -Accountability -Action assign        # add the proposed people (one confirmation)
+.\Agent365-Bulk-Actions.ps1 -AddSponsor "Contoso HR Agent" -To someone@contoso.com
+.\Agent365-Bulk-Actions.ps1 -AddSponsor "Contoso HR Agent" -To someone@contoso.com -AsOwner
 ```
 
-The proposal follows the same order as ownership: the agent's own owner, an owner of its identity, then the manager of either (or of the former owner). If none can be found the agent is flagged for review and nothing is guessed. Sponsors are the default because they carry no technical privilege; owners can change credentials and re-enable the identity, so they are only added with `-IncludeOwners` or `-AsOwner`. Each addition is logged, and `-Undo` removes what a logged run added.
+The proposal follows the ownership order: the agent's own owner, an owner of its identity, then the manager of either. If none can be found the agent is flagged for review. Sponsors are the default because they carry no technical privilege; owners can change credentials and re-enable the identity, so they are added only with `-IncludeOwners` or `-AsOwner`. Each addition is logged and `-Undo` removes it.
 
-In the console, *Ownership > Missing an Entra sponsor* (or *Missing a sponsor or owner*) lists the identities with a gap and the suggested person; **Apply suggested** adds them after a confirmation. The console asks for the `AgentIdentity.ReadWrite.All` permission only at that point.
+- Agent user accounts (the accounts agents get) are not people. They are never offered in the pickers and never proposed, because the API rejects them as sponsors.
+- Groups can be sponsors (dynamic or Microsoft 365 groups only) and count as a valid sponsor when scanning.
+- An identity that cannot be read is reported separately instead of being counted as having no sponsor.
+- Owners are optional in Entra, so most identities have none; the owner scan is off by default for that reason.
+- Microsoft documents adding a sponsor for application permissions and an owner for delegated sign-in. If your tenant refuses the sponsor call, the log says so; add an owner instead or use the Entra admin center.
 
-> [!NOTE]
-> Microsoft documents adding a **sponsor** only for application permissions and an **owner** as a delegated call. In testing, both worked with a signed-in administrator (Agent ID Administrator role) and both were removed again by `-Undo`; if your tenant refuses the sponsor call, the log says so, and you can add an owner instead or use the Entra admin center. The accounts agents get (agent users) are not people: they are never offered in the pickers and never proposed as a sponsor or owner, because the API rejects them as sponsors. Groups can be sponsors (dynamic or Microsoft 365 groups only) and count as a valid sponsor when scanning. An identity that cannot be read is reported separately rather than counted as having no sponsor. Owners are optional in Entra, so most identities have none; the owner scan (`-IncludeOwners`) is therefore noisy and off by default.
+### Restrict who can use an agent
 
-### Containment, impact and clean-up
+Every agent has an availability scope: everyone, some users and groups, or nobody. Narrowing it is a softer containment than a block: the agent stays in the catalog and keeps working for the people you leave. The scope it had is read first and logged, so `-Undo` puts it back.
 
 ```powershell
-# Block, then confirm each agent's Entra identity ended up disabled (unblock: enabled). Only agents that have an identity are checked.
-.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -DisableIdentity -OutFile .\run.csv
-
-# See who would lose each agent before acting: active users, sessions and last use
-.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Impact -Action list
-
-# Blocked agents that have stayed blocked 30+ days (candidates for deletion)
-.\Agent365-Bulk-Actions.ps1 -DeleteCandidates -MinDaysBlocked 30 -OutFile .\delete-candidates.csv
+.\Agent365-Bulk-Actions.ps1 -Restrict "Contoso HR Agent"                                          # nobody
+.\Agent365-Bulk-Actions.ps1 -Restrict "Contoso HR Agent" -AvailableTo Some -OwnerOnly             # its owner only
+.\Agent365-Bulk-Actions.ps1 -Restrict "Contoso HR Agent" -AvailableTo Some -AllowUsers a@contoso.com -AllowGroups "HR team"
+.\Agent365-Bulk-Actions.ps1 -Restrict "Contoso HR Agent" -AvailableTo All                         # reopen
+.\Agent365-Bulk-Actions.ps1 -Undo .\restrict-log.csv                                              # restore a logged run
 ```
 
-- **`-DisableIdentity`** checks the agent's Entra identity after the block. Blocking a package that has an Agent ID already makes the platform disable that identity within about ten seconds, and unblocking re-enables it within seconds (observed on a Foundry agent; confirm for your other platforms). The tool waits up to 30 seconds, records `Disabled (by platform)` or `Enabled (by platform)` in the result log, and calls the identity API itself only if the platform left the identity in the wrong state (`Disabled (by tool)`, or `Failed` with the error). The forced path needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role.
-- **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
-- **`-DeleteCandidates`** does not delete anything. The catalog API has no delete, and nothing deletes blocked agents automatically; a block lasts until someone reverses it. The report lists blocked agents that have been blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files, plus the GUI's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add other log files or folders with `-History`) and from the `BlockedAgent` audit events, which Defender keeps for about 30 days. Agents whose block date cannot be determined are skipped unless you add `-IncludeUnknown`. Delete the listed agents in the admin center (**Agents > All agents > Delete**, then **Deleted > Permanently delete**), or for Copilot Studio agents through the Power Platform API.
+Add `-IncludeDeployment` to change who the agent is deployed to as well, `-WhatIf` to preview and `-OutFile` to keep the log. An agent that already has the target scope is skipped. With `-OwnerOnly`, an agent whose owner is missing or disabled is reported as failed rather than locked out of everyone. `-AllowUsers` and `-AllowGroups` are checked against Entra before anything changes.
 
-### Restricting who can use an agent
-
-Every agent in the catalog has an availability scope: everyone, some users and groups, or nobody. In the test tenant all 97 shared agents were open to everyone. Narrowing that is a softer containment than a block: the agent stays in the catalog and keeps working for the people you leave, and the scope it had is read first and written to the log so **Undo** puts it back. It uses the package `PATCH` (`availableTo`, `allowedUsersAndGroups`; optionally `deployedTo`).
-
-```powershell
-.\Agent365-Bulk-Actions.ps1 -Restrict 'Family Trails Guide'                                # nobody
-.\Agent365-Bulk-Actions.ps1 -Restrict 'Family Trails Guide' -AvailableTo Some -OwnerOnly   # its owner only
-.\Agent365-Bulk-Actions.ps1 -Restrict 'Family Trails Guide' -AvailableTo Some -AllowUsers a@contoso.com -AllowGroups 'Trail guides'
-.\Agent365-Bulk-Actions.ps1 -Restrict 'Family Trails Guide' -AvailableTo All               # reopen
-.\Agent365-Bulk-Actions.ps1 -Undo .\restrict-log.csv                                       # restore what a logged run changed
-```
-
-Add `-IncludeDeployment` to change who the agent is deployed to as well, `-WhatIf` to preview, and `-OutFile` to keep the log. An agent that already has the target scope is skipped. With `-OwnerOnly`, an agent whose owner is missing or disabled is reported as failed rather than locked out of everyone.
-
-In the console, the **Access** filter lists agents that are open to everyone, restricted to some, or available to nobody (and adds an *Available to* column). Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups or everyone; **Undo last run** restores the previous scope. For named people, the dialog has a searchable picker over your Entra directory: type a name or email, switch between **Users** and **Groups**, double-click a result to add it and double-click a selected entry to remove it (the first group search asks for the `Group.Read.All` permission). On the command line, `-AllowUsers` and `-AllowGroups` take typed values that are checked against Entra before anything changes.
-
-> [!NOTE]
-> The `PATCH` is a beta, delegated-only call (`CopilotPackages.ReadWrite.All`), so it needs a signed-in administrator. Restricting an agent changes who may use it; it does not stop an already-running session or change the agent's Entra identity (use **Also disable identity** with Block for that).
-
-### Policy file
-
-Declare your governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
-
-```powershell
-# Show what the policy would do (changes nothing)
-.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json
-
-# Run it (one confirmation for the whole plan; -WhatIf previews, -OutFile keeps a log)
-.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json -Apply -OutFile .\policy-run.csv
-```
-
-```json
-{
-  "name": "Agent governance baseline",
-  "exclude": { "publishers": ["Microsoft Corporation"], "types": ["firstParty"], "names": [], "ids": [] },
-  "rules": [
-    { "name": "Contain high-risk agents",
-      "when": { "risky": { "minSeverity": "High", "source": "Both" } },
-      "then": { "action": "block", "disableIdentity": true } }
-  ]
-}
-```
-
-| Part | Values |
-| --- | --- |
-| `when` conditions | `stale` (`by`: activity or modified, `days`, optional `includeNeverSeen`), `risky` (`minSeverity`, `minSignals`, `source`), `aiActivity` (see below), `blockedDays`, `ownerless` (true), `state` (blocked or active) |
-| `match` | `all` (default, every condition must hold) or `any` |
-| `then.action` | `block`, `unblock`, `reassign` (applies the proposed owners), `restrict` (change who can use the agent), or `report` (list only, the default) |
-| `then` for `restrict` | `availableTo`: `none` (default), `owner`, `some` (with `users` and/or `groups`) or `all`; optional `includeDeployment` |
-| `then.disableIdentity` | With `block`: also disable the agent's Entra identity |
-| `exclude` | Agents to leave alone, by `ids`, `names`, `publishers` or `types` |
-
-The **`aiActivity`** condition reads the Purview audit log (see [AI activity from Purview](#ai-activity-from-purview)) and matches agents with enough risky events in the window:
-
-```json
-{ "name": "Pull back agents that keep tripping runtime protection",
-  "when": { "aiActivity": { "days": 7, "minHigh": 3, "signals": ["Runtime protection blocked", "Jailbreak attempt"] } },
-  "then": { "action": "restrict", "availableTo": "owner" } }
-```
-
-`days` defaults to 7, `minHigh` to 1 and `minMedium` to 0; at least one of the two minimums must be 1 or more, so the rule cannot match every agent that has any activity. `signals` optionally limits which signals count. The plan lists why each agent matched (for example *3 high, 0 medium in 7 days: Runtime protection blocked x2*), and the audit search runs once per plan however many rules use it (about a minute for 7 days). Combine it with other conditions using `match`.
-
-A rule must have at least one condition, so a typo can never match the whole catalog. Rules that would change nothing (an agent already blocked) are shown but not counted. Reassignment, like the other write modes, needs a signed-in administrator and cannot run unattended.
-
-### Snapshots and change reports
-
-```powershell
-# Save today's inventory
-.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-01.json
-
-# Later: save a new one and list what changed since the old one
-.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-08.json -CompareTo .\inventory-2026-10-01.json -OutFile .\changes.csv
-```
-
-The report lists agents that are new or removed, newly blocked or unblocked, and those whose owner or version changed.
-
-### Agent inventory and details
-
-```powershell
-# Everything about one agent: sharing, tools, MCP servers, data sources, permissions, identity, usage
-.\Agent365-Bulk-Actions.ps1 -Detail "T_0d710c64-ab02-2686-9121-43a34b806ecd"
-.\Agent365-Bulk-Actions.ps1 -Detail "Contoso HR Agent" -OutFile .\agent.json
-
-# One row per agent, ready for Excel or a dashboard
-.\Agent365-Bulk-Actions.ps1 -Inventory -OutFile .\inventory.csv
-.\Agent365-Bulk-Actions.ps1 -Inventory -Deep -WithPermissions -OutFile .\inventory-full.csv
-```
-
-The picture is assembled from three places, because no single API has all of it:
-
-| Source | What it provides |
-| --- | --- |
-| Catalog package | Kind (shared by a creator, org-published, Microsoft, partner), publisher, version, dates, owner, who can use it, deployment, sharing lists, usage |
-| Defender `AgentsInfo` | Declared tools (with type, authentication and approval mode), MCP servers, data sources, capabilities, channels, model, sharing, published and lifecycle status |
-| Entra | The agent identity, its owners and sponsors, and the delegated and application permissions held by the identity and inherited from its blueprint |
-| Defender alerts and detections | The agent's risk signals for the last 30 days (severity, alert and detection counts, and each signal), the same ones `-Risky` uses |
-
-`-Inventory` makes one catalog call and one Defender query. `-Deep` adds one call per agent for usage and availability, and `-WithPermissions` adds the identity's permissions (agents with an identity only), so both take longer on a large catalog. Fields a tenant does not populate (for example `AgentsInfo.Permissions`, skills and guardrails were empty in the tenant used for testing) are simply blank.
-
-In the console, **Details...** (or a double-click on a row) opens a tabbed window: Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage and Risk, with **Export JSON**. The grid shows each agent's **Kind** by default, and the **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels (it reads the Defender records once).
-
-Two more filters answer questions about what agents can do. **Tools** lists agents that use an MCP server, have declared tools, or have none. **Permissions** lists agents whose Entra identity (or its blueprint) holds any permission, a Microsoft Graph application permission, or an MCP server permission, and adds a *Permissions held* column. The permission scan reads every agent that has an identity (94 in the test tenant, about a minute and a half the first time) and is cached until you refresh. Both combine with the other filters.
-
-### Risky agents
-
-`-Risky` finds agents with Defender **Security for AI** signals and enriches each with **`severity`**, **`alerts`**, **`detections`**, **`why`** (alert titles and detection types), **`categories`** and the date of the last signal. Results are sorted worst-severity-first. Use `-MinSeverity` and `-MinAlerts` to narrow them, then block with the same preview and confirm/pick flow.
-
-Two kinds of signal are read from Advanced Hunting, because Defender can detect something without raising an alert:
-
-| Signal | Source | How it is tied to an agent | Severity |
-| --- | --- | --- | --- |
-| Alert | `AlertInfo` with `AlertEvidence` (entity `AIAgent`) | The agent id in the evidence | The alert's own severity |
-| Real-time protection detection | `BehaviorEntities` (entity `AIAgent`) for `BehaviorAgentRTPAudit` and `BehaviorAgentRTPBlock`, with the block reason from `BehaviorInfo` | The Entra agent id in the entity | Block: High. Audit: Medium |
-| Prompt Shield detection | `BehaviorInfo` for `BehaviorPromptShieldJailbreakBlock` and `BehaviorPromptShieldJailbreakDetect` | The agent name only, matched when the name is unique in `AgentsInfo` | Block: High. Detect: Medium |
-
-Behaviors carry no severity of their own, so the table above is the mapping the script applies (a block means an attack was stopped; an audit or detect means it was seen but not stopped). Choose the signals with `-RiskSource Both|Alerts|Detections`; in the console use the *from* dropdown next to *Risk*.
-
-> [!NOTE]
-> Not every signal can be attributed to a catalog agent. "Defender for AI Services" alerts name an Azure AI account rather than an agent, `BehaviorAIAgentsRealTimeBlock` records carry no agent identity, and a Prompt Shield record whose agent name is missing or duplicated in `AgentsInfo` is skipped. **Always run `-Risky -Action list` first**, and if the default query doesn't match your tenant's schema, override it with `-HuntingQuery` (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id). Advanced Hunting retains ~30 days, so `-RiskDays` is effectively capped there.
+Restricting changes who may use the agent. It does not end a running session or touch the agent's Entra identity; use `-DisableIdentity` with a block for that.
 
 ### AI activity from Purview
 
-DSPM's **Activity Explorer > AI activities** tab has no API of its own. It is a view over the Microsoft Purview unified audit log, and Graph exposes that log as asynchronous searches (`/security/auditLog/queries`). `-AiActivity` runs those searches, ties each record to a catalog agent and flags the risky ones.
+DSPM's Activity Explorer has no API of its own. It is a view over the Microsoft Purview unified audit log, which Graph exposes as asynchronous searches. `-AiActivity` runs them, ties each record to a catalog agent and flags the risky events.
 
 ```powershell
 .\Agent365-Bulk-Actions.ps1 -AiActivity                                  # every agent with activity, worst first
 .\Agent365-Bulk-Actions.ps1 -AiActivity -AiDays 7 -RiskyOnly             # only agents with a risk signal in the last week
-.\Agent365-Bulk-Actions.ps1 -AiActivity -ForAgent 'Family Trails Guide'  # the individual events of one agent
-.\Agent365-Bulk-Actions.ps1 -AiActivity -OutFile ai-activity.csv         # export the summary (or, with -ForAgent, the events)
+.\Agent365-Bulk-Actions.ps1 -AiActivity -ForAgent "Contoso HR Agent"     # the events of one agent
+.\Agent365-Bulk-Actions.ps1 -AiActivity -OutFile .\ai-activity.csv       # export the summary (or, with -ForAgent, the events)
 ```
-
-In the console, select an agent and press **AI activity...** (or open **Details...** and use the **AI activity** tab). Pick a period, press **Load from Purview audit**, and the events appear with the risk coloured. The search is tenant-wide and is reused by every agent you open afterwards. **Risky only** hides the routine events.
-
-Each event reads as one line under **What happened** (for example *Tools: a365outlookmailmcp, UniversalSearchTool; Files: 1; Web pages: 3*, or *Handed to Email communication agent*). Select an event and the pane underneath lists everything the record holds, by section:
-
-- **Event**: time, user, app, conversation and thread ids, client address and region.
-- **Model**: the model and provider, any built-in plugin (such as Bing web search) and the licence.
-- **Tools and MCP**: each connector or MCP server the agent called, with the action.
-- **Files**: SharePoint and OneDrive files read, with their address and whether they carry a sensitivity label.
-- **Web**: pages the agent cited or read, and whether it searched the web.
-- **Protection**: the runtime-protection verdict for every tool call (Allow, Block or Fail) with the detection rule, the tool and the duration, plus the text of any flagged jailbreak or injected instruction.
-- **Messages and Response**: how many prompts and responses the turn had; for an agent response, the channel, the step and any error.
-
-**Whole conversation** lists every event of the highlighted event's conversation, oldest first, so you can follow what led to a block. **All events** returns to the full list. Exports (`-ForAgent ... -OutFile`) include the same columns.
-
-> [!NOTE]
-> **The audit log does not hold the prompt and response text.** It keeps message ids only, apart from the text of a flagged jailbreak or injection. Microsoft's Interaction Export API, which returns prompts and responses, excludes agents built in Copilot Studio, and DSPM shows the text only through its own capture policy in the portal. For the conversation text itself, open the event in Purview (Activity Explorer or eDiscovery) using the conversation id shown here.
 
 | Signal | Where it comes from in the audit record | Risk |
 | --- | --- | --- |
@@ -374,100 +267,202 @@ Each event reads as one line under **What happened** (for example *Tools: a365ou
 | Protection check failed | A `SecurityWebhook` verdict of `Fail` (the call was not evaluated, for example a timeout) | Medium |
 | Labeled file accessed | An accessed file that carries a sensitivity label | Medium |
 
-What is read: `CopilotInteraction` records (the interactions), `AISpanOutputs` records (the agent's responses) and the Agent 365 operations `AIInvokeAgent`, `AIExecuteTool`, `AIInferenceCall` and `AIGuardrail`. A record is tied to an agent through Defender's identifiers for it (agent id, bot id, Entra id, observability id, source id). Events of agents that are not in the catalog, such as Microsoft 365 Copilot's own agents, are counted but not listed.
+The tool reads `CopilotInteraction` records (the interactions), `AISpanOutputs` records (the agent's responses) and the Agent 365 operations `AIInvokeAgent`, `AIExecuteTool`, `AIInferenceCall` and `AIGuardrail`. A record is tied to an agent through Defender's identifiers for it (agent id, bot id, Entra id, observability id, source id). Events of agents that are not in the catalog, such as Microsoft 365 Copilot's own agents, are counted but not listed.
 
-> [!NOTE]
-> - **Risk levels here come from the audit signals above, not from Insider Risk Management.** The risk level and the sensitive-information-type classification shown in the portal are computed inside Purview and have no API. Insider Risk, DLP and Security for AI alerts do reach Defender, so `-Risky` covers those.
-> - **Speed.** The service takes about a minute for 7 days and about ten minutes for 30, and does the same work however many agents you have. Ranges longer than 30 days are split into windows that run side by side.
-> - **Prompt text.** A jailbreak event shows the start of the offending prompt (160 characters), as the portal does. Treat exports accordingly.
-> - **Saved searches.** Each run creates three audit searches per 30-day window, named `Agent365-Bulk-Actions AI activity ...`. The service does not allow deleting them through the API (HTTP 405), so they stay in the Purview audit search history until you remove them there. The console reuses one search for every agent you open, so load it once per session.
-> - The audit log retention of your licence (180 days or one year) bounds `-AiDays` (maximum 180).
+**In the console:** select an agent and press **AI activity...** (or open **Details...** and use the **AI activity** tab). Pick a period, press **Load from Purview audit**, and the events appear with the risk coloured. The search covers the whole tenant and is reused by every agent you open afterwards. **Risky only** hides routine events, and **Whole conversation** lists every event of the highlighted event's conversation, oldest first.
+
+Each event reads as one line under **What happened**, for example *Tools: a365outlookmailmcp, UniversalSearchTool; Files: 1; Web pages: 3* or *Handed to Email communication agent*. Select an event for the detail pane:
+
+- **Event**: time, user, app, conversation and thread ids, client address and region.
+- **Model**: the model and provider, any built-in plugin and the licence.
+- **Tools and MCP**: each connector or MCP server called, with the action.
+- **Files**: SharePoint and OneDrive files read, with their address and whether they carry a sensitivity label.
+- **Web**: pages cited or read, and whether the agent searched the web.
+- **Protection**: the verdict for every tool call (Allow, Block or Fail) with the rule, the tool and the duration, plus the text of any flagged jailbreak or injected instruction.
+- **Messages and Response**: how many prompts and responses the turn had; for a response, the channel, the step and any error.
+
+Things to know:
+
+- The audit log keeps **message ids only, not the prompt and response text** (apart from the text of a flagged jailbreak or injection, shown as the first 160 characters). Microsoft's Interaction Export API returns the text but excludes agents built in Copilot Studio; for the conversation itself, open it in Purview using the conversation id.
+- Risk levels come from the audit signals above, not from Insider Risk Management. The portal's risk level and sensitive-information classification are computed inside Purview and have no API. Insider Risk, DLP and Security for AI alerts do reach Defender, so `-Risky` covers those.
+- A search takes about a minute for 7 days and about ten minutes for 30. Ranges longer than 30 days are split into windows that run side by side. The audit retention of your licence bounds `-AiDays` (maximum 180).
+- Each run creates audit searches named `Agent365-Bulk-Actions AI activity ...`. The service does not allow deleting them through the API, so they stay in the Purview audit search history until you remove them there.
+
+### Contain and clean up
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Stale -StaleDays 14 -DisableIdentity -OutFile .\run.csv         # block, then verify the identity is disabled
+.\Agent365-Bulk-Actions.ps1 -Risky -MinSeverity High -Impact -Action list                    # who would lose each agent
+.\Agent365-Bulk-Actions.ps1 -DeleteCandidates -MinDaysBlocked 30 -OutFile .\delete-candidates.csv
+```
+
+- **`-DisableIdentity`** checks the agent's Entra identity after the block. Blocking a package that has an Agent ID normally makes the platform disable the identity within about ten seconds, and unblocking re-enables it. The tool waits up to 30 seconds, records `Disabled (by platform)` or `Enabled (by platform)` in the log, and calls the identity API itself only if the platform left it in the wrong state (`Disabled (by tool)`, or `Failed` with the error). Only agents that have an identity are checked. The forced path needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role.
+- **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
+- **`-DeleteCandidates`** deletes nothing: the catalog API has no delete, and a block lasts until someone reverses it. It lists blocked agents that have stayed blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files and the console's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add others with `-History`) and from the `BlockedAgent` audit events Defender keeps for about 30 days. Agents whose block date is unknown are skipped unless you add `-IncludeUnknown`. Delete them in the admin center (Agents > All agents > Delete, then Deleted > Permanently delete), or through the Power Platform API for Copilot Studio agents.
+
+### Policy file
+
+Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json                                     # show the plan, change nothing
+.\Agent365-Bulk-Actions.ps1 -Policy .\policy.example.json -Apply -OutFile .\policy-run.csv    # run it (one confirmation)
+```
+
+```json
+{
+  "name": "Agent governance baseline",
+  "exclude": { "publishers": ["Microsoft Corporation"], "types": ["firstParty"], "names": [], "ids": [] },
+  "rules": [
+    { "name": "Contain high-risk agents",
+      "when": { "risky": { "minSeverity": "High", "source": "Both" } },
+      "then": { "action": "block", "disableIdentity": true } },
+    { "name": "Pull back agents that keep tripping runtime protection",
+      "when": { "aiActivity": { "days": 7, "minHigh": 3, "signals": ["Runtime protection blocked", "Jailbreak attempt"] } },
+      "then": { "action": "restrict", "availableTo": "owner" } }
+  ]
+}
+```
+
+| Part | Values |
+| --- | --- |
+| `when` | `stale` (`by`: activity or modified, `days`, optional `includeNeverSeen`), `risky` (`minSeverity`, `minSignals`, `source`), `aiActivity` (below), `blockedDays`, `ownerless` (true), `state` (blocked or active) |
+| `match` | `all` (default: every condition must hold) or `any` |
+| `then.action` | `block`, `unblock`, `reassign` (applies the proposed owners), `restrict`, or `report` (list only, the default) |
+| `then` for `restrict` | `availableTo`: `none` (default), `owner`, `some` (with `users` and/or `groups`) or `all`; optional `includeDeployment` |
+| `then.disableIdentity` | With `block`: also disable the agent's Entra identity |
+| `exclude` | Agents to leave alone, by `ids`, `names`, `publishers` or `types` |
+
+The `aiActivity` condition matches agents with enough risky events in the window. `days` defaults to 7, `minHigh` to 1 and `minMedium` to 0; at least one minimum must be 1 or more, so a rule cannot match every agent that has any activity. `signals` optionally limits which signals count. The plan shows why each agent matched (for example *3 high, 0 medium in 7 days: Runtime protection blocked x2*), and the audit search runs once per plan however many rules use it.
+
+A rule must have at least one condition, so a typo can never match the whole catalog. Rules that would change nothing (an agent already blocked) are shown but not counted. Write actions need a signed-in administrator and cannot run unattended.
+
+### Snapshots and change reports
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-01.json
+.\Agent365-Bulk-Actions.ps1 -Snapshot .\inventory-2026-10-08.json -CompareTo .\inventory-2026-10-01.json -OutFile .\changes.csv
+```
+
+The report lists agents that are new or removed, newly blocked or unblocked, and those whose owner or version changed.
+
+### Graphical console
+
+```powershell
+pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
+```
+
+A Windows desktop window over the same catalog. It opens on every agent with no filter applied.
+
+| To do this | Use |
+| --- | --- |
+| Find agents | Search by name, publisher, platform or id. Filter All, Active or Blocked, and optionally Copilot agents only. **Reset filters** clears everything. |
+| Filter by analysis | *Stale*, *Risk* (from alerts, detections or both), *Ownership*, *Blocked*, *Tools*, *Permissions* and *Access* dropdowns. Each defaults to **None**. The matching columns fill in. *Match All* needs every active Stale and Risk filter; *Any* accepts either. |
+| Block or unblock | Tick rows (or **Select visible**), then **Block selected** or **Unblock selected**. A confirmation lists the agents with their active users and last use. **Also disable identity** adds the Entra identity check. |
+| Fix ownership | *Ownership > Needs an owner* lists shared agents with no usable owner and a suggestion; **Apply suggested** applies it. **Assign owner...** opens a searchable Entra directory picker. |
+| Add accountability | *Ownership > Missing an Entra sponsor* (or *sponsor or owner*) lists identities with a gap; **Apply suggested** adds the proposed person after a confirmation. |
+| Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. The *Access* filter lists agents open to everyone, restricted or closed. |
+| Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
+| Review AI activity | **AI activity...** opens the details window on that tab. |
+| Undo | **Undo last run** reverses the previous block, unblock, access change or sponsor addition. |
+| Export | **Export** saves the grid as CSV or JSON. |
+
+Each write action saves a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
 
 ## Parameter reference
 
-Only one primary mode (`List`, `Block`, `Unblock`, `Select`, `Stale`, or `Risky`) is used per run.
+Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
-| Parameter | Values / default | What it does |
+### Modes
+
+| Parameter | Values | What it does |
 | --- | --- | --- |
 | `-List` | switch | List catalog packages. |
-| `-Block` | names and/or ids | Block one or more packages by display name and/or `P_` id. |
-| `-Unblock` | names and/or ids | Unblock (undo) one or more packages. |
-| `-Select` | switch | Interactive multi‑select picker over the catalog. |
-| `-Gui` | switch | Open the graphical console. |
-| `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent named in a CSV with an `Id` or `DisplayName` column. |
-| `-Undo` | path | Reverse a previous run using its `-OutFile` log: every agent changed in that run returns to its earlier state. |
-| `-Ownerless` | switch | Find shared agents whose owner is missing or gone and propose a replacement. Default is a preview; add `-Action reassign` to apply. |
-| `-Reassign` | names and/or ids | Manually assign the listed agents to the user given by `-To`. |
-| `-To` | UPN or object id | The new owner for `-Reassign`. |
-| `-DisableIdentity` | switch | After block, verify the agent's Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
-| `-Impact` | switch | Show active users, sessions and last use for each target before acting. |
-| `-Restrict` | names and/or ids | Change who can use these agents (see `-AvailableTo`). |
-| `-AvailableTo` | None (default), Some, All | With `-Restrict`: nobody, named users and groups (or the owner), or everyone. |
-| `-AllowUsers`, `-AllowGroups` | UPNs or ids, names or ids | With `-AvailableTo Some`: who the agents stay available to. |
-| `-OwnerOnly` | switch | With `-AvailableTo Some`: keep each agent available to its own owner. |
-| `-IncludeDeployment` | switch | With `-Restrict`: also change who the agent is deployed to. |
-| `-Accountability` | switch | Entra identities with no valid sponsor (and with `-IncludeOwners`, no owner), with proposals. `-Action assign` adds them. |
-| `-IncludeOwners` | switch | With `-Accountability`: also look for identities with no owner. |
-| `-AddSponsor` | names and/or ids | Add `-To` as sponsor of these agents' Entra identities. |
-| `-AsOwner` | switch | With `-AddSponsor`: add as owner instead. |
-| `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. Add `-ForAgent` for the events of named agents. |
-| `-ForAgent` | names and/or ids | With `-AiActivity`: list the individual events of these agents. |
-| `-AiDays` | 1-180, default 30 | With `-AiActivity`: how many days back to search. |
-| `-RiskyOnly` | switch | With `-AiActivity`: only events with a risk signal. |
-| `-DeleteCandidates` | switch | List agents that have stayed blocked at least `-MinDaysBlocked` days (default 30). Reports only; nothing is deleted. |
-| `-History` | paths | Extra result logs or folders that record when agents were blocked. |
-| `-IncludeUnknown` | switch | With `-DeleteCandidates`, also list blocked agents whose block date is unknown. |
-| `-Policy` | path | Evaluate a JSON policy file and print the plan. Nothing changes without `-Apply`. |
-| `-Apply` | switch | With `-Policy`, run the plan. |
-| `-Snapshot` | path | Save the inventory to a JSON file. |
-| `-Detail` | name or id | Print the full record of one agent (sharing, tools, MCP servers, permissions, identity, usage); `-OutFile` saves it as JSON. |
-| `-Inventory` | switch | One row per agent with kind, owner, tools, MCP servers and sharing. Add `-Deep` for usage and availability, `-WithPermissions` for Entra permissions. |
-| `-CompareTo` | path | With `-Snapshot`, list changes since an earlier snapshot. |
+| `-Block` | names and/or ids | Block packages by display name or `P_`/`T_` id. |
+| `-Unblock` | names and/or ids | Unblock packages. |
+| `-Select` | switch | Pick agents from a grid or numbered menu, then apply `-Action`. |
+| `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent in a CSV with an `Id` or `DisplayName` column. |
+| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners). |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
-| `-StaleDays` | 1–3650 (30/60/90) | Age threshold in days. Required with `-Stale`. |
-| `-By` | `activity` / `modified` | `activity` = no usage telemetry (Defender); `modified` = manifest age. |
-| `-Risky` | switch | Act on agents with Defender AI‑security alerts (Advanced Hunting). |
-| `-RiskDays` | 1–3650 (default 30) | Alert lookback window (Advanced Hunting retains ~30 days). |
-| `-RiskSource` | Both (default) / Alerts / Detections | Which signals make an agent risky: Security for AI alerts, BehaviorInfo detections that raised no alert, or both. |
-| `-MinAlerts` | int (default 1) | Minimum number of signals (alerts plus detections) for an agent to count as risky. |
-| `-MinSeverity` | Informational/Low/Medium/High | Only act on agents at/above this alert severity. |
-| `-HuntingQuery` | KQL (optional) | Custom KQL. Stale: returns `Key,LastActivity`. Risky: returns `Key,AlertCount,Severity,LastAlert`. |
-| `-IncludeNeverSeen` | switch | Activity mode: also treat agents with zero telemetry as stale. |
-| `-Action` | `block` / `unblock` / `list` | What to do with the matched set. `list` = preview only (dry run). |
-| `-AgentsOnly` | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
-| `-Force` | switch | Skip the "proceed?" confirmation for any write mode. |
-| `-WhatIf` | switch | Show what would be blocked or unblocked without changing anything. |
-| `-OutFile` | path (.csv or .json) | Write a per-agent result log: timestamp, operator, action, id, name, state before the run, result, error. |
-| `-Pick` | switch | Choose which stale or risky matches to act on via the picker (the selection counts as confirmation). |
-| `-TenantId` | GUID/domain (optional) | Target a specific tenant (default = your home tenant). |
-| `-DeviceCode` | switch | Use device‑code sign‑in when interactive/WAM auth misbehaves. |
+| `-Risky` | switch | Act on agents with Defender AI-security alerts or detections. |
+| `-Ownerless` | switch | Propose owners for shared agents whose owner is missing. Add `-Action reassign` to apply. |
+| `-Reassign` | names and/or ids | Assign these agents to the user in `-To`. |
+| `-Accountability` | switch | List Entra identities with no valid sponsor; `-Action assign` adds the proposals. |
+| `-AddSponsor` | names and/or ids | Add `-To` as sponsor (or owner with `-AsOwner`) of these agents' identities. |
+| `-Restrict` | names and/or ids | Change who can use these agents. |
+| `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
+| `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
+| `-Policy` | path | Evaluate a JSON policy and print the plan. |
+| `-Snapshot` | path | Save the inventory to a JSON file. |
+| `-Detail` | name or id | Print the full record of one agent. |
+| `-Inventory` | switch | One row per agent. |
+| `-Gui` | switch | Open the console. |
 
-## Safety & good practice
+### Options
 
-- **Dry run first.** Add `-Action list` or `-WhatIf` to preview before any bulk change.
-- **Every write asks once.** `-Block`, `-Unblock`, `-Stale` and `-Risky` show the target set and ask before acting; `-Force` skips the prompt. Agents already in the target state are skipped.
-- **Keep a record.** `-OutFile ./run.csv` logs each agent with the state it had before the run, which is what you need to reverse a batch.
-- **Throttling is handled.** Graph 429 and transient 5xx responses are retried with the `Retry-After` delay.
-- **Everything is reversible.** `-Unblock` restores anything you block.
-- **Start narrow.** Use `-AgentsOnly` and a specific `-StaleDays`; widen only once the preview looks right.
-- **Mind the retention window.** With `-By activity` you can only prove ~30 days of inactivity.
-- **Keep a human in the loop.** Prefer `-Pick`, or omit `-Force`, when you want to confirm before blocking.
-- **Beta endpoint.** `/beta` is not recommended for production automation — validate in a lab first.
+| Parameter | Used with | Values and default | What it does |
+| --- | --- | --- | --- |
+| `-Action` | select, stale, risky, FromCsv, ownerless, accountability | `block` (default), `unblock`, `list`; `reassign` with `-Ownerless`; `assign` with `-Accountability` | What to do with the matched set. `list` previews. |
+| `-AgentsOnly` | list, select, stale, risky, inventory | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
+| `-Pick` | stale, risky | switch | Choose which matches to act on in the picker. |
+| `-Force` | any write | switch | Skip the confirmation. |
+| `-WhatIf` | any write | switch | Show what would change; change nothing. |
+| `-OutFile` | most modes | path (.csv or .json) | Write a result log, or export the result. |
+| `-TenantId` | all | GUID or domain | Target a specific tenant. |
+| `-DeviceCode` | all | switch | Device-code sign-in when interactive sign-in misbehaves. |
+| `-DisableIdentity` | block, unblock | switch | Verify the Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
+| `-Impact` | block, unblock, stale, risky | switch | Show active users, sessions and last use before acting. |
+| `-StaleDays` | `-Stale` | 1 to 3650 | Age threshold in days. |
+| `-By` | `-Stale` | `activity` (default), `modified` | Telemetry or manifest age. |
+| `-IncludeNeverSeen` | `-Stale` | switch | Also treat agents with no telemetry as stale. |
+| `-RiskDays` | `-Risky` | 1 to 3650, default 30 | Lookback window (Advanced Hunting keeps about 30 days). |
+| `-RiskSource` | `-Risky` | `Both` (default), `Alerts`, `Detections` | Which signals count. |
+| `-MinAlerts` | `-Risky` | integer, default 1 | Minimum signals for an agent to count. |
+| `-MinSeverity` | `-Risky` | Informational, Low, Medium, High | Minimum severity. |
+| `-HuntingQuery` | stale, risky | KQL | Custom query. Stale returns `Key, LastActivity`; risky returns `Key, AlertCount, DetectionCount, Severity, LastAlert`. |
+| `-To` | reassign, AddSponsor | UPN or object id | The person to assign. |
+| `-AsOwner` | `-AddSponsor` | switch | Add as owner instead of sponsor. |
+| `-IncludeOwners` | `-Accountability` | switch | Also look for identities with no owner. |
+| `-AvailableTo` | `-Restrict` | `None` (default), `Some`, `All` | Nobody, named users and groups (or the owner), or everyone. |
+| `-AllowUsers`, `-AllowGroups` | `-Restrict` | UPNs or ids; names or ids | Who the agents stay available to (with `-AvailableTo Some`). |
+| `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
+| `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
+| `-ForAgent` | `-AiActivity` | names and/or ids | List the individual events of these agents. |
+| `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
+| `-RiskyOnly` | `-AiActivity` | switch | Only events with a risk signal. |
+| `-MinDaysBlocked` | `-DeleteCandidates` | integer, default 30 | Minimum days blocked. |
+| `-History` | `-DeleteCandidates` | paths | Extra logs or folders that record when agents were blocked. |
+| `-IncludeUnknown` | `-DeleteCandidates` | switch | Also list agents whose block date is unknown. |
+| `-Apply` | `-Policy` | switch | Run the plan. |
+| `-CompareTo` | `-Snapshot` | path | List changes since an earlier snapshot. |
+| `-Deep` | `-Inventory` | switch | Add usage and availability per agent (one call each). |
+| `-WithPermissions` | `-Inventory` | switch | Add the Entra permissions of each identity. |
+
+## Limitations
+
+- **Beta APIs.** Everything targets `/beta` and can change without notice.
+- **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
+- **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
+- **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and cannot run unattended.
+- **Retention.** Advanced Hunting keeps about 30 days. The Purview audit log keeps what your licence allows (180 days or one year).
+- **Audit searches are slow and permanent.** See [AI activity from Purview](#ai-activity-from-purview).
 
 ## Troubleshooting
 
 | Symptom | What to do |
 | --- | --- |
 | No packages returned | Confirm the tenant has an Agent 365 license and that you consented to `CopilotPackages.Read.All`. |
-| "No package named 'X'" | Run `-List` to confirm the exact display name or `P_` id. |
-| "Multiple packages named 'X'" | Two packages share that name — pass the exact `P_` id instead. |
-| Advanced Hunting query failed | Check `ThreatHunting.Read.All` consent, an E5/Defender license, and that Security for AI is onboarded — or use `-By modified`. |
-| Sign‑in / WAM prompt misbehaves | Re‑run with `-DeviceCode`. |
-| `-StaleDays > 30` seems to under‑report | Expected: Advanced Hunting retains ~30 days, so activity can only prove 30 days of inactivity. |
+| "No package named 'X'" | Run `-List` for the exact display name or id. |
+| "Multiple packages named 'X'" | Two packages share the name; pass the exact `P_` or `T_` id. |
+| Advanced Hunting query failed | Check `ThreatHunting.Read.All` consent, an E5 or Defender license and Security for AI onboarding, or use `-By modified`. |
+| Sign-in or WAM prompt misbehaves | Re-run with `-DeviceCode`. |
+| `-StaleDays` of 30 or more seems to under-report | Expected: telemetry covers about 30 days. Use `-By modified` or `-IncludeNeverSeen`. |
+| Audit search is refused | Grant `AuditLogsQuery.Read.All` (admin consent) and hold a Purview audit role. |
+| Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
-## Appendix: the built-in hunting queries
+## Appendix: hunting queries
 
-Both queries start with the same inventory block, which maps every identifier an agent appears under to its catalog id. Override either query with `-HuntingQuery`. A stale override must return `Key` (catalog id, lowercase) and `LastActivity`.
+Both built-in queries start with the same inventory block, which maps every identifier an agent appears under to its catalog id. A stale override must return `Key` (catalog id, lowercase) and `LastActivity`.
 
 ```kql
 let inv = AgentsInfo
@@ -550,16 +545,16 @@ union alerts, rtp, shield
 | extend Severity = case(SevRank == 4, "High", SevRank == 3, "Medium", SevRank == 2, "Low", SevRank == 1, "Informational", "-")
 ```
 
-
 ## Development
 
 ```powershell
-# Tests (Pester 5+) and lint (PSScriptAnalyzer); CI runs the same on every pull request
+# Tests (Pester 5 or later) and lint (PSScriptAnalyzer); CI runs the same on every pull request
 Invoke-Pester -Path .\tests
 Invoke-ScriptAnalyzer -Path .\Agent365-Bulk-Actions.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
 ```
 
 Dot-sourcing the script (`. .\Agent365-Bulk-Actions.ps1`) loads its functions without signing in or running anything, which is how the tests exercise them with mocked Graph calls.
+
 ## Disclaimer
 
-Provided as‑is, without warranty of any kind. It targets a `/beta` Microsoft Graph API that can change without notice. Not an official Microsoft product. Test in a non‑production tenant first. See [LICENSE](LICENSE).
+Provided as-is, without warranty of any kind. It targets `/beta` Microsoft Graph APIs that can change without notice. Not an official Microsoft product. Test in a non-production tenant first. See [LICENSE](LICENSE).
