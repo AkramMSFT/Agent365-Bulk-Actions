@@ -1315,3 +1315,38 @@ Describe 'Find-DirectoryGroups' {
         @(Find-DirectoryGroups -Text '').Count | Should -Be 0
     }
 }
+
+Describe 'Agent users are not people' {
+    It 'leaves agent users out of the directory picker and still returns the requested number of people' {
+        Mock Invoke-Graph {
+            $script:agentUri = $Uri
+            [pscustomobject]@{ value = @(
+                [pscustomobject]@{ id = 'a1'; displayName = 'Abbas Agent'; userPrincipalName = 'abbas@x.com'; accountEnabled = $true; '@odata.type' = '#microsoft.graph.agentUser' },
+                [pscustomobject]@{ id = 'u1'; displayName = 'Ann'; userPrincipalName = 'ann@x.com'; accountEnabled = $true },
+                [pscustomobject]@{ id = 'u2'; displayName = 'Bo'; userPrincipalName = 'bo@x.com'; accountEnabled = $true }) }
+        }
+        (Find-DirectoryUsers -Text '' -Top 1).Name | Should -Be @('Ann')
+        (Find-DirectoryUsers -Text '').Name | Should -Be @('Ann', 'Bo')
+        $script:agentUri | Should -Match 'top=100'
+    }
+    It 'counts only real users as owners of an agent identity' {
+        $script:IdentityOwnerCache = @{}; $script:UserCache = @{}
+        Mock Invoke-GraphBatch { @{ 'idn9' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @(
+            [pscustomobject]@{ id = '11111111-1111-1111-1111-111111111111'; '@odata.type' = '#microsoft.graph.user' },
+            [pscustomobject]@{ id = '22222222-2222-2222-2222-222222222222'; '@odata.type' = '#microsoft.graph.agentUser' }) } } } }
+        Mock Initialize-UserCache { }
+        Initialize-IdentityOwnerCache -AgentIdentityIds @('idn9')
+        $script:IdentityOwnerCache['idn9'] | Should -Be @('11111111-1111-1111-1111-111111111111')
+    }
+    It 'marks agent user accounts and never proposes one as the accountable person' {
+        $script:IdentitySponsorCache = @{ 'idz' = @() }
+        $agent = [pscustomobject]@{ Id = 'agent1'; Upn = 'agent@x.com'; Exists = $true; Enabled = $true; IsAgent = $true }
+        $human = [pscustomobject]@{ Id = 'human1'; Upn = 'human@x.com'; Exists = $true; Enabled = $true; IsAgent = $false }
+        Mock Get-UserInfo { if ($IdOrUpn -eq 'agent1') { $agent } else { $human } }
+        Mock Get-IdentityOwners { @($human) }
+        Mock Get-ManagerInfo { $null }
+        $r = Resolve-AgentAccountability -Package (New-Pkg 'T_z' 'Zed' -IdentityId 'idz' -OwnerId 'agent1')
+        $r.Proposed | Should -Be 'human@x.com'
+        $r.Source | Should -Be 'Agent identity owner'
+    }
+}

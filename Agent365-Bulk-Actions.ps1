@@ -463,7 +463,7 @@ function Initialize-UserCache {
     foreach ($id in $need) {
         $r = $res[$id]
         if ($r -and $r.Status -eq 200 -and $r.Body.id) {
-            $script:UserCache[$id] = [pscustomobject]@{ Id = $r.Body.id; Upn = $r.Body.userPrincipalName; Name = $r.Body.displayName; Exists = $true; Enabled = [bool]$r.Body.accountEnabled }
+            $script:UserCache[$id] = [pscustomobject]@{ Id = $r.Body.id; Upn = $r.Body.userPrincipalName; Name = $r.Body.displayName; Exists = $true; Enabled = [bool]$r.Body.accountEnabled; IsAgent = [bool]("$($r.Body.'@odata.type')" -match 'agentUser') }
         } elseif ($r -and $r.Status -eq 404) {
             $script:UserCache[$id] = [pscustomobject]@{ Id = $id; Upn = ''; Name = ''; Exists = $false; Enabled = $false }
         }
@@ -480,7 +480,7 @@ function Initialize-IdentityOwnerCache {
     $res = Invoke-GraphBatch -Requests $reqs -Version beta -Activity 'Reading agent identity owners'
     foreach ($id in $need) {
         $r = $res[$id]
-        if ($r -and $r.Status -eq 200) { $script:IdentityOwnerCache[$id] = @(@($r.Body.value) | Where-Object { $_.'@odata.type' -match 'user$' } | ForEach-Object { [string]$_.id }) }
+        if ($r -and $r.Status -eq 200) { $script:IdentityOwnerCache[$id] = @(@($r.Body.value) | Where-Object { $_.'@odata.type' -match 'graph\.user$' } | ForEach-Object { [string]$_.id }) }
         elseif ($r -and $r.Status -in 403, 404) { $script:IdentityOwnerCache[$id] = @() }
     }
     Initialize-UserCache -Ids @($need | ForEach-Object { $script:IdentityOwnerCache[$_] } | ForEach-Object { $_ })
@@ -513,7 +513,7 @@ function Get-UserInfo {
     if ($script:UserCache.ContainsKey($key)) { return $script:UserCache[$key] }
     try {
         $u = Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/users/{0}?`$select=id,displayName,userPrincipalName,accountEnabled" -f [uri]::EscapeDataString($IdOrUpn))
-        $info = [pscustomobject]@{ Id = $u.id; Upn = $u.userPrincipalName; Name = $u.displayName; Exists = $true; Enabled = [bool]$u.accountEnabled }
+        $info = [pscustomobject]@{ Id = $u.id; Upn = $u.userPrincipalName; Name = $u.displayName; Exists = $true; Enabled = [bool]$u.accountEnabled; IsAgent = [bool]("$($u.'@odata.type')" -match 'agentUser') }
     } catch {
         $info = [pscustomobject]@{ Id = $IdOrUpn; Upn = ''; Name = ''; Exists = $false; Enabled = $false }
     }
@@ -541,7 +541,7 @@ function Get-IdentityOwners {
     if ($script:IdentityOwnerCache.ContainsKey($AgentIdentityId)) { return @($script:IdentityOwnerCache[$AgentIdentityId] | ForEach-Object { Get-UserInfo $_ }) }
     try {
         $r = Invoke-Graph -Uri ("https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/owners?`$select=id" -f $AgentIdentityId)
-        @($r.value | Where-Object { $_.'@odata.type' -match 'user$' } | ForEach-Object { Get-UserInfo $_.id })
+        @($r.value | Where-Object { $_.'@odata.type' -match 'graph\.user$' } | ForEach-Object { Get-UserInfo $_.id })
     } catch { @() }
 }
 
@@ -872,14 +872,14 @@ function Resolve-AgentAccountability {
 
     $pkgOwner = Get-UserInfo $Package.ownerId
     $pick = $null; $source = ''
-    if ($pkgOwner.Exists -and $pkgOwner.Enabled) { $pick = $pkgOwner; $source = 'Agent owner' }
+    if ($pkgOwner.Exists -and $pkgOwner.Enabled -and -not $pkgOwner.IsAgent) { $pick = $pkgOwner; $source = 'Agent owner' }
     else {
-        $idPick = $idOwners | Where-Object { $_.Exists -and $_.Enabled } | Select-Object -First 1
+        $idPick = $idOwners | Where-Object { $_.Exists -and $_.Enabled -and -not $_.IsAgent } | Select-Object -First 1
         if ($idPick) { $pick = $idPick; $source = 'Agent identity owner' }
         else {
             foreach ($who in @($idOwners | Select-Object -First 1) + @($pkgOwner | Where-Object { $_.Exists })) {
                 $mgr = Get-ManagerInfo $who.Id
-                if ($mgr -and $mgr.Enabled) { $pick = $mgr; $source = "Manager of $($who.Upn)"; break }
+                if ($mgr -and $mgr.Enabled -and -not $mgr.IsAgent) { $pick = $mgr; $source = "Manager of $($who.Upn)"; break }
             }
         }
     }
@@ -2962,14 +2962,15 @@ $OwnerPromptXaml = @'
 # Enabled users from Entra whose name, sign-in name or email starts with the text (all users, first page, when empty).
 function Find-DirectoryUsers {
     param([string]$Text, [int]$Top = 40)
-    $uri = "https://graph.microsoft.com/v1.0/users?`$top=$Top&`$select=id,displayName,userPrincipalName,mail,accountEnabled"
+    $uri = "https://graph.microsoft.com/v1.0/users?`$top=$([Math]::Max($Top, 100))&`$select=id,displayName,userPrincipalName,mail,accountEnabled"
     $q = $Text.Trim()
     if ($q) {
         $e = $q.Replace("'", "''")
         $uri += "&`$filter=" + [uri]::EscapeDataString("startswith(displayName,'$e') or startswith(userPrincipalName,'$e') or startswith(mail,'$e')")
     }
     $r = Invoke-Graph -Uri $uri
-    @($r.value | Where-Object { $_.accountEnabled } | Sort-Object displayName |
+    # Agent users (the accounts agents get) come back from the same endpoint; they are not people.
+    @($r.value | Where-Object { $_.accountEnabled -and "$($_.'@odata.type')" -notmatch 'agentUser' } | Sort-Object displayName | Select-Object -First $Top |
         ForEach-Object { [pscustomobject]@{ Id = $_.id; Name = $_.displayName; Upn = $_.userPrincipalName; Enabled = $true } })
 }
 
