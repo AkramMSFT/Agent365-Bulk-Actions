@@ -198,7 +198,7 @@ The proposal follows the same order as ownership: the agent's own owner, an owne
 In the console, *Ownership > Missing an Entra sponsor* (or *Missing a sponsor or owner*) lists the identities with a gap and the suggested person; **Apply suggested** adds them after a confirmation. The console asks for the `AgentIdentity.ReadWrite.All` permission only at that point.
 
 > [!NOTE]
-> Microsoft documents adding an **owner** as a delegated call (Agent ID Administrator role) but adding a **sponsor** only for application permissions. If your sign-in is refused for sponsors, the log says so; add an owner instead or use the Entra admin center. Groups can be sponsors (dynamic or Microsoft 365 groups only) and count as a valid sponsor when scanning. An identity that cannot be read is reported separately rather than counted as having no sponsor.
+> Microsoft documents adding a **sponsor** only for application permissions and an **owner** as a delegated call. In testing, both worked with a signed-in administrator (Agent ID Administrator role) and both were removed again by `-Undo`; if your tenant refuses the sponsor call, the log says so, and you can add an owner instead or use the Entra admin center. The accounts agents get (agent users) are not people: they are never offered in the pickers and never proposed as a sponsor or owner, because the API rejects them as sponsors. Groups can be sponsors (dynamic or Microsoft 365 groups only) and count as a valid sponsor when scanning. An identity that cannot be read is reported separately rather than counted as having no sponsor. Owners are optional in Entra, so most identities have none; the owner scan (`-IncludeOwners`) is therefore noisy and off by default.
 
 ### Containment, impact and clean-up
 
