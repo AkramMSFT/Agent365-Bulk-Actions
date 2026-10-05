@@ -1064,3 +1064,234 @@ Describe 'AI activity detail' {
         (@(Get-AiActivityDetailRows $a) | Where-Object { $_.Item -eq 'Error' }).Info | Should -Be 'Timeout'
     }
 }
+
+Describe 'Access scope changes' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:patches = @()
+        $script:state = @{ availableTo = 'allowedForAll'; deployedTo = 'acquiredForNone'; allowedUsersAndGroups = @(); acquireUsersAndGroups = @() }
+    }
+    It 'builds a body with only what the target needs' {
+        $none = New-AccessPatchBody -AvailableTo 'allowedForNone'
+        @($none.Keys) | Should -Be @('availableTo')
+        $some = New-AccessPatchBody -AvailableTo 'allowedForSome' -Allowed @([pscustomobject]@{ resourceType = 'user'; resourceId = 'u1' })
+        ($some | ConvertTo-Json -Depth 5 -Compress) | Should -Match '"allowedUsersAndGroups":\[\{.*"resourceId":"u1"'
+        $dep = New-AccessPatchBody -AvailableTo 'allowedForNone' -DeployedTo 'acquiredForNone' -IncludeDeployment
+        $dep['deployedTo'] | Should -Be 'acquiredForNone'
+        (New-AccessPatchBody -AvailableTo 'allowedForNone' -DeployedTo 'acquiredForNone').Contains('deployedTo') | Should -BeFalse
+    }
+    It 'reads the current scope and compares user lists regardless of order or case' {
+        $s = Get-AccessState ([pscustomobject]@{ availableTo = 'allowedForSome'; allowedUsersAndGroups = @([pscustomobject]@{ resourceType = 'user'; resourceId = 'U1' }); deployedTo = 'acquiredForNone'; acquireUsersAndGroups = $null })
+        $s.AvailableTo | Should -Be 'allowedForSome'; @($s.Allowed).Count | Should -Be 1; @($s.Acquire).Count | Should -Be 0
+        Test-SameEntities @([pscustomobject]@{ resourceType = 'user'; resourceId = 'U1' }, [pscustomobject]@{ resourceType = 'group'; resourceId = 'g' }) @([pscustomobject]@{ resourceType = 'group'; resourceId = 'G' }, [pscustomobject]@{ resourceType = 'user'; resourceId = 'u1' }) | Should -BeTrue
+        Test-SameEntities @([pscustomobject]@{ resourceType = 'user'; resourceId = 'u1' }) @() | Should -BeFalse
+    }
+    It 'resolves users and groups, and refuses a missing user or an ambiguous group' {
+        Mock Get-UserInfo { if ($IdOrUpn -eq 'gone@x.com') { [pscustomobject]@{ Exists = $false; Enabled = $false } } else { [pscustomobject]@{ Id = 'u1'; Upn = $IdOrUpn; Exists = $true; Enabled = $true } } }
+        Mock Invoke-Graph { if ($Uri -like '*Sales*') { @{ value = @(@{ id = 'g1'; displayName = 'Sales' }) } } else { @{ value = @(@{ id = 'a' }, @{ id = 'b' }) } } }
+        $e = @(Resolve-AccessEntities -Users 'a@x.com' -Groups 'Sales')
+        ($e | ForEach-Object { "$($_.resourceType):$($_.resourceId)" }) | Should -Be @('user:u1', 'group:g1')
+        { Resolve-AccessEntities -Users 'gone@x.com' } | Should -Throw '*not an existing, enabled user*'
+        { Resolve-AccessEntities -Groups 'Dup' } | Should -Throw '*matched 2*'
+    }
+    It 'reads the old scope first, logs it, then narrows availability' {
+        Mock Invoke-Graph {
+            if ($Method -eq 'PATCH') { $script:patches += ,@{ Uri = $Uri; Body = $Body }; return $null }
+            $script:state
+        }
+        $log = @(Invoke-AvailabilityChange -Packages @((New-Pkg 'T_a' 'Alpha')) -To None -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].WasAvailableTo | Should -Be 'allowedForAll'
+        $log[0].NewAvailableTo | Should -Be 'allowedForNone'
+        $script:patches.Count | Should -Be 1
+        ($script:patches[0].Body | ConvertFrom-Json).availableTo | Should -Be 'allowedForNone'
+        $script:patches[0].Uri | Should -BeLike '*/T_a'
+    }
+    It 'skips an agent that already has the target scope and sends nothing' {
+        $script:state.availableTo = 'allowedForNone'
+        Mock Invoke-Graph { if ($Method -eq 'PATCH') { $script:patches += 1; return $null }; $script:state }
+        $log = @(Invoke-AvailabilityChange -Packages @((New-Pkg 'T_a' 'Alpha')) -To None -PassThru)
+        $log[0].Result | Should -Be 'Skipped'
+        $script:patches.Count | Should -Be 0
+    }
+    It 'keeps each agent available to its owner with -OwnerOnly, and fails one with no valid owner' {
+        Mock Get-UserInfo { if ($IdOrUpn -eq 'o1') { [pscustomobject]@{ Id = 'o1'; Upn = 'o1@x.com'; Exists = $true; Enabled = $true } } else { [pscustomobject]@{ Exists = $false; Enabled = $false } } }
+        Mock Invoke-Graph { if ($Method -eq 'PATCH') { $script:patches += ,@{ Body = $Body }; return $null }; $script:state }
+        $log = @(Invoke-AvailabilityChange -Packages @((New-Pkg 'T_a' 'Alpha' -OwnerId 'o1'), (New-Pkg 'T_b' 'Beta' -OwnerId 'zz')) -To Some -OwnerOnly -PassThru)
+        $log[0].Result | Should -Be 'Done'; $log[0].NewAllowed | Should -Be 'o1@x.com'
+        ($script:patches[0].Body | ConvertFrom-Json).allowedUsersAndGroups[0].resourceId | Should -Be 'o1'
+        $log[1].Result | Should -Be 'Failed'; $log[1].Error | Should -BeLike '*no valid owner*'
+        $script:patches.Count | Should -Be 1
+    }
+    It 'changes nothing under -WhatIf' {
+        Mock Test-Proceed { $false }
+        Mock Invoke-Graph { if ($Method -eq 'PATCH') { $script:patches += 1 }; $script:state }
+        $log = @(Invoke-AvailabilityChange -Packages @((New-Pkg 'T_a' 'Alpha')) -To None -PassThru)
+        $log[0].Result | Should -Be 'WhatIf'
+        $script:patches.Count | Should -Be 0
+    }
+    It 'reports a failed PATCH and carries on' {
+        Mock Invoke-Graph { if ($Method -eq 'PATCH') { throw 'BadRequest: nope' }; $script:state }
+        $log = @(Invoke-AvailabilityChange -Packages @((New-Pkg 'T_a' 'Alpha'), (New-Pkg 'T_b' 'Beta')) -To None -PassThru)
+        @($log | Where-Object { $_.Result -eq 'Failed' }).Count | Should -Be 2
+        $log[0].Error | Should -BeLike '*nope*'
+    }
+    It 'restores the logged scope, including the user list' {
+        Mock Invoke-Graph { $script:patches += ,@{ Uri = $Uri; Body = $Body }; $null }
+        $row = [pscustomobject]@{ Id = 'T_a'; DisplayName = 'Alpha'; WasAvailableTo = 'allowedForSome'; WasAllowed = '[{"resourceType":"user","resourceId":"u1"}]'; WasDeployedTo = 'acquiredForNone'; WasAcquire = '[]'; IncludeDeployment = 'False' }
+        $log = @(Invoke-AccessRestore -Records @($row) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $b = $script:patches[0].Body | ConvertFrom-Json
+        $b.availableTo | Should -Be 'allowedForSome'
+        $b.allowedUsersAndGroups[0].resourceId | Should -Be 'u1'
+        $b.PSObject.Properties.Name | Should -Not -Contain 'deployedTo'
+    }
+}
+
+Describe 'Entra accountability' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:IdentitySponsorCache = @{}
+        $script:users = @{
+            enabled = [pscustomobject]@{ Id = 'enabled'; Upn = 'enabled@x.com'; Exists = $true; Enabled = $true }
+            off     = [pscustomobject]@{ Id = 'off'; Upn = 'off@x.com'; Exists = $true; Enabled = $false }
+            boss    = [pscustomobject]@{ Id = 'boss'; Upn = 'boss@x.com'; Exists = $true; Enabled = $true }
+        }
+        Mock Get-UserInfo { if ($script:users.ContainsKey([string]$IdOrUpn)) { $script:users[[string]$IdOrUpn] } else { [pscustomobject]@{ Id = $IdOrUpn; Upn = ''; Exists = $false; Enabled = $false } } }
+        $script:identityOwners = @()
+        Mock Get-IdentityOwners { @($script:identityOwners) }
+        Mock Get-ManagerInfo { if ($UserId -eq 'off') { $script:users['boss'] } else { $null } }
+    }
+    It 'is satisfied by an enabled sponsor user or any sponsor group' {
+        $p = New-Pkg 'T_a' 'Alpha' -IdentityId 'id1'
+        $script:IdentitySponsorCache['id1'] = @([pscustomobject]@{ Id = 'enabled'; Kind = 'user' })
+        (Resolve-AgentAccountability -Package $p).State | Should -Be 'OK'
+        $script:IdentitySponsorCache['id1'] = @([pscustomobject]@{ Id = 'grp'; Kind = 'group' })
+        (Resolve-AgentAccountability -Package $p).State | Should -Be 'OK'
+    }
+    It 'proposes the agent owner first, then an identity owner, then a manager, else flags it' {
+        $script:IdentitySponsorCache['id1'] = @()
+        $r = Resolve-AgentAccountability -Package (New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId 'enabled')
+        $r.State | Should -Be 'Proposed'; $r.Proposed | Should -Be 'enabled@x.com'; $r.Source | Should -Be 'Agent owner'; $r.Reason | Should -Be 'no sponsor'
+        $script:identityOwners = @($script:users['enabled'])
+        $r = Resolve-AgentAccountability -Package (New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId 'off')
+        $r.Source | Should -Be 'Agent identity owner'
+        $script:identityOwners = @()
+        $r = Resolve-AgentAccountability -Package (New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId 'off')
+        $r.Proposed | Should -Be 'boss@x.com'; $r.Source | Should -BeLike 'Manager of off@x.com'
+        $r = Resolve-AgentAccountability -Package (New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId '')
+        $r.State | Should -Be 'Needs review'; $r.ProposedId | Should -Be ''
+    }
+    It 'treats disabled sponsors as a gap, and looks for owners only when asked' {
+        $p = New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId 'enabled'
+        $script:IdentitySponsorCache['id1'] = @([pscustomobject]@{ Id = 'off'; Kind = 'user' })
+        $r = Resolve-AgentAccountability -Package $p
+        $r.SponsorGap | Should -BeTrue; $r.Reason | Should -Be 'sponsors are disabled'; $r.OwnerGap | Should -BeFalse
+        $script:IdentitySponsorCache['id1'] = @([pscustomobject]@{ Id = 'enabled'; Kind = 'user' })
+        $r = Resolve-AgentAccountability -Package $p -IncludeOwners
+        $r.SponsorGap | Should -BeFalse; $r.OwnerGap | Should -BeTrue; $r.AddOwner | Should -BeTrue; $r.State | Should -Be 'Proposed'
+    }
+    It 'reports only agents with an identity and leaves unreadable identities out' {
+        Mock Initialize-IdentitySponsorCache { $script:IdentitySponsorCache['id1'] = @(); $script:IdentitySponsorCache['id2'] = @([pscustomobject]@{ Id = 'enabled'; Kind = 'user' }) }
+        Mock Initialize-IdentityOwnerCache { }
+        Mock Initialize-UserCache { }
+        Mock Initialize-ManagerCache { }
+        $pk = @((New-Pkg 'T_a' 'Alpha' -IdentityId 'id1' -OwnerId 'enabled'), (New-Pkg 'T_b' 'Beta' -IdentityId 'id2'), (New-Pkg 'T_c' 'Gamma' -IdentityId 'id3'), (New-Pkg 'T_d' 'Delta'))
+        $rep = Get-AccountabilityReport -Packages $pk
+        $rep.Items.Id | Should -Be @('T_a')
+        $rep.OkCount | Should -Be 1; $rep.Unreadable | Should -Be 1; $rep.NoIdentity | Should -Be 1
+    }
+    It 'adds the sponsor through the identity relationship and logs it for undo' {
+        $script:posts = @()
+        Mock Invoke-Graph { $script:posts += ,@{ Method = $Method; Uri = $Uri; Body = $Body }; $null }
+        $item = [pscustomobject]@{ Id = 'T_a'; DisplayName = 'Alpha'; IdentityId = 'id1'; ProposedId = 'u1'; Proposed = 'u1@x.com'; Source = 'Agent owner'; AddSponsor = $true; AddOwner = $false }
+        $log = @(Invoke-AccountabilityAssign -Items @($item) -PassThru)
+        $log.Count | Should -Be 1; $log[0].Action | Should -Be 'addsponsor'; $log[0].Result | Should -Be 'Done'; $log[0].UserId | Should -Be 'u1'
+        $script:posts[0].Uri | Should -Be 'https://graph.microsoft.com/beta/servicePrincipals/id1/microsoft.graph.agentIdentity/sponsors/$ref'
+        ($script:posts[0].Body | ConvertFrom-Json).'@odata.id' | Should -Be 'https://graph.microsoft.com/beta/directoryObjects/u1'
+    }
+    It 'adds owner and sponsor as two separate logged calls, and hints when a sponsor call is refused' {
+        $script:posts = @()
+        Mock Invoke-Graph { $script:posts += $Uri; if ($Uri -like '*/sponsors/*') { throw 'Forbidden: Insufficient privileges' }; $null }
+        $item = [pscustomobject]@{ Id = 'T_a'; DisplayName = 'Alpha'; IdentityId = 'id1'; ProposedId = 'u1'; Proposed = 'u1@x.com'; Source = 'Manual'; AddSponsor = $true; AddOwner = $true }
+        $log = @(Invoke-AccountabilityAssign -Items @($item) -PassThru)
+        $log.Count | Should -Be 2
+        ($log | Where-Object { $_.Action -eq 'addsponsor' }).Result | Should -Be 'Failed'
+        ($log | Where-Object { $_.Action -eq 'addsponsor' }).Error | Should -BeLike '*application-permission*'
+        ($log | Where-Object { $_.Action -eq 'addowner' }).Result | Should -Be 'Done'
+        $script:posts | Should -Contain 'https://graph.microsoft.com/beta/servicePrincipals/id1/microsoft.graph.agentIdentity/owners/$ref'
+    }
+    It 'removes what an earlier run added' {
+        $script:deletes = @()
+        Mock Invoke-Graph { $script:deletes += ,@{ Method = $Method; Uri = $Uri }; $null }
+        Invoke-AccountabilityRemove -Records @([pscustomobject]@{ Action = 'addsponsor'; DisplayName = 'Alpha'; IdentityId = 'id1'; UserId = 'u1'; User = 'u1@x.com' })
+        $script:deletes[0].Method | Should -Be 'DELETE'
+        $script:deletes[0].Uri | Should -Be 'https://graph.microsoft.com/beta/servicePrincipals/id1/microsoft.graph.agentIdentity/sponsors/u1/$ref'
+    }
+}
+
+Describe 'Policy: AI activity and restrict' {
+    BeforeEach {
+        $script:catalog = @((New-Pkg 'T_Abc' 'Alpha'), (New-Pkg 'T_def' 'Beta'), (New-Pkg 'T_ghi' 'Gamma'))
+        foreach ($c in $script:catalog) { $c | Add-Member -NotePropertyName availableTo -NotePropertyValue 'allowedForAll' -Force }
+        $script:catalog[2].availableTo = 'allowedForNone'
+        Mock Get-Packages { $script:catalog }
+        Mock Get-AgentInfoTable { @{} }
+        $now = Get-Date
+        $ev = {
+            param($title, $risk, $signal, $ageDays = 1)
+            [pscustomobject]@{ TitleId = $title; Risk = $risk; Signals = $signal; Time = $now.AddDays(-$ageDays); Kind = 'Interaction'; User = 'u'; AgentName = '' }
+        }
+        $script:acts = @(
+            (& $ev 't_abc' 'High' 'Runtime protection blocked'), (& $ev 't_abc' 'High' 'Runtime protection blocked'), (& $ev 't_abc' 'High' 'Jailbreak attempt'),
+            (& $ev 't_def' 'High' 'Jailbreak attempt'), (& $ev 't_def' 'Medium' 'Labeled file accessed'),
+            (& $ev 't_ghi' 'High' 'Jailbreak attempt' 20))
+        Mock Get-AiActivityData { [pscustomobject]@{ Days = $Days; Activities = $script:acts; Names = @{}; Unmapped = 0 } }
+        function Doc($json) { $json | ConvertFrom-Json }
+    }
+    It 'matches agents with enough high-risk events and explains why, ignoring case in the agent id' {
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 3 } }, "then": { "action": "report" } } ] }'
+        $p = Get-PolicyPlan $d
+        $p.Matched.id | Should -Be @('T_Abc')
+        $p.Evidence['T_Abc'] | Should -BeLike '3 high, 0 medium in 7 days: *Runtime protection blocked x2*'
+    }
+    It 'counts only events inside the window and can narrow to named signals' {
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1 } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $d).Matched.id | Should -Not -Contain 'T_ghi'      # its only event is 20 days old
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 30, "minHigh": 1, "signals": ["Jailbreak attempt"] } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $d).Matched.id | Should -Contain 'T_ghi'
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1, "minMedium": 1 } }, "then": { "action": "report" } } ] }'
+        (Get-PolicyPlan $d).Matched.id | Should -Be @('T_def')
+    }
+    It 'refuses an AI activity rule that would match every agent with any activity' {
+        { Get-PolicyPlan (Doc '{ "rules": [ { "name": "x", "when": { "aiActivity": { "days": 7, "minHigh": 0 } }, "then": { "action": "report" } } ] }') } | Should -Throw '*minHigh or minMedium*'
+    }
+    It 'plans a restrict action and skips agents already at the target scope' {
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 30, "minHigh": 1 } }, "then": { "action": "restrict", "availableTo": "none" } } ] }'
+        $p = Get-PolicyPlan $d
+        $p.Action | Should -Be 'restrict'
+        $p.Restrict.To | Should -Be 'None'
+        $p.Matched.id | Should -Contain 'T_ghi'
+        $p.Actionable.id | Should -Not -Contain 'T_ghi'
+        $p.Actionable.id | Should -Contain 'T_Abc'
+    }
+    It 'understands restricting to the owner or to named users, and rejects an empty list' {
+        $o = Get-PolicyPlan (Doc '{ "rules": [ { "name": "r", "when": { "state": "active" }, "then": { "action": "restrict", "availableTo": "owner" } } ] }')
+        $o.Restrict.To | Should -Be 'Some'; $o.Restrict.OwnerOnly | Should -BeTrue
+        $n = Get-PolicyPlan (Doc '{ "rules": [ { "name": "r", "when": { "state": "active" }, "then": { "action": "restrict", "availableTo": "some", "users": ["a@x.com"] } } ] }')
+        $n.Restrict.Users | Should -Be @('a@x.com')
+        { Get-PolicyPlan (Doc '{ "rules": [ { "name": "r", "when": { "state": "active" }, "then": { "action": "restrict", "availableTo": "some" } } ] }') } | Should -Throw '*needs users, groups or ownerOnly*'
+    }
+    It 'applies a restrict step through the availability routine' {
+        Mock Write-Host { }
+        Mock Confirm-Batch { $true }
+        Mock Invoke-AvailabilityChange { }
+        $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 3 } }, "then": { "action": "restrict", "availableTo": "none", "includeDeployment": true } } ] }'
+        Invoke-PolicyPlan -Plan @(Get-PolicyPlan $d) -Apply
+        Should -Invoke Invoke-AvailabilityChange -Times 1 -ParameterFilter { $To -eq 'None' -and $IncludeDeployment -and @($Packages).Count -eq 1 }
+    }
+}
