@@ -25,6 +25,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Endpoint AI: local agents and shadow AI](#endpoint-ai-local-agents-and-shadow-ai)
   - [Contain and clean up](#contain-and-clean-up)
   - [Respond to a compromised agent](#respond-to-a-compromised-agent)
+  - [Check Conditional Access for risky agents](#check-conditional-access-for-risky-agents)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -50,6 +51,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
+| Conditional Access | Check whether a Conditional Access policy blocks each risky agent at High agent risk, and which policies apply | `-CheckConditionalAccess` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
 | Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
 | Console | A desktop window with filters, a details window and buttons for all of the above | `-Gui` |
@@ -100,6 +102,8 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
 | `IdentityRiskyAgent.ReadWrite.All` | Reading an agent identity's Entra risk and confirming it compromised or dismissing the risk. Needs the Security Administrator role. The console asks for it only when you use that action. |
 | `CustomDetection.ReadWrite.All` | Blocking a local AI agent on a device (a Defender custom detection rule) and reading which are blocked. Needs a Defender role that manages custom detections and can remediate files. The console asks for it only when you use that action. |
+| `Policy.Read.All` | Reading Conditional Access policies (`-CheckConditionalAccess`). The console asks for it only when you use that action. |
+| `IdentityRiskyAgent.Read.All` | Reading an agent identity's Entra risk without changing it (`-CheckConditionalAccess`). `IdentityRiskyAgent.ReadWrite.All` also satisfies it. |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
 | `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
@@ -398,6 +402,31 @@ In the console, select a tool in the Endpoint AI window and press **Block on thi
 - **Undo dismisses the risk.** Entra has no call that returns an agent to the state before, so `-Undo` and **Undo last run** dismiss the risk: the agent ends up *dismissed*, and the admin-confirmed detection stays in Entra's detection history (kept for 90 days). If Entra had already flagged the agent before you confirmed it, dismissing clears that earlier risk too, and the tool warns about it. A confirmation Entra had not shown yet when the log was written may still appear after an undo; dismiss it again then. To clear a flag without a log, use `-DismissRisk` or, in the console, **Entra risk > Clear the compromised flag...**; dismissing cannot itself be undone.
 - **Requirements.** The Security Administrator role and the `IdentityRiskyAgent.ReadWrite.All` permission. The call is beta only.
 
+### Check Conditional Access for risky agents
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess                                # the agents Defender or Entra rate as risky
+.\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -MinSeverity Medium            # only Defender alerts of Medium or higher
+.\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -ForAgent "Contoso HR Agent" -OutFile .\ca.csv
+```
+
+Read-only. For each agent it answers one question: would Microsoft Entra Conditional Access block this agent if its risk were High? Without `-ForAgent` the tool checks the agents Defender flags as risky (last 30 days, optionally limited by `-MinSeverity`) together with the agents Entra ID Protection currently rates at risk or confirmed compromised.
+
+| Verdict | Meaning |
+| --- | --- |
+| **Protected** | An enabled policy that blocks at High agent risk targets this agent identity and the resources it signs in to. The detail says whether it is blocked now. |
+| **Report-only** | Only a report-only policy targets it. Entra logs what it would have blocked and blocks nothing. |
+| **No effect** | An enabled policy targets the agent but protects no resources (its target resources are *None*), so it never applies. |
+| **Possible** | The policy selects agents by a custom security attribute rule. The rule is shown, not evaluated; check it in Entra. |
+| **Unprotected** | No enforced policy blocks the agent at High agent risk. A policy that only covers lower risk levels leaves it here. |
+
+- **Blocked now needs Entra to rate the agent.** Agent risk comes from Entra's own detections or from confirming the agent compromised. Defender alerts do not change it, so a Defender-risky agent that Entra has not flagged is *Protected* but *not blocked now*. Confirming it as compromised (see [Respond to a compromised agent](#respond-to-a-compromised-agent)) raises its risk to High, which the policy then enforces.
+- **Enabled does not mean effective.** An enabled policy whose target resources are *None* never applies; the tool lists these by name.
+- **Agents without an Entra agent identity** (for example declarative agents) cannot be covered by Conditional Access for agents and are listed separately.
+- **What is not evaluated.** Policies for the on-behalf-of flow (they target users), policies for agent user accounts, and attribute rules. Resources that accept an API key instead of a token are outside Conditional Access.
+- **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
+- **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below.
+
 ### Policy file
 
 Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
@@ -463,7 +492,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
 | Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
-| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. |
+| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent at High agent risk, with the policies behind the selected one. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
 
@@ -492,6 +521,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-SignIn` | none | Sign in once with every permission the tool can use; later runs reuse the saved session. |
 | `-ConfirmCompromised` | names and/or ids | Confirm these agents' Entra identities as compromised (risk level High). |
 | `-DismissRisk` | names and/or ids | Dismiss the Entra risk of these agents' identities. |
+| `-CheckConditionalAccess` | switch | Check whether Conditional Access blocks risky agents at High agent risk. Read-only. |
 | `-Restrict` | names and/or ids | Change who can use these agents. |
 | `-BlockLocalAgent` | tool names (wildcards allowed) | Have Defender stop and quarantine these local AI agents on the devices in `-ForDevice`. |
 | `-UnblockLocalAgent` | tool names (wildcards allowed) | Remove the block rule of these local AI agents on the devices in `-ForDevice`. |
@@ -524,7 +554,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-RiskDays` | `-Risky` | 1 to 3650, default 30 | Lookback window (Advanced Hunting keeps about 30 days). |
 | `-RiskSource` | `-Risky` | `Both` (default), `Alerts`, `Detections` | Which signals count. |
 | `-MinAlerts` | `-Risky` | integer, default 1 | Minimum signals for an agent to count. |
-| `-MinSeverity` | `-Risky` | Informational, Low, Medium, High | Minimum severity. |
+| `-MinSeverity` | `-Risky`, `-CheckConditionalAccess` | Informational, Low, Medium, High | Minimum severity. |
 | `-HuntingQuery` | stale, risky | KQL | Custom query. Stale returns `Key, LastActivity`; risky returns `Key, AlertCount, DetectionCount, Severity, LastAlert`. |
 | `-To` | reassign, AddSponsor | UPN or object id | The person to assign. |
 | `-AsOwner` | `-AddSponsor` | switch | Add as owner instead of sponsor. |
@@ -534,7 +564,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-AllowUsers`, `-AllowGroups` | `-Restrict` | UPNs or ids; names or ids | Who the agents stay available to (with `-AvailableTo Some`). |
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
-| `-ForAgent` | `-AiActivity` | names and/or ids | List the individual events of these agents. |
+| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess` | names and/or ids | List the individual events of these agents, or check these agents instead of the risky ones. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
 | `-EndpointDays` | `-EndpointAi`, `-BlockLocalAgent` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
@@ -550,7 +580,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 ## Limitations
 
-- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
+- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls, the Conditional Access policy read and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
 - **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
 - **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in (create it with `-SignIn`, as the account that runs the task) until it expires; the run then fails with a message to run `-SignIn` again.
@@ -571,6 +601,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-StaleDays` of 30 or more seems to under-report | Expected: telemetry covers about 30 days. Use `-By modified` or `-IncludeNeverSeen`. |
 | Audit search is refused | Grant `AuditLogsQuery.Read.All` (admin consent) and hold a Purview audit role. |
 | Confirm compromised says "accepted" but the state is not visible | Entra applies it a minute or two after accepting it. Check the Risky agents report in Microsoft Entra, or raise `-WaitSeconds`. The Security Administrator role and `IdentityRiskyAgent.ReadWrite.All` are required. |
+| Conditional Access check says a Defender-risky agent is not blocked now | Expected. Conditional Access reads the agent risk Entra holds, which comes from Entra's own detections or from confirming the agent compromised; Defender alerts do not change it. |
+| Conditional Access check is refused | Grant `Policy.Read.All` and `IdentityRiskyAgent.Read.All` (or `IdentityRiskyAgent.ReadWrite.All`). Reading policies needs a role such as Security Reader or Conditional Access Administrator. |
 | Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
 ## Appendix: hunting queries
