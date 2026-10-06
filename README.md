@@ -25,7 +25,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Endpoint AI: local agents and shadow AI](#endpoint-ai-local-agents-and-shadow-ai)
   - [Contain and clean up](#contain-and-clean-up)
   - [Respond to a compromised agent](#respond-to-a-compromised-agent)
-  - [Check Conditional Access for risky agents](#check-conditional-access-for-risky-agents)
+  - [Check Conditional Access for agents](#check-conditional-access-for-agents)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -51,7 +51,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
-| Conditional Access | Check whether a Conditional Access policy blocks each risky agent at High agent risk, and which policies apply | `-CheckConditionalAccess` |
+| Conditional Access | Check whether a Conditional Access policy blocks each risky agent, or every agent, at High agent risk, and which policies apply | `-CheckConditionalAccess` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
 | Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
 | Console | A desktop window with filters, a details window and buttons for all of the above | `-Gui` |
@@ -402,15 +402,18 @@ In the console, select a tool in the Endpoint AI window and press **Block on thi
 - **Undo dismisses the risk.** Entra has no call that returns an agent to the state before, so `-Undo` and **Undo last run** dismiss the risk: the agent ends up *dismissed*, and the admin-confirmed detection stays in Entra's detection history (kept for 90 days). If Entra had already flagged the agent before you confirmed it, dismissing clears that earlier risk too, and the tool warns about it. A confirmation Entra had not shown yet when the log was written may still appear after an undo; dismiss it again then. To clear a flag without a log, use `-DismissRisk` or, in the console, **Entra risk > Clear the compromised flag...**; dismissing cannot itself be undone.
 - **Requirements.** The Security Administrator role and the `IdentityRiskyAgent.ReadWrite.All` permission. The call is beta only.
 
-### Check Conditional Access for risky agents
+### Check Conditional Access for agents
 
 ```powershell
 .\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess                                # the agents Defender or Entra rate as risky
 .\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -MinSeverity Medium            # only Defender alerts of Medium or higher
 .\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -ForAgent "Contoso HR Agent" -OutFile .\ca.csv
+.\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -AllAgents -OutFile .\ca-all.csv     # every agent in the catalog, summarised by covering policy
 ```
 
-Read-only. For each agent it answers one question: would Microsoft Entra Conditional Access block this agent if its risk were High? Without `-ForAgent` the tool checks the agents Defender flags as risky (last 30 days, optionally limited by `-MinSeverity`) together with the agents Entra ID Protection currently rates at risk or confirmed compromised.
+Read-only. For each agent it answers one question: would Microsoft Entra Conditional Access block this agent if its risk were High? Without `-ForAgent` or `-AllAgents` the tool checks the agents Defender flags as risky (last 30 days, optionally limited by `-MinSeverity`) together with the agents Entra ID Protection currently rates at risk or confirmed compromised.
+
+**All agents.** `-AllAgents` checks every agent in the catalog (add `-AgentsOnly` for Copilot agents only). It first prints a *By coverage* table that counts agents with the same verdict and the same covering policies, then one line per agent, worst verdict first; the covering policy column appears only when agents differ. Agents with no Entra agent identity cannot be covered by Conditional Access for agents and are counted in one warning instead of one row each. `-OutFile` writes every agent with its verdict, `CoveredBy` and `PoliciesThatApply`.
 
 | Verdict | Meaning |
 | --- | --- |
@@ -425,7 +428,7 @@ Read-only. For each agent it answers one question: would Microsoft Entra Conditi
 - **Agents without an Entra agent identity** (for example declarative agents) cannot be covered by Conditional Access for agents and are listed separately.
 - **What is not evaluated.** Policies for the on-behalf-of flow (they target users), policies for agent user accounts, and attribute rules. Resources that accept an API key instead of a token are outside Conditional Access.
 - **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
-- **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below.
+- **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below. With nothing ticked it checks every agent that has an Entra identity.
 
 ### Policy file
 
@@ -492,7 +495,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
 | Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
-| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent at High agent risk, with the policies behind the selected one. |
+| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
 
@@ -521,7 +524,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-SignIn` | none | Sign in once with every permission the tool can use; later runs reuse the saved session. |
 | `-ConfirmCompromised` | names and/or ids | Confirm these agents' Entra identities as compromised (risk level High). |
 | `-DismissRisk` | names and/or ids | Dismiss the Entra risk of these agents' identities. |
-| `-CheckConditionalAccess` | switch | Check whether Conditional Access blocks risky agents at High agent risk. Read-only. |
+| `-CheckConditionalAccess` | switch | Check whether Conditional Access blocks risky agents (or the agents in `-ForAgent` or `-AllAgents`) at High agent risk. Read-only. |
 | `-Restrict` | names and/or ids | Change who can use these agents. |
 | `-BlockLocalAgent` | tool names (wildcards allowed) | Have Defender stop and quarantine these local AI agents on the devices in `-ForDevice`. |
 | `-UnblockLocalAgent` | tool names (wildcards allowed) | Remove the block rule of these local AI agents on the devices in `-ForDevice`. |
@@ -539,7 +542,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | Parameter | Used with | Values and default | What it does |
 | --- | --- | --- | --- |
 | `-Action` | select, stale, risky, FromCsv, ownerless, accountability | `block` (default), `unblock`, `list`; `reassign` with `-Ownerless`; `assign` with `-Accountability` | What to do with the matched set. `list` previews. |
-| `-AgentsOnly` | list, select, stale, risky, inventory | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
+| `-AgentsOnly` | list, select, stale, risky, inventory, CheckConditionalAccess | switch | Limit to Copilot agents (`supportedHosts` contains `Copilot`). |
 | `-Pick` | stale, risky | switch | Choose which matches to act on in the picker. |
 | `-Force` | any write | switch | Skip the confirmation. |
 | `-WhatIf` | any write | switch | Show what would change; change nothing. |
@@ -564,6 +567,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-AllowUsers`, `-AllowGroups` | `-Restrict` | UPNs or ids; names or ids | Who the agents stay available to (with `-AvailableTo Some`). |
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
+| `-AllAgents` | `-CheckConditionalAccess` | switch | Check every agent in the catalog instead of the risky ones. Not with `-ForAgent`. |
 | `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess` | names and/or ids | List the individual events of these agents, or check these agents instead of the risky ones. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |

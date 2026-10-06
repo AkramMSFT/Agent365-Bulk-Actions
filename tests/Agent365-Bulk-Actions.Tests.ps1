@@ -2247,6 +2247,30 @@ Describe 'Conditional Access check for agents' {
         (($d | Where-Object Item -eq 'Nothing').Info) | Should -BeLike '*never applies*'
         (@(Get-AgentCaDetailRows (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @() | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'unknown' -PassThru)) | Where-Object Item -eq '(none)').Info | Should -BeLike 'No Conditional Access policy targets this agent*'
     }
+    It 'names the policies behind each verdict' {
+        $live = New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))
+        $report = New-Ca (New-RawCa -Name 'Pilot' -State 'enabledForReportingButNotEnforced' -Include @('p1') -Risk @('high'))
+        $none = New-Ca (New-RawCa -Name 'Nothing' -Include @('n1') -Risk @('high') -Resources @('None'))
+        $attr = New-Ca (New-RawCa -Name 'By attribute' -Filter @{ mode = 'include'; rule = 'r' } -Risk @('high'))
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @($live))) | Should -Be 'Block high'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('p1') -Policies @($report))) | Should -Be 'Pilot'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('n1') -Policies @($none))) | Should -Be 'Nothing'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @($attr))) | Should -Be 'By attribute'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @())) | Should -Be ''
+    }
+    It 'counts agents with the same verdict and policies together, worst first' {
+        $live = New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))
+        $open = New-Ca (New-RawCa -Name 'Pilot only' -Include @('p1') -Risk @('high'))
+        $rows = @(
+            (Get-AgentCaCoverage -Agent 'A' -Ids @('a') -Policies @($live) -RiskLevel 'high'),
+            (Get-AgentCaCoverage -Agent 'B' -Ids @('b') -Policies @($live)),
+            (Get-AgentCaCoverage -Agent 'C' -Ids @('c') -Policies @($live)),
+            (Get-AgentCaCoverage -Agent 'D' -Ids @('d') -Policies @($open)))
+        $g = @(Get-AgentCaGroups $rows)
+        $g.Count | Should -Be 2
+        $g[0].Verdict | Should -Be 'Unprotected'; $g[0].Agents | Should -Be 1; $g[0].CoveredBy | Should -Be ''
+        $g[1].Verdict | Should -Be 'Protected'; $g[1].Agents | Should -Be 3; $g[1].BlockedNow | Should -Be 1; $g[1].CoveredBy | Should -Be 'Block high'
+    }
 }
 
 Describe 'Conditional Access check: tenant findings' {
