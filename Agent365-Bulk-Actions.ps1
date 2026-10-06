@@ -11,6 +11,7 @@
     POST  /beta/copilot/admin/catalog/packages/{id}/block      block (and /unblock)
     POST  /beta/copilot/admin/catalog/packages/{id}/reassign   change the owner
     POST  /beta/identityProtection/riskyAgents/confirmCompromised   mark an agent identity compromised (and /dismiss)
+    POST  /beta/security/rules/detectionRules                  block a local AI agent on one device (Defender custom detection rule)
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
 
@@ -60,6 +61,10 @@
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -ConfirmCompromised "Contoso HR Agent"
   Confirm the agent's Entra identity as compromised (risk level High). -Undo <log> or -DismissRisk clears it.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
+  Have Defender stop and quarantine a local AI agent on one device. -UnblockLocalAgent or -Undo <log> removes the rule.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -EndpointAi -RiskyOnly
@@ -282,14 +287,23 @@ param(
     [switch]$EndpointAi,                    # local AI agents and shadow AI on devices onboarded to Defender for Endpoint, with telemetry and risk
 
     [Parameter(ParameterSetName = 'EndpointAi')]
+    [Parameter(ParameterSetName = 'BlockLocalAgent')]
     [ValidateRange(1, 30)]
     [int]$EndpointDays = 30,                # Endpoint AI: days of endpoint telemetry to read (Defender keeps about 30)
 
     [Parameter(ParameterSetName = 'EndpointAi')]
-    [string[]]$ForDevice,                   # Endpoint AI: show the full evidence for the tools on these devices (names, wildcards allowed)
+    [Parameter(ParameterSetName = 'BlockLocalAgent', Mandatory)]
+    [Parameter(ParameterSetName = 'UnblockLocalAgent', Mandatory)]
+    [string[]]$ForDevice,                   # Endpoint AI: show the full evidence for the tools on these devices. Block and unblock: the devices to act on (names, wildcards allowed)
 
     [Parameter(ParameterSetName = 'EndpointAi')]
     [string[]]$Sanctioned,                  # Endpoint AI: tool or vendor names you have approved (substring match); everything else shows as Unsanctioned
+
+    [Parameter(ParameterSetName = 'BlockLocalAgent', Mandatory)]
+    [string[]]$BlockLocalAgent,             # have Defender stop and quarantine these local AI agents (names, wildcards allowed) on the devices in -ForDevice
+
+    [Parameter(ParameterSetName = 'UnblockLocalAgent', Mandatory)]
+    [string[]]$UnblockLocalAgent,           # remove the block rule of these local AI agents (names, wildcards allowed) on the devices in -ForDevice
 
     [Parameter(ParameterSetName = 'SignIn', Mandatory)]
     [switch]$SignIn,                          # sign in once from a terminal with every permission the tool can use; later runs reuse the saved session
@@ -326,7 +340,7 @@ if (-not $script:LoadOnly -and -not (Get-Module -ListAvailable -Name Microsoft.G
 if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 
 # Every permission the tool can use. -SignIn asks for all of them once, so no later mode has to prompt.
-$script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
+$script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
                       'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All')
 
@@ -373,6 +387,9 @@ if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 if ($PSCmdlet.ParameterSetName -eq 'SignIn') { $scopes = $script:AllScopes }
 if ($PSCmdlet.ParameterSetName -eq 'EndpointAi') { $scopes = @('ThreatHunting.Read.All') }
+if ($PSCmdlet.ParameterSetName -eq 'BlockLocalAgent') { $scopes = @('ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All') }
+if ($PSCmdlet.ParameterSetName -eq 'UnblockLocalAgent') { $scopes = @('CustomDetection.ReadWrite.All') }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blocklocalagent')) { $scopes += 'CustomDetection.ReadWrite.All' }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -1295,7 +1312,7 @@ function Get-EndpointAiRisk {
 }
 # Turn the query results into one row per tool and device, with its evidence and risk.
 function New-EndpointAiRows {
-    param([hashtable]$Data, [string[]]$Sanctioned = @(), [int]$Days = 30)
+    param([hashtable]$Data, [string[]]$Sanctioned = @(), [int]$Days = 30, [hashtable]$Blocks = @{})
     $rows = @{}
     $idByName = @{}
     foreach ($set in 'Processes', 'Outbound', 'Listening', 'Software', 'Vulnerabilities', 'Files', 'Devices') {
@@ -1318,8 +1335,8 @@ function New-EndpointAiRows {
                 Flag = ''; ExposureLevel = ''; AssetValue = ''; Device = $null; ActiveAt = (New-Object 'System.Collections.Generic.List[datetime]')
             }
             $rows[$key] = [pscustomobject]@{
-                Tool = $Tool.Name; Vendor = $Tool.Vendor; Category = $Tool.Category; Device = $DeviceName; DeviceId = $DeviceId; User = ''; Version = ''
-                Status = ''; Risk = 'None'; Why = ''; FirstSeen = $null; LastSeen = $null; Runs = 0; Sources = (New-Object 'System.Collections.Generic.List[string]')
+                ToolKey = $Tool.Key; Tool = $Tool.Name; Vendor = $Tool.Vendor; Category = $Tool.Category; Device = $DeviceName; DeviceId = $DeviceId; User = ''; Version = ''
+                Status = ''; Blocked = ''; Risk = 'None'; Why = ''; FirstSeen = $null; LastSeen = $null; Runs = 0; Sources = (New-Object 'System.Collections.Generic.List[string]')
                 Trusted = ''; AutoApprove = ''; Accounts = (New-Object 'System.Collections.Generic.List[string]'); Evidence = $ev; Reasons = @(); Key = $key
             }
         }
@@ -1456,6 +1473,7 @@ function New-EndpointAiRows {
         $row.Status = if (-not $approved.Count) { 'Unreviewed' }
                       elseif (@($approved | Where-Object { ($row.Tool -like "*$_*") -or ($row.Vendor -like "*$_*") }).Count) { 'Sanctioned' }
                       else { 'Unsanctioned' }
+        $row.Blocked = if (Test-LocalAgentBlockActive -Blocks $Blocks -RuleId (Get-LocalAgentBlockId -ToolKey $row.ToolKey -DeviceId $row.DeviceId)) { 'Blocked' } else { '' }
         $risk = Get-EndpointAiRisk $row
         $row.Risk = $risk.Level; $row.Reasons = $risk.Reasons
         $row.Why = (@($risk.Reasons | Select-Object -First 3 | ForEach-Object { $_.Short }) -join '; ')
@@ -1485,10 +1503,13 @@ function Get-EndpointAiData {
     $data.Alerts = if ($names.Count) { @(Invoke-HuntingQuery -Query (Get-EndpointAiAlertQuery -Days $Days -DeviceNames $names) -Hint $hint) } else { @() }
     & $say ("Reading device details ({0} of {1})..." -f ($steps.Count + 2), ($steps.Count + 2))
     $data.Devices = if ($ids.Count) { @(Invoke-HuntingQuery -Query (Get-EndpointAiDeviceQuery -DeviceIds $ids) -Hint $hint) } else { @() }
+    # Which rows this tool has blocked. Only read when the permission is already held, so looking never prompts.
+    $blocks = @{}
+    if ((Test-GraphScope 'CustomDetection.ReadWrite.All') -or (Test-GraphScope 'CustomDetection.Read.All')) { try { $blocks = Get-LocalAgentBlocks } catch { $null = $_ } }
     $cover = @{}; foreach ($c in $data.Coverage) { $cover[[string]$c.OnboardingStatus] = [int]$c.Devices }
     $removed = @($data.Agents | Where-Object { $_.LifecycleStatus -in 'Deleted', 'Uninstalled' }).Count
     [pscustomobject]@{
-        Days = $Days; Rows = @(New-EndpointAiRows -Data $data -Sanctioned $Sanctioned -Days $Days); Coverage = $cover; RemovedAgents = $removed
+        Days = $Days; Rows = @(New-EndpointAiRows -Data $data -Sanctioned $Sanctioned -Days $Days -Blocks $blocks); Coverage = $cover; RemovedAgents = $removed
         Devices = $data.Devices
     }
 }
@@ -1496,7 +1517,7 @@ function Get-EndpointAiData {
 function Show-EndpointAiTable {
     param([object[]]$Rows)
     $Rows | Select-Object @{ n = 'tool'; e = { $_.Tool } }, @{ n = 'category'; e = { $_.Category } }, @{ n = 'device'; e = { $_.Device } }, @{ n = 'user'; e = { $_.User } },
-        @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'status'; e = { $_.Status } }, @{ n = 'lastSeen'; e = { if ($_.LastSeen) { $_.LastSeen.ToString('yyyy-MM-dd HH:mm') } else { '' } } },
+        @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'status'; e = { $_.Status } }, @{ n = 'blocked'; e = { $_.Blocked } }, @{ n = 'lastSeen'; e = { if ($_.LastSeen) { $_.LastSeen.ToString('yyyy-MM-dd HH:mm') } else { '' } } },
         @{ n = 'why'; e = { $_.Why } } | Format-Table -AutoSize -Wrap | Out-Host
 }
 
@@ -1512,6 +1533,7 @@ function Get-EndpointAiDetailRows {
     if ($Row.User) { & $add 'Overview' 'Users' $Row.User }
     if ($Row.Version) { & $add 'Overview' 'Version' $Row.Version }
     & $add 'Overview' 'Status' $Row.Status
+    if ($Row.Blocked) { & $add 'Overview' 'Block' 'A Defender rule stops and quarantines its files on this device each time they appear.' }
     & $add 'Overview' 'Seen by' $Row.Sources
     & $add 'Overview' 'First / last seen' ("{0}  /  {1}" -f (& $time $Row.FirstSeen), (& $time $Row.LastSeen))
     if ($Row.Runs) { & $add 'Overview' 'Process starts' ([string]$Row.Runs) }
@@ -1543,6 +1565,210 @@ function Get-EndpointAiDetailRows {
         & $add 'Device' $Row.Device ("{0}, {1}, {2}. Exposure {3}, asset value {4}." -f $d.OSPlatform, $d.DeviceType, $d.OnboardingStatus, $d.ExposureLevel, $d.AssetValue)
     }
     $out.ToArray()
+}
+
+# ---------------------------------------------------------------------------------------------
+# Block a local AI agent on one device. Microsoft's own block (Shadow AI in the admin center) covers only OpenClaw, Node.js-based
+# agents and VS Code extensions, and acts through Intune. This uses a Defender custom detection rule instead: the rule matches
+# the tool's files on that device and stops and quarantines them each time they appear. Beta only.
+# Deleting the rule stops further quarantines. Files already quarantined stay quarantined until restored in Microsoft Defender.
+# ---------------------------------------------------------------------------------------------
+$script:DetectionRuleBase = 'https://graph.microsoft.com/beta/security/rules/detectionRules'
+$script:BlockRulePrefix = 'a365ba-block-'
+# Rows that are not programs of their own: blocking them would mean blocking node, python or a data file.
+$script:NotBlockable = @('mcp-server', 'mcp-config', 'model-files')
+
+function Get-LocalAgentBlockId {
+    param([string]$ToolKey, [string]$DeviceId)
+    $k = ($ToolKey.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+    $d = ($DeviceId.ToLowerInvariant() -replace '[^a-z0-9]', '')
+    if ($d.Length -gt 12) { $d = $d.Substring(0, 12) }
+    '{0}{1}-{2}' -f $script:BlockRulePrefix, $k, $d
+}
+
+# A literal for the service's regular expressions, which reject an escaped space.
+function ConvertTo-Re2Literal {
+    param([string]$Text)
+    $Text -replace '([\\.+*?()|\[\]{}^$])', '\$1'
+}
+
+# A pattern for one file path in which any version folder (Claude_1.52.3.0_x64, 1.0.87) matches whatever version it is.
+function ConvertTo-PathRegex {
+    param([string]$Path)
+    $parts = foreach ($segment in ($Path -split '\\')) {
+        if ($segment -match '^(?<pre>[^\d]*?)(?<ver>\d+(\.\d+)+.*)$') { (ConvertTo-Re2Literal $Matches['pre']) + '[^\\]+' }
+        else { ConvertTo-Re2Literal $segment }
+    }
+    $parts -join '\\'
+}
+
+# A path as people read it: any version folder shows as <version>, which is what the rule matches.
+function ConvertTo-PathDisplay {
+    param([string]$Path)
+    (($Path -split '\\') | ForEach-Object { if ($_ -match '^(?<pre>[^\d]*?)(?<ver>\d+(\.\d+)+.*)$') { $Matches['pre'] + '<version>' } else { $_ } }) -join '\'
+}
+
+# Files the rule would match. Windows and Microsoft's own app packages are never included. -Raw gives the paths as seen, not the readable form.
+function Get-LocalAgentBlockPaths {
+    param([object]$Row, [switch]$Raw)
+    $paths = @($Row.Evidence.Processes | Where-Object { $_.Path -and $_.Path -notmatch '(?i)^[a-z]:\\windows\\' -and $_.Path -notmatch '(?i)\\WindowsApps\\Microsoft\.' } | ForEach-Object { $_.Path })
+    if ($Raw) { @($paths | Get-Distinct) } else { @($paths | ForEach-Object { ConvertTo-PathDisplay $_ } | Get-Distinct) }
+}
+
+# Why a row cannot be blocked, or an empty string when it can.
+function Test-LocalAgentBlockable {
+    param([object]$Row)
+    if (-not $Row.DeviceId) { return 'Defender gave no device id for it.' }
+    if ($script:NotBlockable -contains $Row.ToolKey) { return 'It is not a program of its own. Block the agent that uses it instead.' }
+    if (@($Row.Evidence.Processes | Where-Object { $_.Path }).Count -eq 0) { return 'No program file was seen in this period, so there is nothing to match.' }
+    if ((Get-LocalAgentBlockPaths -Row $Row -Raw).Count -eq 0) { return 'Its files are in the Windows folder or in one of Microsoft''s own app packages, which are protected. Manage those with Intune or the admin center.' }
+    ''
+}
+
+# A caution that does not stop the block: files in the Microsoft Store folder are protected, so quarantine may not work.
+function Get-LocalAgentBlockWarning {
+    param([object]$Row)
+    if (@(Get-LocalAgentBlockPaths -Row $Row -Raw | Where-Object { $_ -match '(?i)\\WindowsApps\\' }).Count) {
+        'Installed from the Microsoft Store. Defender may not be able to quarantine files in that protected folder, so the block might not take effect. Check the device after the rule has run.'
+    } else { '' }
+}
+# The hunting query the rule runs: that device, and only the files this tool was seen running from.
+function New-LocalAgentBlockQuery {
+    param([object]$Row)
+    $patterns = @(Get-LocalAgentBlockPaths -Row $Row -Raw | ForEach-Object { ConvertTo-PathRegex $_ } | Get-Distinct)
+    $regex = '(?i)^(' + ($patterns -join '|') + ')$'
+@"
+DeviceProcessEvents
+| where DeviceId == "$($Row.DeviceId)"
+| where FolderPath matches regex @"$regex"
+| project Timestamp, ReportId, DeviceId, DeviceName, FileName, FolderPath, SHA1, SHA256, ProcessCommandLine
+"@
+}
+
+function New-LocalAgentBlockRule {
+    param([object]$Row, [string]$Operator)
+    $name = 'Agent365 Bulk Actions: block {0} on {1}' -f $Row.Tool, $Row.Device
+    @{
+        '@odata.type'   = '#microsoft.graph.security.detectionRule'
+        id              = Get-LocalAgentBlockId -ToolKey $Row.ToolKey -DeviceId $Row.DeviceId
+        displayName     = $name
+        description     = ("Created by Agent365-Bulk-Actions ({0}, {1}). Stops and quarantines the files of {2} on {3} each time they appear. Delete this rule to stop. Files already quarantined stay quarantined until restored in Microsoft Defender." -f $Operator, (Get-Date -Format 'yyyy-MM-dd'), $Row.Tool, $Row.Device)
+        status          = 'enabled'
+        queryCondition  = @{ queryText = (New-LocalAgentBlockQuery $Row) }
+        schedule        = @{ frequency = 'PT1H' }
+        detectionAction = @{
+            alertTemplate    = @{
+                title              = ('Local AI agent blocked: {0}' -f $Row.Tool)
+                description        = ('{0} ran on {1}. Agent365-Bulk-Actions asked Microsoft Defender to stop and quarantine its files on that device.' -f $Row.Tool, $Row.Device)
+                severity           = 'informational'
+                recommendedActions = ('To allow it again, delete the detection rule "{0}" and restore the quarantined files in Microsoft Defender.' -f $name)
+                entityMappings     = @{
+                    hosts = @(@{ deviceIdColumn = 'DeviceId'; nameColumn = 'DeviceName' })
+                    files = @(@{ nameColumn = 'FileName'; sha1Column = 'SHA1'; sha256Column = 'SHA256' })
+                }
+            }
+            automatedActions = @{
+                stopAndQuarantineFiles = @(@{ '@odata.type' = '#microsoft.graph.security.stopAndQuarantineFileAction'; deviceIdColumn = 'DeviceId'; sha1Column = 'SHA1' })
+            }
+        }
+    }
+}
+
+# The block rules this tool created, by rule id.
+function Get-LocalAgentBlocks {
+    $rules = @{}
+    $uri = $script:DetectionRuleBase
+    do {
+        $page = Invoke-Graph -Uri $uri
+        foreach ($r in @($page.value)) { if ([string]$r.id -like "$script:BlockRulePrefix*") { $rules[[string]$r.id] = $r } }
+        $uri = [string]$page.'@odata.nextLink'
+    } while ($uri)
+    $rules
+}
+
+# Rules this session just deleted. The service accepts a delete at once but its list keeps showing the rule for a long while,
+# so a rule listed here is treated as gone whatever the list says.
+$script:RecentlyUnblocked = @{}
+
+function Test-LocalAgentBlockActive {
+    param([hashtable]$Blocks, [string]$RuleId)
+    $r = $Blocks[$RuleId]
+    [bool]($r -and ([string]$r.status -ne 'disabled') -and -not $script:RecentlyUnblocked.ContainsKey($RuleId))
+}
+
+# Create one block rule per row. A row that cannot be blocked, or is already blocked, is skipped and says why. A rule that exists
+# but is disabled is switched back on with a complete update (the service replaces a rule from its full body).
+function Invoke-LocalAgentBlock {
+    param([object[]]$Rows, [switch]$PassThru)
+    $who = (Get-MgContext).Account
+    $existing = Get-LocalAgentBlocks
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $skip = 0; $fail = 0
+    Write-Host ("`nBlock {0} local AI agent(s):" -f @($Rows).Count) -ForegroundColor Cyan
+    foreach ($row in @($Rows)) {
+        $id = Get-LocalAgentBlockId -ToolKey $row.ToolKey -DeviceId $row.DeviceId
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'blocklocalagent'
+            Tool = $row.Tool; Device = $row.Device; DeviceId = $row.DeviceId; RuleId = $id; Files = ((Get-LocalAgentBlockPaths $row) -join '; '); Result = ''; Error = ''
+        }
+        $why = Test-LocalAgentBlockable $row
+        if ($why) { Write-Host ("  SKIP {0} on {1}: {2}" -f $row.Tool, $row.Device, $why) -ForegroundColor DarkGray; $rec.Result = 'Skipped'; $rec.Error = $why; $skip++ }
+        elseif (Test-LocalAgentBlockActive -Blocks $existing -RuleId $id) { Write-Host ("  SKIP {0} on {1}: already blocked" -f $row.Tool, $row.Device) -ForegroundColor DarkGray; $rec.Result = 'Skipped'; $rec.Error = 'Already blocked.'; $skip++ }
+        elseif (-not (Test-Proceed ("{0} on {1}" -f $row.Tool, $row.Device) 'Block local AI agent')) { $rec.Result = 'WhatIf' }
+        else {
+            try {
+                $body = New-LocalAgentBlockRule -Row $row -Operator $who | ConvertTo-Json -Depth 12
+                $uri = '{0}/{1}' -f $script:DetectionRuleBase, [uri]::EscapeDataString($id)
+                $listed = $existing.ContainsKey($id) -and -not $script:RecentlyUnblocked.ContainsKey($id)
+                try {
+                    if ($listed) { Invoke-Graph -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null }
+                    else { Invoke-Graph -Method POST -Uri $script:DetectionRuleBase -Body $body -ContentType 'application/json' | Out-Null }
+                } catch {
+                    # The service still has a rule the list did not show: update it instead.
+                    if (-not $listed -and $_.Exception.Message -match '(?i)already|exist|conflict|duplicate') { Invoke-Graph -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' | Out-Null } else { throw }
+                }
+                $script:RecentlyUnblocked.Remove($id)
+                Write-Host ("  OK   {0} on {1}  (rule {2})" -f $row.Tool, $row.Device, $id) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            } catch {
+                $msg = $_.Exception.Message
+                if ($msg -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $msg += ' (this needs the CustomDetection.ReadWrite.All permission and a Defender role that can manage custom detections and remediate files, such as Security Administrator)' }
+                Write-Host ("  FAIL {0} on {1}: {2}" -f $row.Tool, $row.Device, $msg) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $msg; $fail++
+            }
+        }
+        $log.Add([pscustomobject]$rec)
+    }
+    Write-Host ("Done: {0} blocked, {1} skipped, {2} failed." -f $ok, $skip, $fail) -ForegroundColor Cyan
+    if ($ok) { Write-Host 'Defender runs the rule when it is created and then every hour, and stops and quarantines the files each time it finds them. Delete the rule (-UnblockLocalAgent or -Undo) to stop; files already quarantined stay quarantined until restored in Microsoft Defender.' -ForegroundColor Yellow }
+    Export-ActionLog -Records $log.ToArray()
+    if ($PassThru) { $log.ToArray() }
+}
+
+# Delete block rules. A rule the service no longer knows counts as removed. Quarantined files are not restored.
+function Invoke-LocalAgentUnblock {
+    param([object[]]$Rules, [switch]$PassThru)
+    $who = (Get-MgContext).Account
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
+    foreach ($rule in @($Rules)) {
+        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'unblocklocalagent'; Rule = [string]$rule.displayName; RuleId = [string]$rule.id; Result = ''; Error = '' }
+        if (-not (Test-Proceed ([string]$rule.displayName) 'Remove block')) { $rec.Result = 'WhatIf' }
+        else {
+            try {
+                try { Invoke-Graph -Method DELETE -Uri ("{0}/{1}" -f $script:DetectionRuleBase, [uri]::EscapeDataString([string]$rule.id)) | Out-Null }
+                catch { if ($_.Exception.Message -match '(?i)NotFound|not found|404') { $rec.Error = 'The service no longer had the rule.' } else { throw } }
+                $script:RecentlyUnblocked[[string]$rule.id] = Get-Date
+                Write-Host ("  OK   removed {0}" -f $rule.displayName) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            } catch {
+                Write-Host ("  FAIL {0}: {1}" -f $rule.displayName, $_.Exception.Message) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+            }
+        }
+        $log.Add([pscustomobject]$rec)
+    }
+    Write-Host ("Done: {0} removed, {1} failed. Files Defender already quarantined stay quarantined until restored in Microsoft Defender. The rule list in Defender can keep showing a deleted rule for several minutes." -f $ok, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log.ToArray()
+    if ($PassThru) { $log.ToArray() }
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4057,6 +4283,8 @@ $EndpointAiXaml = @'
       <DockPanel>
         <Button x:Name="BtnEpExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON."/>
         <Button x:Name="BtnEpLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the endpoint telemetry again from Microsoft Defender Advanced Hunting."/>
+        <Button x:Name="BtnEpUnblock" Content="Remove block" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" IsEnabled="False" ToolTip="Delete the Defender rule that blocks the selected tool on its device. Files already quarantined stay quarantined until restored in Microsoft Defender."/>
+        <Button x:Name="BtnEpBlock" Content="Block on this device..." DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" IsEnabled="False" ToolTip="Have Microsoft Defender stop and quarantine the selected tool's files on this device only, each time they appear."/>
         <ComboBox x:Name="EpDaysBox" DockPanel.Dock="Right" SelectedIndex="2" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="How much endpoint telemetry to read. Defender keeps about 30 days.">
           <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
         </ComboBox>
@@ -4082,6 +4310,7 @@ $EndpointAiXaml = @'
           </DataGridTextColumn.ElementStyle>
         </DataGridTextColumn>
         <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Blocked" Binding="{Binding Blocked}" Width="80" ElementStyle="{StaticResource Wrap}"/>
         <DataGridTextColumn Header="Last seen" Binding="{Binding LastSeen, StringFormat=yyyy-MM-dd HH:mm}" Width="130" ElementStyle="{StaticResource Wrap}"/>
         <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2.4*" ElementStyle="{StaticResource Wrap}"/>
         <DataGridTextColumn Header="Seen by" Binding="{Binding Sources}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
@@ -4128,6 +4357,60 @@ function Update-EndpointAiWindow {
                  else { 'No AI tool found on the onboarded devices for this period.' }
     if ($rows.Count) { $grid.SelectedIndex = 0 }
     $Window.FindName('EpDetailGrid').ItemsSource = @(if ($grid.SelectedItem) { Get-EndpointAiDetailRows $grid.SelectedItem })
+    Update-EndpointAiButtons -Window $Window
+}
+
+# Which of the block buttons apply to the selected row.
+function Update-EndpointAiButtons {
+    param([System.Windows.Window]$Window)
+    $row = $Window.FindName('EpGrid').SelectedItem
+    $block = $Window.FindName('BtnEpBlock'); $unblock = $Window.FindName('BtnEpUnblock')
+    if (-not $row) { $block.IsEnabled = $false; $unblock.IsEnabled = $false; return }
+    $why = Test-LocalAgentBlockable $row
+    $block.IsEnabled = (-not $why) -and ($row.Blocked -ne 'Blocked')
+    $block.ToolTip = if ($why) { "Cannot be blocked: $why" } elseif ($row.Blocked -eq 'Blocked') { 'Already blocked on this device.' } else { 'Have Microsoft Defender stop and quarantine this tool''s files on this device only, each time they appear.' }
+    $unblock.IsEnabled = ($row.Blocked -eq 'Blocked')
+}
+
+# Block the selected tool on its device, or remove that block. Asks first, naming the files Defender will quarantine.
+function Invoke-EndpointAiBlockAction {
+    param([System.Windows.Window]$Window, [ValidateSet('Block', 'Unblock')][string]$Mode)
+    $row = $Window.FindName('EpGrid').SelectedItem
+    if (-not $row) { return }
+    $note = $Window.FindName('EpNote')
+    $pump = { $Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
+    try {
+        if (-not (Test-GraphScope 'CustomDetection.ReadWrite.All')) {
+            $note.Text = 'Granting access to Defender custom detections: finish the sign-in window...'; & $pump
+            Request-GraphScope 'CustomDetection.ReadWrite.All'
+        }
+    } catch { $note.Text = 'Sign-in failed: ' + $_.Exception.Message; return }
+    if ($Mode -eq 'Block') {
+        $why = Test-LocalAgentBlockable $row
+        if ($why) { [void][Windows.MessageBox]::Show("$($row.Tool) on $($row.Device) cannot be blocked.`n`n$why", 'Block', 'OK', 'Information'); return }
+        $files = @(Get-LocalAgentBlockPaths $row)
+        $list = (($files | Select-Object -First 8 | ForEach-Object { "  $_" }) -join "`n") + $(if ($files.Count -gt 8) { "`n  ... and $($files.Count - 8) more" } else { '' })
+        $caution = Get-LocalAgentBlockWarning $row
+        $text = "Block $($row.Tool) on $($row.Device)?`n`nMicrosoft Defender will stop and quarantine these files on that device, and do so again whenever they appear (an update into a new version folder is covered). Other devices are not affected.`n`n$list`n`n$(if ($caution) { "$caution`n`n" })Removing the block stops further quarantines, but files already quarantined stay quarantined until restored in Microsoft Defender."
+        if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Warning', 'No') -ne 'Yes') { return }
+        if ($script:ctx) { & $script:ctx.NewLogPath 'block-local-agent' }
+        $note.Text = "Creating the block rule for $($row.Tool) on $($row.Device)..."; & $pump
+        $rec = @(Invoke-LocalAgentBlock -Rows @($row) -PassThru)[0]
+        if ($rec.Result -eq 'Done') { $row.Blocked = 'Blocked'; $note.Text = "Blocked. Defender runs the rule within the hour and then stops and quarantines the files of $($row.Tool) on $($row.Device)." }
+        elseif ($rec.Result -eq 'Failed') { $note.Text = 'The block failed.'; [void][Windows.MessageBox]::Show($rec.Error, 'Block failed', 'OK', 'Warning') }
+        else { $note.Text = [string]$rec.Error }
+    } else {
+        $text = "Remove the block on $($row.Tool) on $($row.Device)?`n`nDefender stops quarantining its files. Files already quarantined stay quarantined until restored in Microsoft Defender."
+        if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+        if ($script:ctx) { & $script:ctx.NewLogPath 'unblock-local-agent' }
+        $rule = [pscustomobject]@{ id = (Get-LocalAgentBlockId -ToolKey $row.ToolKey -DeviceId $row.DeviceId); displayName = ('Agent365 Bulk Actions: block {0} on {1}' -f $row.Tool, $row.Device) }
+        $rec = @(Invoke-LocalAgentUnblock -Rules @($rule) -PassThru)[0]
+        if ($rec.Result -eq 'Done') { $row.Blocked = ''; $note.Text = "The block on $($row.Tool) on $($row.Device) is removed. Files already quarantined stay quarantined until restored in Microsoft Defender." }
+        else { $note.Text = 'Could not remove the block.'; [void][Windows.MessageBox]::Show([string]$rec.Error, 'Remove block failed', 'OK', 'Warning') }
+    }
+    $Window.FindName('EpGrid').Items.Refresh()
+    Update-EndpointAiButtons -Window $Window
+    $Window.FindName('EpDetailGrid').ItemsSource = @(Get-EndpointAiDetailRows $row)
 }
 
 function New-EndpointAiWindow {
@@ -4136,10 +4419,13 @@ function New-EndpointAiWindow {
     if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
     $script:epWindow = $d
     $d.FindName('BtnEpLoad').Add_Click({ Update-EndpointAiWindow -Window $script:epWindow -Load })
+    $d.FindName('BtnEpBlock').Add_Click({ Invoke-EndpointAiBlockAction -Window $script:epWindow -Mode Block })
+    $d.FindName('BtnEpUnblock').Add_Click({ Invoke-EndpointAiBlockAction -Window $script:epWindow -Mode Unblock })
     $d.FindName('EpRiskyOnly').Add_Click({ Update-EndpointAiWindow -Window $script:epWindow })
     $d.FindName('EpGrid').Add_SelectionChanged({
         $item = $script:epWindow.FindName('EpGrid').SelectedItem
         $script:epWindow.FindName('EpDetailGrid').ItemsSource = @(if ($item) { Get-EndpointAiDetailRows $item })
+        Update-EndpointAiButtons -Window $script:epWindow
     })
     $d.FindName('BtnEpExport').Add_Click({
         $shown = @($script:epWindow.FindName('EpGrid').ItemsSource)
@@ -4147,7 +4433,7 @@ function New-EndpointAiWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'endpoint-ai.csv'
         if (-not $dlg.ShowDialog()) { return }
-        $out = @($shown | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
+        $out = @($shown | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Blocked, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
         else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
@@ -4906,6 +5192,30 @@ switch ($PSCmdlet.ParameterSetName) {
         Show-AgentDetail -Detail $det
         if ($OutFile) { $det | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutFile -Encoding utf8; Write-Host "Saved: $OutFile" -ForegroundColor Cyan }
     }
+    'BlockLocalAgent' {
+        $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
+        Write-Host ("Finding {0} on {1}..." -f ($BlockLocalAgent -join ', '), ($ForDevice -join ', ')) -ForegroundColor DarkGray
+        $data = Get-EndpointAiData -Days $EndpointDays -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        $found = @($data.Rows | Where-Object { $tool = $_.Tool; $dev = $_.Device; @($BlockLocalAgent | Where-Object { $tool -like $_ }).Count -and @($ForDevice | Where-Object { $dev -like $_ }).Count })
+        if ($found.Count -eq 0) { Write-Host 'No matching AI tool was found on those devices. Run -EndpointAi to see what is there.' -ForegroundColor Yellow; break }
+        $found | Select-Object @{ n = 'tool'; e = { $_.Tool } }, @{ n = 'device'; e = { $_.Device } }, @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'blocked'; e = { $_.Blocked } },
+            @{ n = 'files Defender would quarantine'; e = { (Get-LocalAgentBlockPaths $_) -join '; ' } }, @{ n = 'cannot block because'; e = { Test-LocalAgentBlockable $_ } } | Format-Table -AutoSize -Wrap | Out-Host
+        $ready = @($found | Where-Object { -not (Test-LocalAgentBlockable $_) -and $_.Blocked -ne 'Blocked' })
+        if ($ready.Count -eq 0) { Write-Host 'Nothing to block: each match is already blocked or cannot be blocked.' -ForegroundColor Yellow; break }
+        foreach ($r in $ready) { $w = Get-LocalAgentBlockWarning $r; if ($w) { Write-Warning ("{0} on {1}: {2}" -f $r.Tool, $r.Device, $w) } }
+        Write-Host ("Defender will stop and quarantine the files listed above on {0} device(s), only the ones named, each time they appear. Removing the block stops that, but files already quarantined stay quarantined until restored in Microsoft Defender." -f @($ready | ForEach-Object { $_.Device } | Get-Distinct).Count) -ForegroundColor Yellow
+        if (-not (Confirm-Batch -Count $ready.Count -Action 'block (stop and quarantine)')) { Write-Host 'Cancelled.'; break }
+        Invoke-LocalAgentBlock -Rows $ready
+    }
+    'UnblockLocalAgent' {
+        $UnblockLocalAgent = ConvertTo-NameList $UnblockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
+        $blocks = Get-LocalAgentBlocks
+        $rules = @($blocks.Values | Where-Object { $name = [string]$_.displayName; $hit = $false; foreach ($tl in $UnblockLocalAgent) { foreach ($dv in $ForDevice) { if ($name -like ('*block {0} on {1}' -f $tl, $dv)) { $hit = $true } } }; $hit })
+        if ($rules.Count -eq 0) { Write-Host 'No block rule made by this tool matches those names.' -ForegroundColor Yellow; break }
+        $rules | Select-Object @{ n = 'rule'; e = { $_.displayName } }, @{ n = 'id'; e = { $_.id } } | Format-Table -AutoSize | Out-Host
+        if (-not (Confirm-Batch -Count $rules.Count -Action 'remove the block rule of')) { Write-Host 'Cancelled.'; break }
+        Invoke-LocalAgentUnblock -Rules $rules
+    }
     'EndpointAi' {
         $Sanctioned = ConvertTo-NameList $Sanctioned; $ForDevice = ConvertTo-NameList $ForDevice
         Write-Host ("Reading endpoint telemetry for the last {0} day(s)..." -f $EndpointDays) -ForegroundColor DarkGray
@@ -4930,7 +5240,7 @@ switch ($PSCmdlet.ParameterSetName) {
         } else {
             if ($rows.Count) { Show-EndpointAiTable $rows }
             Write-Host 'Use -ForDevice <name> for the evidence behind each row. Prompts and credentials in command lines are hidden. Alerts name the device, not the process, so one counts against a tool only when it fired within 15 minutes of that tool running.' -ForegroundColor DarkGray
-            Export-ActionLog -Records @($rows | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
+            Export-ActionLog -Records @($rows | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Blocked, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
         }
     }
     'AiActivity' {
@@ -5112,6 +5422,7 @@ switch ($PSCmdlet.ParameterSetName) {
         $accessChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'restrict' })
         $accountChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'addsponsor', 'addowner' })
         $riskChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'confirmcompromised' })
+        $blockRules = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'blocklocalagent' })
         if ($accessChanges.Count -gt 0) {
             $accessChanges | Select-Object DisplayName, @{ n = 'now'; e = { Get-AccessLabel $_.NewAvailableTo } }, @{ n = 'restoreTo'; e = { Get-AccessLabel $_.WasAvailableTo } } | Format-Table -AutoSize | Out-Host
             if (Confirm-Batch -Count $accessChanges.Count -Action 'restore access for') { Invoke-AccessRestore -Records $accessChanges }
@@ -5120,7 +5431,13 @@ switch ($PSCmdlet.ParameterSetName) {
             $accountChanges | Select-Object DisplayName, Action, User | Format-Table -AutoSize | Out-Host
             if (Confirm-Batch -Count $accountChanges.Count -Action 'remove accountability for') { Invoke-AccountabilityRemove -Records $accountChanges }
         }
-        if ($riskChanges.Count -gt 0) {
+        if ($blockRules.Count -gt 0) {
+            $blockRules | Select-Object Tool, Device, RuleId | Format-Table -AutoSize | Out-Host
+            Write-Warning 'Removing the rule stops further quarantines. Files Defender already quarantined stay quarantined until restored in Microsoft Defender.'
+            if (Confirm-Batch -Count $blockRules.Count -Action 'remove the block rule of') {
+                Invoke-LocalAgentUnblock -Rules @($blockRules | ForEach-Object { [pscustomobject]@{ id = $_.RuleId; displayName = ('Agent365 Bulk Actions: block {0} on {1}' -f $_.Tool, $_.Device) } })
+            }
+        }        if ($riskChanges.Count -gt 0) {
             $riskChanges | Select-Object DisplayName, @{ n = 'before'; e = { $_.WasRiskState } }, @{ n = 'now'; e = { $_.NowRiskState } } | Format-Table -AutoSize | Out-Host
             $note = Get-DismissNote $riskChanges
             if ($note) { Write-Warning $note }
@@ -5136,7 +5453,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $back = @($back)
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
-        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $byId = @{}
         foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
         $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
