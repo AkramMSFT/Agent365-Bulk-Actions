@@ -62,6 +62,10 @@
   Confirm the agent's Entra identity as compromised (risk level High). -Undo <log> or -DismissRisk clears it.
 
 .EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -EndpointAi -RiskyOnly
+  Local AI agents and shadow AI found on Defender-onboarded devices, with their telemetry and risk. -ForDevice <name> shows the evidence.
+
+.EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -AiActivity -AiDays 7 -RiskyOnly
   Agents with risky AI activity in the Purview audit log; add -ForAgent <name> for the individual events.
 
@@ -135,7 +139,8 @@ param(
     [int]$AiDays = 30,                      # AI activity: how many days back to read
 
     [Parameter(ParameterSetName = 'AiActivity')]
-    [switch]$RiskyOnly,                     # AI activity: only events with a risk signal
+    [Parameter(ParameterSetName = 'EndpointAi')]
+    [switch]$RiskyOnly,                     # AI activity: only events with a risk signal. Endpoint AI: only high and medium risk
 
     [Parameter(ParameterSetName = 'Restrict', Mandatory)]
     [string[]]$Restrict,                     # agents (names or ids) whose availability to narrow or reopen
@@ -273,6 +278,19 @@ param(
     [Parameter(ParameterSetName = 'Risky')]
     [switch]$Pick,                            # choose WHICH stale/risky agents to act on via the picker
 
+    [Parameter(ParameterSetName = 'EndpointAi', Mandatory)]
+    [switch]$EndpointAi,                    # local AI agents and shadow AI on devices onboarded to Defender for Endpoint, with telemetry and risk
+
+    [Parameter(ParameterSetName = 'EndpointAi')]
+    [ValidateRange(1, 30)]
+    [int]$EndpointDays = 30,                # Endpoint AI: days of endpoint telemetry to read (Defender keeps about 30)
+
+    [Parameter(ParameterSetName = 'EndpointAi')]
+    [string[]]$ForDevice,                   # Endpoint AI: show the full evidence for the tools on these devices (names, wildcards allowed)
+
+    [Parameter(ParameterSetName = 'EndpointAi')]
+    [string[]]$Sanctioned,                  # Endpoint AI: tool or vendor names you have approved (substring match); everything else shows as Unsanctioned
+
     [Parameter(ParameterSetName = 'SignIn', Mandatory)]
     [switch]$SignIn,                          # sign in once from a terminal with every permission the tool can use; later runs reuse the saved session
 
@@ -354,6 +372,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Policy' -and (Test-Path -LiteralPath $Policy
 if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
 if ($PSCmdlet.ParameterSetName -eq 'SignIn') { $scopes = $script:AllScopes }
+if ($PSCmdlet.ParameterSetName -eq 'EndpointAi') { $scopes = @('ThreatHunting.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -1043,6 +1062,487 @@ function Invoke-AccountabilityRemove {
         } catch { Write-Host ("  FAIL {0}  -> {1}" -f $r.DisplayName, $_.Exception.Message) -ForegroundColor Red; $fail++ }
     }
     Write-Host ("Removed {0}, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+}
+
+# ---------------------------------------------------------------------------------------------
+# Endpoint AI: local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint.
+# Defender's own discovery (AgentsInfo, platform LocalAgents) names each agent with its vendor, trust and auto-approve
+# settings and MCP servers. Endpoint telemetry adds what ran, what it talked to, what it listens on, which version is
+# installed and which alerts hit the device. Everything here is read-only.
+# ---------------------------------------------------------------------------------------------
+
+function New-AiTool {
+    param([string]$Key, [string]$Name, [string]$Vendor, [string]$Category, [string]$NamePattern, [string[]]$Processes = @(), [string]$PathPattern = '', [string[]]$Software = @())
+    [pscustomobject]@{ Key = $Key; Name = $Name; Vendor = $Vendor; Category = $Category; NamePattern = $NamePattern; Processes = @($Processes); PathPattern = $PathPattern; Software = @($Software) }
+}
+
+# The tools the discovery recognises. Defender names an agent (NamePattern); telemetry names its process and install.
+# The first match wins, so a more specific entry (a path) goes before the general one.
+$script:EndpointAiCatalog = @(
+    New-AiTool 'claude-desktop' 'Claude Desktop' 'Anthropic' 'Desktop assistant' 'claude desktop' @('claude.exe', 'claude') 'WindowsApps.Claude_|AnthropicClaude|Claude\.app' @('claude')
+    New-AiTool 'claude-code' 'Claude Code' 'Anthropic' 'Coding agent' 'claude code' @('claude.exe', 'claude')
+    New-AiTool 'copilot-cli' 'GitHub Copilot CLI' 'GitHub' 'Coding agent' 'copilot cli' @('copilot.exe', 'copilot')
+    New-AiTool 'codex-cli' 'Codex CLI' 'OpenAI' 'Coding agent' 'codex' @('codex.exe', 'codex')
+    New-AiTool 'gemini-cli' 'Gemini CLI' 'Google' 'Coding agent' 'gemini' @('gemini.exe', 'gemini')
+    New-AiTool 'cursor' 'Cursor' 'Anysphere' 'Agentic IDE' 'cursor' @('cursor.exe', 'cursor') '' @('cursor')
+    New-AiTool 'windsurf' 'Windsurf' 'Codeium' 'Agentic IDE' 'windsurf' @('windsurf.exe', 'windsurf') '' @('windsurf')
+    New-AiTool 'chatgpt-desktop' 'ChatGPT Desktop' 'OpenAI' 'Desktop assistant' 'chatgpt' @('chatgpt.exe', 'chatgpt') '' @('chatgpt')
+    New-AiTool 'm365-copilot' 'Microsoft 365 Copilot' 'Microsoft' 'Desktop assistant' 'microsoft 365 copilot|m365 ?copilot' @('m365copilot.exe')
+    New-AiTool 'openclaw' 'OpenClaw' 'OpenClaw' 'Local agent' 'openclaw' @('openclaw.exe', 'openclaw') '' @('openclaw')
+    New-AiTool 'ollama' 'Ollama' 'Ollama' 'Local model runtime' 'ollama' @('ollama.exe', 'ollama app.exe', 'ollama') '' @('ollama')
+    New-AiTool 'lm-studio' 'LM Studio' 'LM Studio' 'Local model runtime' 'lm ?studio' @('lm studio.exe', 'lmstudio.exe', 'lm-studio') '' @('lm studio', 'lm_studio', 'lmstudio')
+    New-AiTool 'llama-cpp' 'llama.cpp' 'llama.cpp' 'Local model runtime' 'llama\.cpp|llama-server' @('llama-server.exe', 'llama-cli.exe', 'llama-server', 'llama-cli')
+    New-AiTool 'gpt4all' 'GPT4All' 'Nomic' 'Local model runtime' 'gpt4all' @('gpt4all.exe') '' @('gpt4all')
+    New-AiTool 'msty' 'Msty' 'Msty' 'Local model runtime' '^msty' @('msty.exe') '' @('msty')
+    New-AiTool 'anythingllm' 'AnythingLLM' 'Mintplex Labs' 'Local model runtime' 'anythingllm' @('anythingllm.exe') '' @('anythingllm')
+    New-AiTool 'mcp-server' 'MCP server (local)' '' 'MCP server' 'mcp'
+    New-AiTool 'mcp-config' 'MCP configuration file' '' 'MCP server' '^$'
+    New-AiTool 'model-files' 'Local model files' '' 'Local model runtime' '^$'
+)
+
+$script:EndpointAiDomains = @('openai.com', 'chatgpt.com', 'anthropic.com', 'claude.ai', 'claude.com', 'generativelanguage.googleapis.com', 'gemini.google.com',
+                              'aistudio.google.com', 'mistral.ai', 'groq.com', 'openrouter.ai', 'huggingface.co', 'together.ai', 'together.xyz', 'cohere.com',
+                              'replicate.com', 'deepseek.com', 'x.ai', 'perplexity.ai', 'githubcopilot.com', 'cursor.sh', 'cursor.com', 'windsurf.com',
+                              'codeium.com', 'ollama.com', 'ollama.ai', 'lmstudio.ai')
+$script:EndpointAiPorts = @(11434, 1234, 8188, 7860)
+# Flags that make a coding agent run tools without asking.
+$script:EndpointAiApprovalFlags = @('--dangerously-skip-permissions', '--dangerously-bypass-approvals-and-sandbox', '--yolo', '--full-auto', '--allow-all-tools', '--allow-all-paths', '--allow-all-urls')
+$script:EndpointAiMcpHints = @('@modelcontextprotocol', 'mcp-server', 'mcp_server', 'server-filesystem')
+$script:EndpointAiAlertPattern = 'SuspPrompt|prompt injection|jailbreak|AI agent|MCP|LLM|Copilot|Ollama|Claude|ChatGPT'
+$script:RiskOrder = @{ High = 3; Medium = 2; Low = 1; None = 0 }
+
+function ConvertTo-KqlList {
+    param([string[]]$Items)
+    (@($Items | ForEach-Object { '"' + ($_ -replace '\\', '\\' -replace '"', '\"') + '"' })) -join ', '
+}
+
+# Which catalog tool is this: by the name Defender gave it, or by the process (and where it runs from).
+function Resolve-EndpointAiTool {
+    param([string]$DefenderName, [string]$Process, [string]$Path)
+    foreach ($t in $script:EndpointAiCatalog) {
+        if ($DefenderName -and $t.NamePattern -and $DefenderName -match $t.NamePattern) { return $t }
+        if ($Process -and @($t.Processes) -contains $Process.ToLowerInvariant() -and (-not $t.PathPattern -or $Path -match $t.PathPattern)) { return $t }
+    }
+    $null
+}
+
+function ConvertTo-EndpointTime {
+    param($Value)
+    if ($null -eq $Value -or [string]$Value -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value }
+    try { [datetimeoffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { $null }
+}
+
+# A command line for people to read: what ran, not the prompt it was given or a credential it carried.
+function Protect-CommandLine {
+    param([string]$Text, [int]$Max = 220)
+    if (-not $Text) { return '' }
+    $t = $Text -replace '(?i)(\s(?:-p|--prompt|-m|--message|--print|-c)\s+)("[^"]*"|''[^'']*''|\S+)', '$1"<prompt hidden>"'
+    $t = $t -replace '(?i)(--?(?:api[-_]?key|token|password|secret|authorization|auth)(?:\s+|=))\S+', '$1***'
+    $t = $t -replace '(?i)\bsk-[A-Za-z0-9_\-]{12,}', 'sk-***' -replace '(?i)Bearer\s+\S+', 'Bearer ***'
+    if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
+    $t
+}
+
+# A list given to `pwsh -File` (a scheduled task, for example) arrives as one string with commas in it, so split it here.
+function ConvertTo-NameList {
+    param([string[]]$Values)
+    @($Values | ForEach-Object { $_ -split '\s*[,;]\s*' } | Where-Object { $_ })
+}
+# The Advanced Hunting queries. Each one is narrow and summarised on the service so the result stays small.
+function Get-EndpointAiQueries {
+    param([int]$Days = 30)
+    $procs = ConvertTo-KqlList @($script:EndpointAiCatalog | ForEach-Object { $_.Processes } | Where-Object { $_ } | Get-Distinct)
+    $soft = ConvertTo-KqlList @($script:EndpointAiCatalog | ForEach-Object { $_.Software } | Where-Object { $_ } | Get-Distinct)
+    $domains = ConvertTo-KqlList $script:EndpointAiDomains
+    $flags = ConvertTo-KqlList $script:EndpointAiApprovalFlags
+    $mcp = ConvertTo-KqlList $script:EndpointAiMcpHints
+    $ports = $script:EndpointAiPorts -join ', '
+    [ordered]@{
+        Agents = @"
+AgentsInfo
+| where Platform == "LocalAgents"
+| summarize arg_max(Timestamp, *), FirstSeen = min(Timestamp) by AgentId
+| extend m = todynamic(RawAgentInfo).localAgentMetadata
+| project AgentId, Name, Version, LifecycleStatus, LastSeen = Timestamp, FirstSeen,
+          Vendor = tostring(m.vendor), Process = tostring(m.relatedProcess), Trusted = tostring(m.trustedProcess),
+          AutoApprove = tostring(m.autoApprove), Device = tostring(m.deviceName), DeviceId = tostring(m.machineId),
+          Account = tostring(m.accountName), Upn = tostring(m.upn), McpServers, DeclaredTools, LocalMcps = m.localMcps
+"@
+        Processes = @"
+DeviceProcessEvents
+| where Timestamp > ago(${Days}d)
+| where FileName in~ ($procs)
+| summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
+            Parents = make_set(InitiatingProcessFileName, 5), ActiveAt = make_set(bin(Timestamp, 10m), 300), Command = take_any(substring(ProcessCommandLine, 0, 400)),
+            FlagCommand = take_anyif(substring(ProcessCommandLine, 0, 400), ProcessCommandLine has_any ($flags))
+    by DeviceId, DeviceName, FileName, FolderPath
+| top 400 by Runs
+"@
+        Mcp = @"
+DeviceProcessEvents
+| where Timestamp > ago(${Days}d)
+| where ProcessCommandLine has_any ($mcp)
+| where FileName !in~ ($procs)
+| summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
+            Parent = take_any(InitiatingProcessFileName) by DeviceId, DeviceName, FileName, Command = substring(ProcessCommandLine, 0, 300)
+| top 200 by Runs
+"@
+        Outbound = @"
+DeviceNetworkEvents
+| where Timestamp > ago(${Days}d)
+| where ActionType != "ListeningConnectionCreated"
+| where InitiatingProcessFileName in~ ($procs) or RemoteUrl has_any ($domains)
+| extend Host = tostring(parse_url(iff(RemoteUrl has "://", RemoteUrl, strcat("https://", RemoteUrl))).Host)
+| extend Host = iff(isempty(Host), RemoteIP, Host)
+| summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, Host
+| top 600 by Hits
+"@
+        Listening = @"
+DeviceNetworkEvents
+| where Timestamp > ago(${Days}d)
+| where ActionType == "ListeningConnectionCreated"
+| where InitiatingProcessFileName in~ ($procs) or LocalPort in ($ports)
+| summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, LocalIP, LocalPort
+| top 400 by Hits
+"@
+        Files = @"
+DeviceFileEvents
+| where Timestamp > ago(${Days}d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("claude_desktop_config.json", ".mcp.json", "mcp.json", "mcp_config.json", "mcp-servers.json") or FileName endswith ".gguf" or FileName endswith ".safetensors"
+| extend Kind = iff(FileName endswith ".gguf" or FileName endswith ".safetensors", "Model file", "MCP configuration")
+| summarize Files = dcount(strcat(FolderPath, FileName)), LastSeen = max(Timestamp), Example = take_any(strcat(FolderPath, "\\", FileName)) by DeviceId, DeviceName, Kind
+"@
+        Software = @"
+DeviceTvmSoftwareInventory
+| where SoftwareName has_any ($soft)
+| project DeviceId, DeviceName, SoftwareName, SoftwareVendor, SoftwareVersion
+"@
+        Vulnerabilities = @"
+DeviceTvmSoftwareVulnerabilities
+| where SoftwareName has_any ($soft)
+| summarize Cves = dcount(CveId), Critical = dcountif(CveId, VulnerabilitySeverityLevel == "Critical"), High = dcountif(CveId, VulnerabilitySeverityLevel == "High"),
+            Example = take_anyif(CveId, VulnerabilitySeverityLevel in ("Critical", "High")) by DeviceId, DeviceName, SoftwareName, SoftwareVersion
+"@
+        Coverage = @"
+DeviceInfo
+| summarize arg_max(Timestamp, OnboardingStatus) by DeviceId
+| summarize Devices = count() by OnboardingStatus
+"@
+    }
+}
+
+function Get-EndpointAiAlertQuery {
+    param([int]$Days, [string[]]$DeviceNames)
+    $names = ConvertTo-KqlList @($DeviceNames | Where-Object { $_ })
+@"
+AlertEvidence
+| where Timestamp > ago(${Days}d)
+| where DeviceName in~ ($names)
+| summarize by AlertId, DeviceName
+| join kind=inner (AlertInfo | where Timestamp > ago(${Days}d) | project AlertId, Timestamp, Title, Severity, Category, DetectionSource) on AlertId
+| project DeviceName, AlertId, Timestamp, Title, Severity, Category, DetectionSource
+| top 300 by Timestamp
+"@
+}
+
+function Get-EndpointAiDeviceQuery {
+    param([string[]]$DeviceIds)
+    $ids = ConvertTo-KqlList @($DeviceIds | Where-Object { $_ })
+@"
+DeviceInfo
+| where DeviceId in ($ids)
+| summarize arg_max(Timestamp, *) by DeviceId
+| project DeviceId, DeviceName, OSPlatform, OnboardingStatus, DeviceType, ExposureLevel, IsInternetFacing, AssetValue, LoggedOnUsers
+"@
+}
+
+# Level and reasons for one discovered tool, from its evidence. Each rule says why, so the result can be argued with.
+# Every reason has a full sentence for the evidence view and a short form for the table.
+function Get-EndpointAiRisk {
+    param([object]$Row)
+    $reasons = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param([string]$Level, [string]$Text, [string]$Short) $reasons.Add([pscustomobject]@{ Level = $Level; Text = $Text; Short = $Short }) }
+    $e = $Row.Evidence
+    if ($Row.AutoApprove -eq 'true') { & $add 'High' 'Acts without asking for approval (Defender reports auto-approve on).' 'Approves its own actions' }
+    if ($e.Flag) { & $add 'High' ("Started with a flag that skips approvals: {0}." -f $e.Flag) ("Started with {0}" -f $e.Flag) }
+    foreach ($l in @($e.Listeners | Where-Object { $_.Exposed })) {
+        & $add 'High' ("Listens beyond this device on {0}:{1} ({2}), so other machines can reach it." -f $l.Ip, $l.Port, $l.Process) ("Reachable from the network on {0}:{1}" -f $l.Ip, $l.Port)
+    }
+    foreach ($s in @($e.Software | Where-Object { $_.Critical -gt 0 })) {
+        & $add 'High' ("{0} {1} has {2} critical vulnerabilit{3}." -f $s.Name, $s.Version, $s.Critical, $(if ($s.Critical -eq 1) { 'y' } else { 'ies' })) ("{0} critical CVE{1} in {2}" -f $s.Critical, $(if ($s.Critical -ne 1) { 's' }), $s.Version)
+    }
+    foreach ($s in @($e.Software | Where-Object { $_.High -gt 0 -and $_.Critical -eq 0 })) {
+        & $add 'Medium' ("{0} {1} has {2} high-severity vulnerabilit{3}." -f $s.Name, $s.Version, $s.High, $(if ($s.High -eq 1) { 'y' } else { 'ies' })) ("{0} high CVE{1} in {2}" -f $s.High, $(if ($s.High -ne 1) { 's' }), $s.Version)
+    }
+    $ai = @($e.Alerts | Where-Object { $_.AiRelated -and $_.Near })
+    if ($ai.Count) {
+        $worst = if (@($ai | Where-Object { $_.Severity -in 'High', 'Critical' }).Count) { 'High' } else { 'Medium' }
+        & $add $worst ("{0} AI-related alert{1} fired within 15 minutes of this tool's activity, such as '{2}'. Defender names the device, not the process, so this is a timing match." -f $ai.Count, $(if ($ai.Count -ne 1) { 's' }), $ai[0].Title) ("{0} AI-related alert{1} near its activity" -f $ai.Count, $(if ($ai.Count -ne 1) { 's' }))
+    }
+    if ($Row.Trusted -eq 'false') { & $add 'Medium' 'Its host process is not trusted.' 'Host process not trusted' }
+    if (@($e.LocalMcps | Where-Object { $_.Unpinned }).Count) { & $add 'Medium' 'Runs a local MCP server through a package runner that fetches code when it starts (npx, uvx or similar).' 'Local MCP server fetched at start' }
+    if ($e.AssetValue -eq 'High') { & $add 'Medium' 'Runs on a device Defender rates as high value.' 'High-value device' }
+    elseif ($e.ExposureLevel -eq 'High') { & $add 'Low' 'Runs on a device with a High exposure level.' 'Device exposure High' }
+    $remote = $e.RemoteMcps.Count; $local = $e.LocalMcps.Count
+    if ($remote -or $local) { & $add 'Low' ("MCP servers configured: {0} remote, {1} local." -f $remote, $local) ("{0} MCP server{1}" -f ($remote + $local), $(if (($remote + $local) -ne 1) { 's' })) }
+    foreach ($f in $e.Files) { & $add 'Low' ("{0}: {1} file{2} written (for example {3})." -f $f.Kind, $f.Files, $(if ($f.Files -ne 1) { 's' }), $f.Example) ("{0}: {1} written" -f $f.Kind, $f.Files) }
+    if ($Row.Status -eq 'Unsanctioned') { & $add 'Low' 'Not on the list of tools you have sanctioned.' 'Not sanctioned' }
+    $sorted = @($reasons | Sort-Object { -$script:RiskOrder[$_.Level] })
+    $level = if ($sorted.Count) { $sorted[0].Level } else { 'None' }
+    [pscustomobject]@{ Level = $level; Reasons = $sorted }
+}
+# Turn the query results into one row per tool and device, with its evidence and risk.
+function New-EndpointAiRows {
+    param([hashtable]$Data, [string[]]$Sanctioned = @(), [int]$Days = 30)
+    $rows = @{}
+    $idByName = @{}
+    foreach ($set in 'Processes', 'Outbound', 'Listening', 'Software', 'Vulnerabilities', 'Files', 'Devices') {
+        foreach ($r in @($Data[$set])) { if ($r.DeviceId -and $r.DeviceName) { $idByName[([string]$r.DeviceName).ToLowerInvariant()] = [string]$r.DeviceId } }
+    }
+    $deviceInfo = @{}
+    foreach ($d in @($Data.Devices)) { $deviceInfo[[string]$d.DeviceId] = $d }
+
+    $getRow = {
+        param($Tool, [string]$DeviceId, [string]$DeviceName)
+        if (-not $DeviceId -and $DeviceName) { $DeviceId = $idByName[$DeviceName.ToLowerInvariant()] }
+        $dev = if ($DeviceId) { $DeviceId } else { ([string]$DeviceName).ToLowerInvariant() }
+        $key = '{0}|{1}' -f $Tool.Key, $dev
+        if (-not $rows.ContainsKey($key)) {
+            $ev = [pscustomobject]@{
+                Processes = New-Object 'System.Collections.Generic.List[object]'; Hosts = New-Object 'System.Collections.Generic.List[object]'
+                Listeners = New-Object 'System.Collections.Generic.List[object]'; Files = New-Object 'System.Collections.Generic.List[object]'
+                Software = New-Object 'System.Collections.Generic.List[object]'; Alerts = New-Object 'System.Collections.Generic.List[object]'
+                RemoteMcps = New-Object 'System.Collections.Generic.List[object]'; LocalMcps = New-Object 'System.Collections.Generic.List[object]'
+                Flag = ''; ExposureLevel = ''; AssetValue = ''; Device = $null; ActiveAt = (New-Object 'System.Collections.Generic.List[datetime]')
+            }
+            $rows[$key] = [pscustomobject]@{
+                Tool = $Tool.Name; Vendor = $Tool.Vendor; Category = $Tool.Category; Device = $DeviceName; DeviceId = $DeviceId; User = ''; Version = ''
+                Status = ''; Risk = 'None'; Why = ''; FirstSeen = $null; LastSeen = $null; Runs = 0; Sources = (New-Object 'System.Collections.Generic.List[string]')
+                Trusted = ''; AutoApprove = ''; Accounts = (New-Object 'System.Collections.Generic.List[string]'); Evidence = $ev; Reasons = @(); Key = $key
+            }
+        }
+        $rows[$key]
+    }
+    $touch = {
+        param($Row, $First, $Last)
+        $f = ConvertTo-EndpointTime $First; $l = ConvertTo-EndpointTime $Last
+        if ($f -and (-not $Row.FirstSeen -or $f -lt $Row.FirstSeen)) { $Row.FirstSeen = $f }
+        if ($l -and (-not $Row.LastSeen -or $l -gt $Row.LastSeen)) { $Row.LastSeen = $l }
+    }
+    $source = { param($Row, [string]$Name) if (-not $Row.Sources.Contains($Name)) { $Row.Sources.Add($Name) } }
+    $account = { param($Row, $Names) foreach ($n in @($Names)) { if ($n -and -not $Row.Accounts.Contains([string]$n)) { $Row.Accounts.Add([string]$n) } } }
+
+    # Defender's own discovery
+    foreach ($a in @($Data.Agents)) {
+        if ($a.LifecycleStatus -in 'Deleted', 'Uninstalled') { continue }
+        $tool = Resolve-EndpointAiTool -DefenderName $a.Name -Process $a.Process
+        if (-not $tool) { $tool = New-AiTool -Key ('defender:' + ([string]$a.Name).ToLowerInvariant()) -Name $a.Name -Vendor $a.Vendor -Category 'Local AI agent' -NamePattern '' }
+        $row = & $getRow $tool $a.DeviceId $a.Device
+        & $source $row 'Defender discovery'
+        & $touch $row $a.FirstSeen $a.LastSeen
+        if ($a.Version) { $row.Version = [string]$a.Version }
+        if ($a.Vendor -and -not $row.Vendor) { $row.Vendor = [string]$a.Vendor }
+        $row.Trusted = [string]$a.Trusted; $row.AutoApprove = [string]$a.AutoApprove
+        & $account $row @($a.Account)
+        foreach ($m in @($a.McpServers | Where-Object { $_ })) { $row.Evidence.RemoteMcps.Add([pscustomobject]@{ Name = [string]$m.name; Type = [string]$m.type; Endpoint = [string]$m.endpoint }) }
+        foreach ($m in @($a.LocalMcps | Where-Object { $_ })) {
+            $cmd = [string]$m.commandName
+            $row.Evidence.LocalMcps.Add([pscustomobject]@{ Name = [string]$m.name; Command = $cmd; Unpinned = [bool]($cmd -match '(?i)(^|[\\/ ])(npx|bunx|uvx|pipx)(\.cmd|\.exe)?($|\s)') })
+        }
+    }
+    # What ran
+    foreach ($p in @($Data.Processes)) {
+        $tool = Resolve-EndpointAiTool -Process $p.FileName -Path $p.FolderPath
+        if (-not $tool) { continue }
+        if ($tool.Key -eq 'llama-cpp' -and (@($p.Parents) -join ' ') -match '(?i)ollama') { $tool = @($script:EndpointAiCatalog | Where-Object { $_.Key -eq 'ollama' })[0] }
+        $row = & $getRow $tool $p.DeviceId $p.DeviceName
+        & $source $row 'Process telemetry'
+        & $touch $row $p.FirstSeen $p.LastSeen
+        $row.Runs += [int]$p.Runs
+        foreach ($slot in @($p.ActiveAt)) { $when = ConvertTo-EndpointTime $slot; if ($when) { $row.Evidence.ActiveAt.Add($when) } }
+        & $account $row @($p.Accounts)
+        $row.Evidence.Processes.Add([pscustomobject]@{ File = [string]$p.FileName; Path = [string]$p.FolderPath; Runs = [int]$p.Runs; FirstSeen = ConvertTo-EndpointTime $p.FirstSeen; LastSeen = ConvertTo-EndpointTime $p.LastSeen
+                                                       Parents = (@($p.Parents | Where-Object { $_ }) -join ', '); Command = Protect-CommandLine ([string]$p.Command) })
+        if ($p.FlagCommand -and -not $row.Evidence.Flag) {
+            $row.Evidence.Flag = (@($script:EndpointAiApprovalFlags | Where-Object { ([string]$p.FlagCommand).Contains($_) }) | Select-Object -First 1)
+        }
+    }
+    $mcpTool = @($script:EndpointAiCatalog | Where-Object { $_.Key -eq 'mcp-server' })[0]
+    foreach ($m in @($Data.Mcp)) {
+        $row = & $getRow $mcpTool $m.DeviceId $m.DeviceName
+        & $source $row 'Process telemetry'
+        & $touch $row $m.FirstSeen $m.LastSeen
+        $row.Runs += [int]$m.Runs
+        & $account $row @($m.Accounts)
+        $cmd = [string]$m.Command
+        $row.Evidence.LocalMcps.Add([pscustomobject]@{ Name = [string]$m.FileName; Command = (Protect-CommandLine $cmd); Unpinned = [bool]($cmd -match '(?i)(^|[\\/ ])(npx|bunx|uvx|pipx)(\.cmd|\.exe)?($|\s)') })
+        $row.Evidence.Processes.Add([pscustomobject]@{ File = [string]$m.FileName; Path = ''; Runs = [int]$m.Runs; FirstSeen = ConvertTo-EndpointTime $m.FirstSeen; LastSeen = ConvertTo-EndpointTime $m.LastSeen
+                                                       Parents = [string]$m.Parent; Command = Protect-CommandLine $cmd })
+    }
+    # What is installed
+    foreach ($s in @($Data.Software)) {
+        foreach ($tool in @($script:EndpointAiCatalog | Where-Object { $_.Software.Count -and (@($_.Software | Where-Object { ([string]$s.SoftwareName).ToLowerInvariant().Contains($_) }).Count) })) {
+            $row = & $getRow $tool $s.DeviceId $s.DeviceName
+            & $source $row 'Software inventory'
+            if ($s.SoftwareVersion) { $row.Version = [string]$s.SoftwareVersion }
+            $row.Evidence.Software.Add([pscustomobject]@{ Name = [string]$s.SoftwareName; Version = [string]$s.SoftwareVersion; Cves = 0; Critical = 0; High = 0; Example = '' })
+            break
+        }
+    }
+    foreach ($v in @($Data.Vulnerabilities)) {
+        foreach ($row in @($rows.Values | Where-Object { ($_.DeviceId -eq [string]$v.DeviceId -or $_.Device -eq $v.DeviceName) })) {
+            $hit = @($row.Evidence.Software | Where-Object { $_.Name -eq [string]$v.SoftwareName -and $_.Version -eq [string]$v.SoftwareVersion })
+            foreach ($h in $hit) { $h.Cves = [int]$v.Cves; $h.Critical = [int]$v.Critical; $h.High = [int]$v.High; $h.Example = [string]$v.Example }
+        }
+    }
+    # What it talked to and listens on: attached to the tools on that device that own the process
+    foreach ($n in @($Data.Outbound)) {
+        foreach ($row in @($rows.Values | Where-Object { $_.DeviceId -eq [string]$n.DeviceId })) {
+            $tool = $script:EndpointAiCatalog | Where-Object { $_.Name -eq $row.Tool } | Select-Object -First 1
+            if ($tool -and $n.Process -and @($tool.Processes) -contains ([string]$n.Process).ToLowerInvariant()) {
+                $row.Evidence.Hosts.Add([pscustomobject]@{ Process = [string]$n.Process; Host = [string]$n.Host; Hits = [int]$n.Hits; LastSeen = ConvertTo-EndpointTime $n.LastSeen })
+                & $touch $row $null $n.LastSeen
+            }
+        }
+    }
+    $loopback = @('127.0.0.1', '::1', '')
+    foreach ($n in @($Data.Listening)) {
+        foreach ($row in @($rows.Values | Where-Object { $_.DeviceId -eq [string]$n.DeviceId })) {
+            $tool = $script:EndpointAiCatalog | Where-Object { $_.Name -eq $row.Tool } | Select-Object -First 1
+            $owns = $tool -and $n.Process -and @($tool.Processes) -contains ([string]$n.Process).ToLowerInvariant()
+            $aiPort = @($script:EndpointAiPorts) -contains [int]$n.LocalPort -and $tool -and $tool.Category -eq 'Local model runtime'
+            if ($owns -or $aiPort) {
+                $ip = [string]$n.LocalIP
+                $exposed = ($loopback -notcontains $ip) -and ($ip -notmatch '^127\.') -and ($ip -ne '::1')
+                $row.Evidence.Listeners.Add([pscustomobject]@{ Process = [string]$n.Process; Ip = $ip; Port = [int]$n.LocalPort; Exposed = $exposed; Hits = [int]$n.Hits; LastSeen = ConvertTo-EndpointTime $n.LastSeen })
+            }
+        }
+    }
+    # Files written
+    foreach ($f in @($Data.Files)) {
+        $pseudoKey = if ($f.Kind -eq 'Model file') { 'model-files' } else { 'mcp-config' }
+        $tool = @($script:EndpointAiCatalog | Where-Object { $_.Key -eq $pseudoKey })[0]
+        $row = & $getRow $tool $f.DeviceId $f.DeviceName
+        & $source $row 'File telemetry'
+        & $touch $row $null $f.LastSeen
+        $row.Evidence.Files.Add([pscustomobject]@{ Kind = [string]$f.Kind; Files = [int]$f.Files; Example = [string]$f.Example; LastSeen = ConvertTo-EndpointTime $f.LastSeen })
+    }
+    # Device context and alerts (alerts name the device, not a process)
+    $approved = @($Sanctioned | Where-Object { $_ })
+    $alertsByDevice = @{}
+    foreach ($a in @($Data.Alerts)) {
+        $k = ([string]$a.DeviceName).ToLowerInvariant()
+        if (-not $alertsByDevice.ContainsKey($k)) { $alertsByDevice[$k] = New-Object 'System.Collections.Generic.Dictionary[string,object]' }
+        $alertsByDevice[$k][[string]$a.AlertId] = [pscustomobject]@{ Time = ConvertTo-EndpointTime $a.Timestamp; Title = [string]$a.Title; Severity = [string]$a.Severity; Source = [string]$a.DetectionSource
+                                                                    AiRelated = [bool]([string]$a.Title -match $script:EndpointAiAlertPattern) }
+    }
+    foreach ($row in @($rows.Values)) {
+        $info = $deviceInfo[[string]$row.DeviceId]
+        if ($info) {
+            $row.Evidence.Device = $info; $row.Evidence.ExposureLevel = [string]$info.ExposureLevel; $row.Evidence.AssetValue = [string]$info.AssetValue
+            if ($info.DeviceName) { $row.Device = [string]$info.DeviceName }
+        }
+        $k = ([string]$row.Device).ToLowerInvariant()
+        if ($alertsByDevice.ContainsKey($k)) {
+            foreach ($al in $alertsByDevice[$k].Values) {
+                $near = $false
+                if ($al.Time) { foreach ($slot in $row.Evidence.ActiveAt) { if ($al.Time -ge $slot.AddMinutes(-15) -and $al.Time -le $slot.AddMinutes(25)) { $near = $true; break } } }
+                $row.Evidence.Alerts.Add([pscustomobject]@{ Time = $al.Time; Title = $al.Title; Severity = $al.Severity; Source = $al.Source; AiRelated = $al.AiRelated; Near = $near })
+            }
+        }
+        $row.User = ($row.Accounts.ToArray() -join ', ')
+        $row.Status = if (-not $approved.Count) { 'Unreviewed' }
+                      elseif (@($approved | Where-Object { ($row.Tool -like "*$_*") -or ($row.Vendor -like "*$_*") }).Count) { 'Sanctioned' }
+                      else { 'Unsanctioned' }
+        $risk = Get-EndpointAiRisk $row
+        $row.Risk = $risk.Level; $row.Reasons = $risk.Reasons
+        $row.Why = (@($risk.Reasons | Select-Object -First 3 | ForEach-Object { $_.Short }) -join '; ')
+        $row.Sources = ($row.Sources.ToArray() -join ', ')
+    }
+    @($rows.Values | Sort-Object @{ e = { -$script:RiskOrder[$_.Risk] } }, @{ e = { $_.LastSeen }; Descending = $true }, Tool)
+}
+
+# Everything for the window and the command: read the data, then build the rows.
+function Get-EndpointAiData {
+    param([ValidateRange(1, 30)][int]$Days = 30, [string[]]$Sanctioned = @(), [scriptblock]$OnStatus)
+    $say = { param($m) if ($OnStatus) { & $OnStatus $m } }
+    $hint = 'Endpoint AI needs Advanced Hunting (ThreatHunting.Read.All) and devices onboarded to Microsoft Defender for Endpoint.'
+    $q = Get-EndpointAiQueries -Days $Days
+    $data = @{}
+    $steps = [ordered]@{ Agents = 'Defender local agent discovery'; Processes = 'process activity'; Mcp = 'MCP server processes'; Outbound = 'network connections'
+                         Listening = 'listening ports'; Files = 'model and MCP files'; Software = 'installed software'; Vulnerabilities = 'vulnerabilities'; Coverage = 'device coverage' }
+    $i = 0
+    foreach ($name in $steps.Keys) {
+        $i++
+        & $say ("Reading {0} ({1} of {2})..." -f $steps[$name], $i, ($steps.Count + 2))
+        $data[$name] = @(Invoke-HuntingQuery -Query $q[$name] -Hint $hint)
+    }
+    $names = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Agents | ForEach-Object { if ($_.DeviceName) { $_.DeviceName } else { $_.Device } }) | Where-Object { $_ } | Get-Distinct)
+    $ids = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Files + $data.Mcp + $data.Agents | ForEach-Object { $_.DeviceId }) | Where-Object { $_ } | Get-Distinct)
+    & $say ("Reading alerts on {0} device(s) ({1} of {2})..." -f $names.Count, ($steps.Count + 1), ($steps.Count + 2))
+    $data.Alerts = if ($names.Count) { @(Invoke-HuntingQuery -Query (Get-EndpointAiAlertQuery -Days $Days -DeviceNames $names) -Hint $hint) } else { @() }
+    & $say ("Reading device details ({0} of {1})..." -f ($steps.Count + 2), ($steps.Count + 2))
+    $data.Devices = if ($ids.Count) { @(Invoke-HuntingQuery -Query (Get-EndpointAiDeviceQuery -DeviceIds $ids) -Hint $hint) } else { @() }
+    $cover = @{}; foreach ($c in $data.Coverage) { $cover[[string]$c.OnboardingStatus] = [int]$c.Devices }
+    $removed = @($data.Agents | Where-Object { $_.LifecycleStatus -in 'Deleted', 'Uninstalled' }).Count
+    [pscustomobject]@{
+        Days = $Days; Rows = @(New-EndpointAiRows -Data $data -Sanctioned $Sanctioned -Days $Days); Coverage = $cover; RemovedAgents = $removed
+        Devices = $data.Devices
+    }
+}
+
+function Show-EndpointAiTable {
+    param([object[]]$Rows)
+    $Rows | Select-Object @{ n = 'tool'; e = { $_.Tool } }, @{ n = 'category'; e = { $_.Category } }, @{ n = 'device'; e = { $_.Device } }, @{ n = 'user'; e = { $_.User } },
+        @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'status'; e = { $_.Status } }, @{ n = 'lastSeen'; e = { if ($_.LastSeen) { $_.LastSeen.ToString('yyyy-MM-dd HH:mm') } else { '' } } },
+        @{ n = 'why'; e = { $_.Why } } | Format-Table -AutoSize -Wrap | Out-Host
+}
+
+# The evidence behind one row as Section / Item / Info lines, for the command and the window.
+function Get-EndpointAiDetailRows {
+    param([object]$Row)
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param([string]$Section, [string]$Item, [string]$Info) $out.Add([pscustomobject]@{ Section = $Section; Item = $Item; Info = $Info }) }
+    $time = { param($t) if ($t) { ([datetime]$t).ToString('yyyy-MM-dd HH:mm') } else { '' } }
+    $e = $Row.Evidence
+    & $add 'Overview' 'Tool' ("{0} ({1}, {2})" -f $Row.Tool, $Row.Vendor, $Row.Category)
+    & $add 'Overview' 'Device' $Row.Device
+    if ($Row.User) { & $add 'Overview' 'Users' $Row.User }
+    if ($Row.Version) { & $add 'Overview' 'Version' $Row.Version }
+    & $add 'Overview' 'Status' $Row.Status
+    & $add 'Overview' 'Seen by' $Row.Sources
+    & $add 'Overview' 'First / last seen' ("{0}  /  {1}" -f (& $time $Row.FirstSeen), (& $time $Row.LastSeen))
+    if ($Row.Runs) { & $add 'Overview' 'Process starts' ([string]$Row.Runs) }
+    if ($Row.Trusted) { & $add 'Overview' 'Host process trusted' $Row.Trusted }
+    if ($Row.AutoApprove) { & $add 'Overview' 'Approves its own actions' $Row.AutoApprove }
+    foreach ($r in @($Row.Reasons)) { & $add 'Risk' $r.Level $r.Text }
+    if (-not @($Row.Reasons).Count) { & $add 'Risk' 'None' 'No risk indicators found.' }
+    foreach ($p in @($e.Processes | Sort-Object Runs -Descending)) {
+        & $add 'Processes' $p.File ("{0} start{1}, last {2}. From {3}. Started by {4}. {5}" -f $p.Runs, $(if ($p.Runs -ne 1) { 's' }), (& $time $p.LastSeen), $p.Path, $p.Parents, $p.Command)
+    }
+    $named = @($e.Hosts | Where-Object { $_.Host -notmatch '^[\d.:a-fA-F]+$' -or $_.Host -match '[g-zG-Z]' } | Sort-Object Hits -Descending)
+    $bare = @($e.Hosts | Where-Object { $named -notcontains $_ })
+    foreach ($h in ($named | Select-Object -First 20)) { & $add 'Network' $h.Host ("{0} connection{1} by {2}, last {3}" -f $h.Hits, $(if ($h.Hits -ne 1) { 's' }), $h.Process, (& $time $h.LastSeen)) }
+    if ($bare.Count) { & $add 'Network' 'IP addresses without a name' ("{0} address{1}, {2} connection{3}, for example {4}" -f $bare.Count, $(if ($bare.Count -ne 1) { 'es' }), (($bare | Measure-Object Hits -Sum).Sum), $(if ((($bare | Measure-Object Hits -Sum).Sum) -ne 1) { 's' }), $bare[0].Host) }
+    foreach ($l in @($e.Listeners | Sort-Object Exposed, Port -Descending | Select-Object -First 15)) {
+        & $add 'Listening' ("{0}:{1}" -f $l.Ip, $l.Port) ("{0}. {1} time{2} by {3}, last {4}" -f $(if ($l.Exposed) { 'Reachable from other machines' } else { 'This device only' }), $l.Hits, $(if ($l.Hits -ne 1) { 's' }), $l.Process, (& $time $l.LastSeen))
+    }
+    foreach ($m in $e.RemoteMcps) { & $add 'MCP servers' $m.Name ("Remote ({0}) {1}" -f $m.Type, $m.Endpoint) }
+    foreach ($m in $e.LocalMcps) { & $add 'MCP servers' $m.Name ("Local. {0}{1}" -f $m.Command, $(if ($m.Unpinned) { '  (fetches code through a package runner)' } else { '' })) }
+    foreach ($f in $e.Files) { & $add 'Files' $f.Kind ("{0} file(s), last {1}. For example {2}" -f $f.Files, (& $time $f.LastSeen), $f.Example) }
+    foreach ($s in $e.Software) {
+        & $add 'Software' ("{0} {1}" -f $s.Name, $s.Version) $(if ($s.Cves) { "{0} vulnerabilit{1}: {2} critical, {3} high. For example {4}" -f $s.Cves, $(if ($s.Cves -eq 1) { 'y' } else { 'ies' }), $s.Critical, $s.High, $s.Example } else { 'No known vulnerabilities' })
+    }
+    foreach ($a in @($e.Alerts | Sort-Object Time -Descending | Select-Object -First 15)) {
+        & $add 'Device alerts' $a.Title ("{0}{1}{2}, {3}, {4}" -f $a.Severity, $(if ($a.AiRelated) { ', AI-related' } else { '' }), $(if ($a.Near) { ', within 15 minutes of this tool''s activity' } else { ', same device, not near this tool' }), (& $time $a.Time), $a.Source)
+    }
+    if ($e.Device) {
+        $d = $e.Device
+        & $add 'Device' $Row.Device ("{0}, {1}, {2}. Exposure {3}, asset value {4}." -f $d.OSPlatform, $d.DeviceType, $d.OnboardingStatus, $d.ExposureLevel, $d.AssetValue)
+    }
+    $out.ToArray()
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2897,6 +3397,7 @@ $GuiXaml = @'
         <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
           <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
           <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
+          <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" IsEnabled="False"/>
         </StackPanel>
@@ -3530,6 +4031,130 @@ function Update-AiActivityTab {
     Update-AiDetailPane -Window $Window
 }
 # Build the details window (not yet shown) for one grid row.
+$EndpointAiXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Endpoint AI" Width="1240" Height="760" MinWidth="900" MinHeight="520" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="250"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Endpoint AI: local agents and shadow AI"/>
+        <TextBlock x:Name="EpSummary" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap" Text="Loading..."/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="16,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <Button x:Name="BtnEpExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON."/>
+        <Button x:Name="BtnEpLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the endpoint telemetry again from Microsoft Defender Advanced Hunting."/>
+        <ComboBox x:Name="EpDaysBox" DockPanel.Dock="Right" SelectedIndex="2" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="How much endpoint telemetry to read. Defender keeps about 30 days.">
+          <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+        </ComboBox>
+        <CheckBox x:Name="EpRiskyOnly" Content="Risky only" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Show only tools rated High or Medium."/>
+        <TextBlock x:Name="EpNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+      </DockPanel>
+    </Border>
+    <DataGrid x:Name="EpGrid" Grid.Row="2" Style="{StaticResource Grid}">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Tool" Binding="{Binding Tool}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Category" Binding="{Binding Category}" Width="130" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Device" Binding="{Binding Device}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="User" Binding="{Binding User}" Width="110" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="70">
+          <DataGridTextColumn.ElementStyle>
+            <Style TargetType="TextBlock">
+              <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="#6B7280"/><Setter Property="VerticalAlignment" Value="Top"/><Setter Property="Padding" Value="0,6"/>
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#B91C1C"/></DataTrigger>
+                <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </DataGridTextColumn.ElementStyle>
+        </DataGridTextColumn>
+        <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="100" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Last seen" Binding="{Binding LastSeen, StringFormat=yyyy-MM-dd HH:mm}" Width="130" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2.4*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Seen by" Binding="{Binding Sources}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Grid.Row="3" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+      <DataGrid x:Name="EpDetailGrid" Style="{StaticResource Grid}">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Section" Binding="{Binding Section}" Width="120" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Item" Binding="{Binding Item}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Info" Binding="{Binding Info}" Width="3*" ElementStyle="{StaticResource Wrap}"/>
+        </DataGrid.Columns>
+      </DataGrid>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Fill the window from the data it holds, or read the data first (-Load).
+function Update-EndpointAiWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('EpNote'); $grid = $Window.FindName('EpGrid'); $btn = $Window.FindName('BtnEpLoad'); $summary = $Window.FindName('EpSummary')
+    if ($Load) {
+        try {
+            $days = [int]$Window.FindName('EpDaysBox').SelectedItem.Tag
+            $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $Window.Tag = Get-EndpointAiData -Days $days -OnStatus $pump
+        } catch {
+            $note.Text = 'Could not read endpoint telemetry: ' + $_.Exception.Message
+            return
+        } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
+    }
+    $data = $Window.Tag
+    if (-not $data) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
+    $all = @($data.Rows)
+    $rows = @(if ($Window.FindName('EpRiskyOnly').IsChecked) { $all | Where-Object { $_.Risk -in 'High', 'Medium' } } else { $all })
+    $grid.ItemsSource = $rows
+    $onboarded = [int]$data.Coverage['Onboarded']; $devices = [int](@($data.Coverage.Values) | Measure-Object -Sum).Sum
+    $summary.Text = ("{0} AI tool(s) on {1} device(s): {2} high risk, {3} medium. {4} of {5} device(s) are onboarded to Defender for Endpoint; the others cannot be inspected." -f
+        $all.Count, @($all | ForEach-Object { $_.Device } | Get-Distinct).Count, @($all | Where-Object { $_.Risk -eq 'High' }).Count, @($all | Where-Object { $_.Risk -eq 'Medium' }).Count, $onboarded, $devices)
+    $note.Text = if ($rows.Count) { "Last {0} days. Select a row for the evidence. Prompts and credentials in command lines are hidden. Alerts name the device, not the process, so one counts against a tool only when it fired within 15 minutes of that tool running." -f $data.Days }
+                 else { 'No AI tool found on the onboarded devices for this period.' }
+    if ($rows.Count) { $grid.SelectedIndex = 0 }
+    $Window.FindName('EpDetailGrid').ItemsSource = @(if ($grid.SelectedItem) { Get-EndpointAiDetailRows $grid.SelectedItem })
+}
+
+function New-EndpointAiWindow {
+    param([System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($EndpointAiXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:epWindow = $d
+    $d.FindName('BtnEpLoad').Add_Click({ Update-EndpointAiWindow -Window $script:epWindow -Load })
+    $d.FindName('EpRiskyOnly').Add_Click({ Update-EndpointAiWindow -Window $script:epWindow })
+    $d.FindName('EpGrid').Add_SelectionChanged({
+        $item = $script:epWindow.FindName('EpGrid').SelectedItem
+        $script:epWindow.FindName('EpDetailGrid').ItemsSource = @(if ($item) { Get-EndpointAiDetailRows $item })
+    })
+    $d.FindName('BtnEpExport').Add_Click({
+        $shown = @($script:epWindow.FindName('EpGrid').ItemsSource)
+        if ($shown.Count -eq 0) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'endpoint-ai.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($shown | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+    })
+    $d.Add_ContentRendered({ if (-not $script:epWindow.Tag) { Update-EndpointAiWindow -Window $script:epWindow -Load } })
+    $d
+}
+
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($DetailXaml)
@@ -3579,7 +4204,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -4045,6 +4670,7 @@ function New-ConsoleWindow {
         $win.ShowDialog() | Out-Null
     }
     $script:ui.BtnAi.Add_Click({ & $script:ctx.ShowDetails 'AI' })
+    $script:ui.BtnEndpointAi.Add_Click({ (New-EndpointAiWindow -Owner $script:w).ShowDialog() | Out-Null })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
@@ -4279,6 +4905,33 @@ switch ($PSCmdlet.ParameterSetName) {
         $det = Get-AgentDetail -Package $pkg
         Show-AgentDetail -Detail $det
         if ($OutFile) { $det | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutFile -Encoding utf8; Write-Host "Saved: $OutFile" -ForegroundColor Cyan }
+    }
+    'EndpointAi' {
+        $Sanctioned = ConvertTo-NameList $Sanctioned; $ForDevice = ConvertTo-NameList $ForDevice
+        Write-Host ("Reading endpoint telemetry for the last {0} day(s)..." -f $EndpointDays) -ForegroundColor DarkGray
+        $data = Get-EndpointAiData -Days $EndpointDays -Sanctioned $Sanctioned -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        $rows = @($data.Rows)
+        if ($RiskyOnly) { $rows = @($rows | Where-Object { $_.Risk -in 'High', 'Medium' }) }
+        if ($ForDevice) { $rows = @($rows | Where-Object { $name = $_.Device; @($ForDevice | Where-Object { $name -like $_ }).Count }) }
+        $onboarded = [int]$data.Coverage['Onboarded']; $allDevices = [int](@($data.Coverage.Values) | Measure-Object -Sum).Sum
+        Write-Host ("`n{0} AI tool(s) on {1} device(s): {2} high risk, {3} medium, {4} low or none. {5} found by Defender's own discovery." -f $rows.Count,
+            @($rows | ForEach-Object { $_.Device } | Get-Distinct).Count, @($rows | Where-Object { $_.Risk -eq 'High' }).Count, @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count,
+            @($rows | Where-Object { $_.Risk -in 'Low', 'None' }).Count, @($rows | Where-Object { $_.Sources -like '*Defender discovery*' }).Count) -ForegroundColor Cyan
+        Write-Host ("Coverage: {0} of {1} device(s) are onboarded to Defender for Endpoint. The others cannot be inspected, so a tool on them is not listed." -f $onboarded, $allDevices) -ForegroundColor DarkGray
+        if ($ForDevice) {
+            $evidenceRows = New-Object 'System.Collections.Generic.List[object]'
+            foreach ($r in $rows) {
+                Write-Host ("`n{0} on {1}: {2} risk" -f $r.Tool, $r.Device, $r.Risk) -ForegroundColor Cyan
+                $lines = @(Get-EndpointAiDetailRows $r)
+                $lines | Format-Table -AutoSize -Wrap | Out-Host
+                foreach ($l in $lines) { $evidenceRows.Add([pscustomobject]@{ Tool = $r.Tool; Device = $r.Device; Section = $l.Section; Item = $l.Item; Info = $l.Info }) }
+            }
+            Export-ActionLog -Records $evidenceRows.ToArray()
+        } else {
+            if ($rows.Count) { Show-EndpointAiTable $rows }
+            Write-Host 'Use -ForDevice <name> for the evidence behind each row. Prompts and credentials in command lines are hidden. Alerts name the device, not the process, so one counts against a tool only when it fired within 15 minutes of that tool running.' -ForegroundColor DarkGray
+            Export-ActionLog -Records @($rows | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
+        }
     }
     'AiActivity' {
         $pk = @(Get-Packages)

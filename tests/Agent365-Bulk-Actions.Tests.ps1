@@ -1697,3 +1697,198 @@ Describe 'Sign-in help' {
         @($script:AllScopes | Select-Object -Unique).Count | Should -Be @($script:AllScopes).Count
     }
 }
+
+Describe 'Endpoint AI: recognising tools and hiding secrets' {
+    It 'recognises a tool by the name Defender gave it, or by its process' {
+        (Resolve-EndpointAiTool -DefenderName 'Ollama Desktop').Key | Should -Be 'ollama'
+        (Resolve-EndpointAiTool -DefenderName 'GitHub Copilot CLI').Key | Should -Be 'copilot-cli'
+        (Resolve-EndpointAiTool -Process 'OLLAMA APP.EXE').Key | Should -Be 'ollama'
+        (Resolve-EndpointAiTool -Process 'codex').Key | Should -Be 'codex-cli'
+        Resolve-EndpointAiTool -Process 'notepad.exe' | Should -BeNullOrEmpty
+        Resolve-EndpointAiTool -DefenderName 'Some Internal Bot' | Should -BeNullOrEmpty
+    }
+    It 'tells Claude Desktop from Claude Code by where claude.exe runs from' {
+        (Resolve-EndpointAiTool -Process 'claude.exe' -Path 'C:\Program Files\WindowsApps\Claude_1.5.0_x64__abc\app\claude.exe').Key | Should -Be 'claude-desktop'
+        (Resolve-EndpointAiTool -Process 'claude.exe' -Path 'C:\Users\a\.local\bin\claude.exe').Key | Should -Be 'claude-code'
+        (Resolve-EndpointAiTool -DefenderName 'Claude Code').Key | Should -Be 'claude-code'
+    }
+    It 'hides a prompt, an api key and a bearer token, and shortens a long command' {
+        Protect-CommandLine 'copilot.exe -p "summarise my payroll file"' | Should -Be 'copilot.exe -p "<prompt hidden>"'
+        Protect-CommandLine 'tool --api-key abc123secret --model x' | Should -Be 'tool --api-key *** --model x'
+        Protect-CommandLine 'curl -H Authorization: Bearer eyJhbGciOi.payload' | Should -Not -BeLike '*eyJhbGciOi*'
+        Protect-CommandLine 'run sk-abcdefghijklmnop1234' | Should -Be 'run sk-***'
+        (Protect-CommandLine ('x' * 500)).Length | Should -BeLessThan 240
+        Protect-CommandLine '' | Should -Be ''
+    }
+    It 'builds queries from the catalog and the number of days' {
+        $q = Get-EndpointAiQueries -Days 14
+        $q.Agents | Should -BeLike '*Platform == "LocalAgents"*'
+        $q.Processes | Should -BeLike '*ago(14d)*'
+        $q.Processes | Should -BeLike '*"ollama.exe"*'
+        $q.Outbound | Should -BeLike '*"anthropic.com"*'
+        $q.Listening | Should -BeLike '*11434*'
+        $alerts = Get-EndpointAiAlertQuery -Days 7 -DeviceNames @('lab', 'we"ird')
+        $alerts | Should -BeLike '*"lab", "we\"ird"*'
+        (Get-EndpointAiDeviceQuery -DeviceIds @('d1', 'd2')) | Should -BeLike '*"d1", "d2"*'
+    }
+}
+
+Describe 'Endpoint AI: building rows and scoring risk' {
+    BeforeAll {
+        function New-EpData {
+            @{
+                Agents = @(
+                    @{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice'; McpServers = $null; LocalMcps = $null }
+                    @{ AgentId = 'a2'; Name = 'Claude Desktop'; Version = '2.0'; LifecycleStatus = 'Deleted'; LastSeen = '2026-09-23T16:06:59Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Anthropic'; Process = 'claude.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' }
+                    @{ AgentId = 'a3'; Name = 'Acme Helper'; Version = '3'; LifecycleStatus = ''; LastSeen = '2026-10-01T10:00:00Z'; FirstSeen = '2026-10-01T10:00:00Z'; Vendor = 'Acme'; Process = 'acme.exe'; Trusted = 'false'; AutoApprove = 'true'; Device = 'lab'; DeviceId = 'dev1'; Account = 'bob' }
+                )
+                Processes = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'ollama.exe'; FolderPath = 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'; Runs = 5; FirstSeen = '2026-09-22T14:09:00Z'; LastSeen = '2026-09-22T14:09:50Z'; Accounts = @('alice'); Parents = @('ollama app.exe'); ActiveAt = @('2026-09-22T14:00:00Z'); Command = 'ollama.exe serve'; FlagCommand = $null }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'llama-server.exe'; FolderPath = 'C:\Ollama\lib\llama-server.exe'; Runs = 8; FirstSeen = '2026-09-22T14:09:00Z'; LastSeen = '2026-09-22T14:09:50Z'; Accounts = @('alice'); Parents = @('ollama.exe'); ActiveAt = @('2026-09-22T14:00:00Z'); Command = 'llama-server.exe --port 5 --host 127.0.0.1'; FlagCommand = $null }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'copilot.exe'; FolderPath = 'C:\Users\alice\AppData\Local\GitHub CLI\copilot\copilot.exe'; Runs = 6; FirstSeen = '2026-09-10T13:14:00Z'; LastSeen = '2026-09-25T08:05:00Z'; Accounts = @('alice'); Parents = @('gh.exe'); ActiveAt = @('2026-09-25T08:00:00Z'); Command = 'copilot.exe -p "review the payroll export"'; FlagCommand = 'copilot.exe --yolo -p "x"' }
+                )
+                Mcp = @(); Files = @()
+                Outbound = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = 'ollama.com'; Hits = 17; LastSeen = '2026-10-05T16:47:00Z' }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'chrome.exe'; Host = 'chatgpt.com'; Hits = 3; LastSeen = '2026-10-05T16:47:00Z' }
+                )
+                Listening = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; LocalIP = '127.0.0.1'; LocalPort = 11434; Hits = 1; LastSeen = '2026-09-22T14:09:13Z' }
+                )
+                Software = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; SoftwareName = 'ollama_version_0.34.1'; SoftwareVendor = 'ollama'; SoftwareVersion = '0.34.1.0' })
+                Vulnerabilities = @()
+                Alerts = @(
+                    @{ DeviceName = 'LAB'; AlertId = 'x1'; Timestamp = '2026-09-22T14:10:23Z'; Title = "An active 'SuspPrompt' malware was detected"; Severity = 'Low'; DetectionSource = 'Antivirus' }
+                    @{ DeviceName = 'LAB'; AlertId = 'x2'; Timestamp = '2026-08-01T09:00:00Z'; Title = "'SuspPrompt' malware was prevented"; Severity = 'Informational'; DetectionSource = 'Antivirus' }
+                    @{ DeviceName = 'LAB'; AlertId = 'x3'; Timestamp = '2026-09-22T14:11:00Z'; Title = 'Suspicious service created'; Severity = 'Medium'; DetectionSource = 'EDR' }
+                )
+                Devices = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; OSPlatform = 'Windows10'; OnboardingStatus = 'Onboarded'; DeviceType = 'Workstation'; ExposureLevel = 'High'; AssetValue = 'Normal' })
+            }
+        }
+    }
+    It 'makes one row per tool and device, merges every source, and leaves out removed agents' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        ($rows.Tool | Sort-Object) | Should -Be @('Acme Helper', 'GitHub Copilot CLI', 'Ollama')
+        $ollama = $rows | Where-Object Tool -eq 'Ollama'
+        $ollama.Sources | Should -Be 'Defender discovery, Process telemetry, Software inventory'
+        $ollama.Version | Should -Be '0.34.1.0'
+        $ollama.Runs | Should -Be 13
+        $ollama.User | Should -Be 'alice'
+        $ollama.Evidence.Processes.Count | Should -Be 2
+    }
+    It 'counts an alert only for a tool that was active within 15 minutes of it, and only if it is about AI' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $ollama = $rows | Where-Object Tool -eq 'Ollama'
+        $copilot = $rows | Where-Object Tool -eq 'GitHub Copilot CLI'
+        @($ollama.Evidence.Alerts | Where-Object { $_.AiRelated -and $_.Near }).Count | Should -Be 1
+        @($copilot.Evidence.Alerts | Where-Object { $_.Near }).Count | Should -Be 0
+        @($ollama.Evidence.Alerts | Where-Object { $_.Title -like 'Suspicious service*' -and $_.AiRelated }).Count | Should -Be 0
+        $ollama.Risk | Should -Be 'Medium'
+        $ollama.Why | Should -BeLike '*1 AI-related alert near its activity*'
+    }
+    It 'rates auto-approve and an approval-skipping flag as high, and an untrusted process as medium' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $acme = $rows | Where-Object Tool -eq 'Acme Helper'
+        $acme.Risk | Should -Be 'High'
+        $acme.Why | Should -BeLike '*Approves its own actions*'
+        ($acme.Reasons | Where-Object Level -eq 'Medium').Text | Should -BeLike '*not trusted*'
+        $copilot = $rows | Where-Object Tool -eq 'GitHub Copilot CLI'
+        $copilot.Risk | Should -Be 'High'
+        $copilot.Evidence.Flag | Should -Be '--yolo'
+        $copilot.Evidence.Processes[0].Command | Should -Be 'copilot.exe -p "<prompt hidden>"'
+    }
+    It 'rates a model server reachable from the network as high, but not one on the loopback address' {
+        $loop = @(New-EndpointAiRows -Data (New-EpData)) | Where-Object Tool -eq 'Ollama'
+        $loop.Evidence.Listeners.Count | Should -Be 1
+        @($loop.Evidence.Listeners | Where-Object Exposed).Count | Should -Be 0
+        $d = New-EpData
+        $d.Listening = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; LocalIP = '0.0.0.0'; LocalPort = 11434; Hits = 2; LastSeen = '2026-09-22T14:09:13Z' })
+        $open = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $open.Risk | Should -Be 'High'
+        ($open.Reasons | Where-Object Level -eq 'High').Short | Should -BeLike '*0.0.0.0:11434*'
+    }
+    It 'rates a critical vulnerability as high and a high one as medium' {
+        $d = New-EpData
+        $d.Vulnerabilities = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; SoftwareName = 'ollama_version_0.34.1'; SoftwareVersion = '0.34.1.0'; Cves = 3; Critical = 1; High = 2; Example = 'CVE-2026-0001' })
+        $o = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $o.Risk | Should -Be 'High'
+        $o.Why | Should -BeLike '*1 critical CVE*'
+        $d.Vulnerabilities[0].Critical = 0
+        (@(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama').Reasons.Short | Should -Contain '2 high CVEs in 0.34.1.0'
+    }
+    It 'flags a local MCP server that is fetched by a package runner' {
+        $d = New-EpData
+        $d.Mcp = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'node.exe'; Runs = 4; FirstSeen = '2026-09-30T10:00:00Z'; LastSeen = '2026-10-01T10:00:00Z'; Accounts = @('alice'); Parent = 'cursor.exe'; Command = 'npx -y @modelcontextprotocol/server-filesystem C:\' })
+        $mcp = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'MCP server (local)'
+        $mcp.Category | Should -Be 'MCP server'
+        $mcp.Risk | Should -Be 'Medium'
+        $mcp.Why | Should -BeLike '*Local MCP server fetched at start*'
+    }
+    It 'marks tools as unreviewed, sanctioned or unsanctioned depending on the approved list' {
+        (@(New-EndpointAiRows -Data (New-EpData)) | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unreviewed'
+        (@(New-EndpointAiRows -Data (New-EpData) -Sanctioned $null) | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unreviewed'
+        $rows = @(New-EndpointAiRows -Data (New-EpData) -Sanctioned @('github'))
+        ($rows | Where-Object Tool -eq 'GitHub Copilot CLI').Status | Should -Be 'Sanctioned'
+        ($rows | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unsanctioned'
+        ($rows | Where-Object Tool -eq 'Ollama').Why | Should -BeLike '*Not sanctioned*'
+    }
+    It 'sorts the highest risk first' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $rows[0].Risk | Should -Be 'High'
+        $rows[-1].Risk | Should -Be 'Medium'
+    }
+    It 'gives a row with no evidence at all the level None' {
+        $row = [pscustomobject]@{ AutoApprove = ''; Trusted = ''; Status = 'Unreviewed'; Reasons = @()
+            Evidence = [pscustomobject]@{ Flag = ''; Listeners = @(); Software = @(); Alerts = @(); LocalMcps = (New-Object 'System.Collections.Generic.List[object]'); RemoteMcps = (New-Object 'System.Collections.Generic.List[object]')
+                                          Files = (New-Object 'System.Collections.Generic.List[object]'); AssetValue = ''; ExposureLevel = '' } }
+        (Get-EndpointAiRisk $row).Level | Should -Be 'None'
+    }
+    It 'lists named hosts first and sums the bare addresses into one line in the evidence' {
+        $d = New-EpData
+        $d.Outbound = @(
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = 'ollama.com'; Hits = 17; LastSeen = '2026-10-05T16:47:00Z' }
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = '140.82.112.22'; Hits = 3; LastSeen = '2026-10-05T16:47:00Z' }
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = '140.82.113.6'; Hits = 2; LastSeen = '2026-10-05T16:47:00Z' })
+        $o = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $net = @(Get-EndpointAiDetailRows $o | Where-Object Section -eq 'Network')
+        $net.Count | Should -Be 2
+        $net[0].Item | Should -Be 'ollama.com'
+        $net[1].Item | Should -Be 'IP addresses without a name'
+        $net[1].Info | Should -BeLike '2 addresses, 5 connections*'
+    }
+}
+
+Describe 'Endpoint AI: reading the data' {
+    It 'runs the queries, reports progress, and returns rows with coverage' {
+        $script:said = @()
+        Mock Invoke-HuntingQuery {
+            if ($Query -like '*summarize Devices = count() by OnboardingStatus*') { @(@{ OnboardingStatus = 'Onboarded'; Devices = 3 }, @{ OnboardingStatus = 'Can be onboarded'; Devices = 8 }) }
+            elseif ($Query -like '*Platform == "LocalAgents"*') { @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' }, @{ AgentId = 'a2'; Name = 'Claude Desktop'; LifecycleStatus = 'Deleted'; Device = 'lab'; DeviceId = 'dev1' }) }
+            elseif ($Query -like 'DeviceInfo*') { @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; OSPlatform = 'Windows10'; OnboardingStatus = 'Onboarded'; DeviceType = 'Workstation'; ExposureLevel = 'Low'; AssetValue = 'Normal' }) }
+            else { @() }
+        }
+        $data = Get-EndpointAiData -Days 7 -OnStatus { param($m) $script:said += $m }
+        $data.Rows.Count | Should -Be 1
+        $data.Rows[0].Tool | Should -Be 'Ollama'
+        $data.Rows[0].Risk | Should -Be 'None'
+        $data.Coverage['Onboarded'] | Should -Be 3
+        $data.RemovedAgents | Should -Be 1
+        Should -Invoke Invoke-HuntingQuery -Times 11
+        $script:said.Count | Should -Be 11
+        $script:said[0] | Should -BeLike 'Reading Defender local agent discovery*'
+    }
+    It 'says what is needed when Advanced Hunting is not available' {
+        Mock Invoke-HuntingQuery { throw 'Advanced Hunting query failed (403). Endpoint AI needs Advanced Hunting' }
+        { Get-EndpointAiData -Days 7 } | Should -Throw '*Advanced Hunting*'
+    }
+}
+
+Describe 'Endpoint AI: lists given on the command line' {
+    It 'splits a comma or semicolon separated value, so a scheduled task can pass a list' {
+        ConvertTo-NameList @('GitHub,Microsoft') | Should -Be @('GitHub', 'Microsoft')
+        ConvertTo-NameList @('lab-* ; vm-1') | Should -Be @('lab-*', 'vm-1')
+        ConvertTo-NameList @('GitHub', 'Microsoft') | Should -Be @('GitHub', 'Microsoft')
+        @(ConvertTo-NameList $null).Count | Should -Be 0
+        @(ConvertTo-NameList @('', ' ,')).Count | Should -Be 0
+    }
+}
