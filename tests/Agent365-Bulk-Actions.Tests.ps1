@@ -2116,3 +2116,154 @@ Describe 'Local AI agent block: how the service behaves' {
         (@(New-EndpointAiRows -Data $data -Blocks @{ $rid = @{ id = $rid; status = 'enabled' } }) | Select-Object -First 1).Blocked | Should -Be 'Blocked'
     }
 }
+
+Describe 'Conditional Access check for agents' {
+    BeforeAll {
+        # Policies shaped like the ones the service returns.
+        function New-RawCa {
+            param([string]$Name = 'p', [string]$State = 'enabled', [string[]]$Include = @(), $Filter = $null, [string[]]$Exclude = @(), [string[]]$Risk = @(),
+                  [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Grant = @('block'), $Agents = $null, [switch]$NoClientApps)
+            $ca = if ($NoClientApps) { $null } else { @{ includeServicePrincipals = @(); includeAgentIdServicePrincipals = $Include; excludeServicePrincipals = $Exclude } }
+            if ($ca -and $Filter) { $ca['agentIdServicePrincipalFilter'] = $Filter }
+            @{ id = "id-$Name"; displayName = $Name; state = $State
+               conditions = @{ clientApplications = $ca; agents = $Agents; agentIdRiskLevels = $Risk; users = @{ includeUsers = @('None') }
+                               applications = @{ includeApplications = $Resources; excludeApplications = @(); applicationFilter = $null } }
+               grantControls = @{ builtInControls = $Grant; operator = 'OR' } }
+        }
+        function New-Ca { param([hashtable]$Raw) ConvertTo-AgentCaPolicy $Raw }
+    }
+    It 'reads who a policy targets, what it protects and what it does' {
+        $all = New-Ca (New-RawCa -Name 'Adecco' -Include @('All') -Risk @('high'))
+        $all.TargetsAgentIdentities | Should -BeTrue; $all.AllAgents | Should -BeTrue
+        $all.RiskLevels | Should -Be @('high'); $all.ResourceScope | Should -Be 'Agent resources'; $all.Blocks | Should -BeTrue
+        (New-Ca (New-RawCa -Include @('a1', 'b2') -Resources @('All'))).ResourceScope | Should -Be 'All resources'
+        (New-Ca (New-RawCa -Include @('All') -Resources @('None'))).ResourceScope | Should -Be 'None'
+        (New-Ca (New-RawCa -Include @('All') -Resources @('7598ef18-a171-4c40-b5b2-9b6df5d67a21'))).ResourceScope | Should -Be 'Specific resources'
+        (New-Ca (New-RawCa -Include @('All') -Grant @('mfa'))).Blocks | Should -BeFalse
+        $byRule = New-Ca (New-RawCa -Filter @{ mode = 'include'; rule = 'CustomSecurityAttribute.X -contains "Y"' })
+        $byRule.TargetsAgentIdentities | Should -BeTrue; $byRule.FilterMode | Should -Be 'include'; $byRule.AllAgents | Should -BeFalse
+        (New-Ca (New-RawCa -NoClientApps -Resources @('All'))).TargetsAgentIdentities | Should -BeFalse
+        (New-Ca (New-RawCa -Include @('All') -Agents @{ includeAgentUsers = @('All') })).TargetsAgentUsers | Should -BeTrue
+    }
+    It 'decides whether an agent is among the agents a policy targets' {
+        $ids = @('agent-1', 'app-1', 'bp-app-1', 'bp-sp-1')
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('AGENT-1'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('bp-sp-1'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('other'))) $ids).Result | Should -Be 'No'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All') -Exclude @('bp-app-1'))) $ids).Result | Should -Be 'No'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Filter @{ mode = 'include'; rule = 'r' })) $ids).Result | Should -Be 'Maybe'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All') -Filter @{ mode = 'exclude'; rule = 'r' })) $ids).Result | Should -Be 'Maybe'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -NoClientApps)) $ids).Result | Should -Be 'No'
+    }
+    It 'says an agent is protected when an enforced policy blocks High agent risk, and whether it is blocked now' {
+        $pol = @(New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Protected'; $c.BlockedNow | Should -BeTrue; $c.Verdict | Should -BeLike '*Block high*Blocked now*'
+        $m = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'medium'
+        $m.Kind | Should -Be 'Protected'; $m.BlockedNow | Should -BeFalse; $m.Verdict | Should -BeLike '*risk is medium*no enforced policy covers*'
+        $n = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
+        $n.Kind | Should -Be 'Protected'; $n.BlockedNow | Should -BeFalse; $n.Verdict | Should -BeLike '*Not blocked now: Entra has not flagged it*'
+    }
+    It 'blocks now at the current level when the policy covers medium and high' {
+        $pol = @(New-Ca (New-RawCa -Name 'Medium and up' -Include @('All') -Risk @('medium', 'high')))
+        (Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'medium').BlockedNow | Should -BeTrue
+    }
+    It 'does not count a policy that is only reporting' {
+        $pol = @(New-Ca (New-RawCa -Name 'Reporting' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Report-only'; $c.Verdict | Should -BeLike 'Not enforced*Reporting*'; $c.BlockedNow | Should -BeFalse
+    }
+    It 'spots an enabled policy that protects no resources' {
+        $pol = @(New-Ca (New-RawCa -Name 'Medium and above' -Include @('All') -Risk @('medium', 'high') -Resources @('None')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'No effect'; $c.Verdict | Should -BeLike '*Medium and above*protects no resources*'; $c.BlockedNow | Should -BeFalse
+    }
+    It 'only suggests protection from an attribute rule it cannot evaluate' {
+        $pol = @(New-Ca (New-RawCa -Name 'By attribute' -Filter @{ mode = 'include'; rule = 'CustomSecurityAttribute.A -contains "B"' } -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Possible'; $c.Verdict | Should -BeLike '*attribute-based*By attribute*'
+    }
+    It 'says unprotected when no enforced policy blocks the agent at High, whatever else exists' {
+        $pol = @(
+            (New-Ca (New-RawCa -Name 'Other agents' -Include @('someone-else') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Off' -State 'disabled' -Include @('All') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))),
+            (New-Ca (New-RawCa -Name 'Low only' -Include @('All') -Risk @('low'))))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Unprotected'; $c.Verdict | Should -BeLike 'No enforced policy blocks it at High*'
+        @($c.Policies | ForEach-Object { $_.Policy }) | Should -Be @('Off', 'Low only')
+    }
+    It 'lets an enforced policy win over a report-only one and over one with no effect' {
+        $pol = @(
+            (New-Ca (New-RawCa -Name 'Reporting' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Nothing' -Include @('All') -Risk @('high') -Resources @('None'))),
+            (New-Ca (New-RawCa -Name 'Real' -Include @('All') -Risk @('high'))))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
+        $c.Kind | Should -Be 'Protected'; $c.Verdict | Should -BeLike '*Real*'; $c.Verdict | Should -Not -BeLike '*Nothing*'
+    }
+    It 'reads the policies page by page' {
+        Mock Invoke-Graph {
+            if ($Uri -like '*skip=1') { @{ value = @((New-RawCa -Name 'two' -Include @('All'))) } }
+            else { @{ value = @((New-RawCa -Name 'one' -Include @('All'))); '@odata.nextLink' = 'https://graph.microsoft.com/beta/identity/conditionalAccess/policies?skip=1' } }
+        }
+        @(Get-AgentCaPolicies | ForEach-Object { $_.Name }) | Should -Be @('one', 'two')
+    }
+    It 'finds each agent identity''s app id, blueprint and blueprint principal in two batches' {
+        Mock Invoke-GraphBatch {
+            if ($Requests[0].url -match '\?\$filter') { @{ 'bp-app' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-principal' }) } } } }
+            else { @{ 'ag1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ appId = 'ag1-app'; agentIdentityBlueprintId = 'bp-app' } }; 'ag2' = [pscustomobject]@{ Status = 404; Body = $null } } }
+        }
+        $m = Get-AgentIdentityIds @('ag1', 'ag2', 'ag1')
+        $m['ag1'].AppId | Should -Be 'ag1-app'; $m['ag1'].Blueprint | Should -Be 'bp-app'; $m['ag1'].Principal | Should -Be 'bp-principal'
+        $m['ag2'].Blueprint | Should -Be ''
+        Should -Invoke Invoke-GraphBatch -Times 2
+    }
+    It 'lists only the identities Entra rates at risk or confirmed compromised' {
+        $script:RiskBase = 'https://graph.microsoft.com/beta/identityProtection/riskyAgents'
+        Mock Invoke-Graph { @{ value = @(@{ id = 'a'; riskState = 'atRisk' }, @{ id = 'b'; riskState = 'dismissed' }, @{ id = 'c'; riskState = 'confirmedCompromised' }) } }
+        Get-EntraRiskyAgentIds | Should -Be @('a', 'c')
+    }
+    It 'builds a report for chosen agents and notes the ones with no Entra identity' {
+        Mock Get-AgentCaPolicies { @((New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))), (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))), (New-Ca (New-RawCa -Name 'Agent users' -Include @('All') -Agents @{ x = 1 } -NoClientApps))) }
+        Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = 'i1'; Blueprint = ''; Principal = '' } } }
+        Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = '' } } }
+        $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = '' })
+        $r = Get-AgentCaReport -Packages $pk
+        $r.Rows.Count | Should -Be 1
+        $r.Rows[0].Agent | Should -Be 'Alpha'; $r.Rows[0].Kind | Should -Be 'Protected'; $r.Rows[0].EntraRisk | Should -Be 'high (confirmedCompromised)'; $r.Rows[0].BlockedNow | Should -BeTrue
+        $r.NoIdentity | Should -Be @('Beta')
+        $r.PolicyCount | Should -Be 3; $r.AgentPolicies | Should -Be 1; $r.AgentUserPolicies | Should -Be 1
+    }
+    It 'lists the verdict, the Entra risk and each policy that could apply in the detail view' {
+        $pol = @((New-Ca (New-RawCa -Name 'Nothing' -Include @('All') -Risk @('high') -Resources @('None'))), (New-Ca (New-RawCa -Name 'Real' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high'))))
+        $row = Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies $pol -RiskLevel 'high'
+        $row | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'high (atRisk)'
+        $d = @(Get-AgentCaDetailRows $row)
+        ($d | Where-Object Section -eq 'Verdict').Item | Should -Be 'Report-only'
+        ($d | Where-Object Item -eq 'Entra risk now').Info | Should -Be 'high (atRisk)'
+        @($d | Where-Object Section -eq 'Policies').Count | Should -Be 2
+        (($d | Where-Object Item -eq 'Real').Info) | Should -BeLike 'Report-only. Applies: Yes*'
+        (($d | Where-Object Item -eq 'Nothing').Info) | Should -BeLike '*never applies*'
+        (@(Get-AgentCaDetailRows (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @() | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'unknown' -PassThru)) | Where-Object Item -eq '(none)').Info | Should -BeLike 'No Conditional Access policy targets this agent*'
+    }
+}
+
+Describe 'Conditional Access check: tenant findings' {
+    It 'lists enabled policies that protect no resources, and agents covered but not blocked now' {
+        function New-RawCa2 { param([string]$Name, [string]$State = 'enabled', [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Risk = @('high'))
+            @{ id = "id-$Name"; displayName = $Name; state = $State
+               conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('All'); excludeServicePrincipals = @() }; agents = $null; agentIdRiskLevels = $Risk
+                               applications = @{ includeApplications = $Resources; applicationFilter = $null } }
+               grantControls = @{ builtInControls = @('block') } } }
+        Mock Get-AgentCaPolicies { @((ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Real')), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Nothing' -Resources @('None'))), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Off' -State 'disabled' -Resources @('None')))) }
+        Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = ''; Blueprint = ''; Principal = '' }; 'i2' = [pscustomobject]@{ Identity = 'i2'; AppId = ''; Blueprint = ''; Principal = '' } } }
+        Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'atRisk'; Detail = '' }; 'i2' = $null } }
+        $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Flagged'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Quiet'; agentIdentityId = 'i2' })
+        $r = Get-AgentCaReport -Packages $pk
+        $r.NeverApply | Should -Be @('Nothing')
+        $r.NotBlockedNow | Should -Be @('Quiet')
+        ($r.Rows | Where-Object Agent -eq 'Flagged').BlockedNow | Should -BeTrue
+        ($r.Rows | Where-Object Agent -eq 'Quiet').EntraRisk | Should -Be 'unknown'
+    }
+}
