@@ -65,7 +65,8 @@
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess
-  For every risky agent (Defender or Entra), say whether a Conditional Access policy blocks it at High agent risk. Add -ForAgent <name> for chosen agents.
+  For every risky agent (Defender or Entra), say whether a Conditional Access policy blocks it at High agent risk. Add -ForAgent <name> for chosen agents,
+  or -AllAgents for every agent in the catalog, summarised by the policies that cover them.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
@@ -276,6 +277,7 @@ param(
     [Parameter(ParameterSetName = 'Stale')]
     [Parameter(ParameterSetName = 'Risky')]
     [Parameter(ParameterSetName = 'Inventory')]
+    [Parameter(ParameterSetName = 'CaCheck')]
     [switch]$AgentsOnly,                       # filter supportedHosts eq 'Copilot'
 
     [switch]$Force,                           # skip the "proceed?" confirmation for any write
@@ -307,7 +309,10 @@ param(
     [string[]]$Sanctioned,                  # Endpoint AI: tool or vendor names you have approved (substring match); everything else shows as Unsanctioned
 
     [Parameter(ParameterSetName = 'CaCheck', Mandatory)]
-    [switch]$CheckConditionalAccess,        # does a Conditional Access policy block each risky agent at High agent risk? (Defender-risky and Entra-risky agents, or -ForAgent)
+    [switch]$CheckConditionalAccess,        # does a Conditional Access policy block each risky agent at High agent risk? (Defender-risky and Entra-risky agents, or -ForAgent, or -AllAgents)
+
+    [Parameter(ParameterSetName = 'CaCheck')]
+    [switch]$AllAgents,                     # Conditional Access check: every agent in the catalog, not only the risky ones
 
     [Parameter(ParameterSetName = 'BlockLocalAgent', Mandatory)]
     [string[]]$BlockLocalAgent,             # have Defender stop and quarantine these local AI agents (names, wildcards allowed) on the devices in -ForDevice
@@ -1947,6 +1952,32 @@ function Get-AgentCaReport {
         NeverApply = @($policies | Where-Object { $_.TargetsAgentIdentities -and $_.State -eq 'enabled' -and $_.Blocks -and $_.ResourceScope -eq 'None' } | ForEach-Object { $_.Name })
         NotBlockedNow = @($rows | Where-Object { $_.Kind -eq 'Protected' -and -not $_.BlockedNow } | ForEach-Object { $_.Agent })
     }
+}
+
+$script:CaKindOrder = @{ 'Unprotected' = 0; 'No effect' = 1; 'Report-only' = 2; 'Possible' = 3; 'Protected' = 4 }
+
+# The policies that give an agent its verdict, as one string: the enforced blocking policies for Protected, the report-only ones for
+# Report-only, and so on. Unprotected has none.
+function Get-AgentCaCovering {
+    param([object]$Row)
+    $match = switch ($Row.Kind) {
+        'Protected'   { { $_.Applies -eq 'Yes' -and $_.Live -and $_.AtHigh } }
+        'Report-only' { { $_.Applies -eq 'Yes' -and $_.ReportOnly -and $_.Blocks -and $_.AtHigh -and $_.Resources -ne 'None' } }
+        'No effect'   { { $_.Applies -eq 'Yes' -and $_.NoEffect -and $_.AtHigh } }
+        'Possible'    { { $_.Applies -eq 'Maybe' -and $_.Live -and $_.AtHigh } }
+        default       { $null }
+    }
+    if (-not $match) { return '' }
+    (@($Row.Policies | Where-Object $match | ForEach-Object { $_.Policy }) -join '; ')
+}
+
+# Agents with the same verdict and the same covering policies, counted together: the view of a whole tenant.
+function Get-AgentCaGroups {
+    param([object[]]$Rows)
+    @($Rows | Group-Object { '{0}|{1}' -f $_.Kind, (Get-AgentCaCovering $_) } | ForEach-Object {
+        $first = $_.Group[0]
+        [pscustomobject]@{ Verdict = $first.Kind; Agents = $_.Count; BlockedNow = @($_.Group | Where-Object { $_.BlockedNow }).Count; CoveredBy = (Get-AgentCaCovering $first) }
+    } | Sort-Object @{ e = { $script:CaKindOrder[$_.Verdict] } }, @{ e = { -$_.Agents } })
 }
 
 function Get-AgentCaDetailRows {
@@ -3829,7 +3860,7 @@ $GuiXaml = @'
               <ContextMenu>
                 <MenuItem Header="Confirm as compromised..." ToolTip="Entra sets the risk level to High. Undo last run dismisses it."/>
                 <MenuItem Header="Clear the compromised flag..." ToolTip="Dismiss the Entra risk of the selected agents. Entra shows them as dismissed afterwards."/>
-                <MenuItem Header="Check Conditional Access..." ToolTip="Read-only. Check whether a Conditional Access policy blocks each selected agent at High agent risk, and which policies apply."/>
+                <MenuItem Header="Check Conditional Access..." ToolTip="Read-only. Check whether a Conditional Access policy blocks each ticked agent at High agent risk, and which policies apply. With nothing ticked it checks every agent that has an Entra identity."/>
               </ContextMenu>
             </Button.ContextMenu>
           </Button>
@@ -4700,7 +4731,7 @@ function New-CaCheckWindow {
     $d = [Windows.Markup.XamlReader]::Parse($CaCheckXaml)
     if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
     $script:caWindow = $d
-    $rows = @($Report.Rows | Sort-Object @{ e = { @{ 'Unprotected' = 0; 'No effect' = 1; 'Report-only' = 2; 'Possible' = 3; 'Protected' = 4 }[$_.Kind] } }, Agent)
+    $rows = @($Report.Rows | Sort-Object @{ e = { $script:CaKindOrder[$_.Kind] } }, Agent)
     $d.FindName('CaSummary').Text = ("{0} agent(s): {1} protected, {2} report-only, {3} with a policy that has no effect, {4} possibly protected by an attribute rule, {5} unprotected. {6} of {7} Conditional Access policies target agent identities." -f
         $rows.Count, @($rows | Where-Object { $_.Kind -eq 'Protected' }).Count, @($rows | Where-Object { $_.Kind -eq 'Report-only' }).Count, @($rows | Where-Object { $_.Kind -eq 'No effect' }).Count,
         @($rows | Where-Object { $_.Kind -eq 'Possible' }).Count, @($rows | Where-Object { $_.Kind -eq 'Unprotected' }).Count, $Report.AgentPolicies, $Report.PolicyCount)
@@ -4708,7 +4739,7 @@ function New-CaCheckWindow {
     if ($Report.NeverApply.Count) { $notes.Add(("Enabled but protecting no resources, so it never applies: {0}. Set its target resources." -f ($Report.NeverApply -join '; '))) }
     if ($Report.NotBlockedNow.Count) { $notes.Add(("{0} agent(s) are covered but not blocked now, because Entra has not flagged them. Confirming an agent as compromised raises its risk to High, which the policy then enforces." -f $Report.NotBlockedNow.Count)) }
     if ($Report.AgentUserPolicies) { $notes.Add(("{0} policy(ies) target agent user accounts and were not evaluated." -f $Report.AgentUserPolicies)) }
-    if ($Report.NoIdentity.Count) { $notes.Add(("No Entra agent identity, so Conditional Access for agents cannot apply: {0}." -f (($Report.NoIdentity | Select-Object -First 6) -join '; '))) }
+    if ($Report.NoIdentity.Count) { $notes.Add(("{0} agent(s) have no Entra agent identity, so Conditional Access for agents cannot apply (for example: {1})." -f $Report.NoIdentity.Count, (($Report.NoIdentity | Select-Object -First 4) -join '; '))) }
     $notes.Add('This covers an agent signing in as itself. Policies for the on-behalf-of flow target users. An attribute rule is shown, not evaluated.')
     $d.FindName('CaNote').Text = ($notes -join ' ')
     $grid = $d.FindName('CaGrid')
@@ -5350,12 +5381,15 @@ function New-ConsoleWindow {
     }
 
     $script:ctx.CheckConditionalAccess = {
-        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $_.Package.agentIdentityId })
-        if ($rows.Count -eq 0) { & $script:ctx.Idle 'Tick agents that have an Entra identity first.'; return }
+        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked })
+        $rows = @($ticked | Where-Object { $_.Package.agentIdentityId })
+        $scope = 'the ticked agent(s)'
+        if ($ticked.Count -eq 0) { $rows = @($script:ctx.Rows | Where-Object { $_.Package.agentIdentityId }); $scope = 'every agent with an Entra identity' }
+        if ($rows.Count -eq 0) { & $script:ctx.Idle $(if ($ticked.Count) { 'The ticked agents have no Entra identity, so Conditional Access for agents cannot apply to them.' } else { 'No agent in the catalog has an Entra identity.' }); return }
         try {
             if (-not (Test-GraphScope 'Policy.Read.All')) { & $script:ctx.Busy 'Granting read access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.Read.All' }
             if (-not ((Test-GraphScope 'IdentityRiskyAgent.Read.All') -or (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All'))) { & $script:ctx.Busy 'Granting read access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.Read.All' }
-            & $script:ctx.Busy ("Reading Conditional Access policies and the Entra risk of {0} agent(s)..." -f $rows.Count)
+            & $script:ctx.Busy ("Reading Conditional Access policies and the Entra risk of {0} agent(s) ({1})..." -f $rows.Count, $scope)
             $report = Get-AgentCaReport -Packages @($rows | ForEach-Object { $_.Package })
         } catch { & $script:ctx.Idle 'Conditional Access check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Conditional Access check', 'OK', 'Error'); return }
         & $script:ctx.Idle ("Conditional Access: {0} agent(s) checked, {1} protected." -f @($report.Rows).Count, @($report.Rows | Where-Object { $_.Kind -eq 'Protected' }).Count)
@@ -5487,8 +5521,10 @@ switch ($PSCmdlet.ParameterSetName) {
     }
     'CaCheck' {
         $ForAgent = ConvertTo-NameList $ForAgent
+        if ($AllAgents -and $ForAgent) { throw 'Use -AllAgents or -ForAgent, not both.' }
         $pk = @(Get-Packages)
-        if ($ForAgent) { $targets = @(Resolve-Packages $ForAgent -Catalog $pk) }
+        if ($AllAgents) { $targets = $pk }
+        elseif ($ForAgent) { $targets = @(Resolve-Packages $ForAgent -Catalog $pk) }
         else {
             Write-Host 'Finding risky agents in Defender and in Entra ID Protection...' -ForegroundColor DarkGray
             $defender = @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity $MinSeverity -Source Both -Packages $pk)
@@ -5496,7 +5532,8 @@ switch ($PSCmdlet.ParameterSetName) {
             $entra = @($pk | Where-Object { $_.agentIdentityId -and ($entraIds -contains [string]$_.agentIdentityId) })
             $targets = @(@($defender) + @($entra) | Group-Object -Property id | ForEach-Object { $_.Group[0] })
         }
-        if ($targets.Count -eq 0) { Write-Host 'No risky agent found. Use -ForAgent <name> to check chosen agents.' -ForegroundColor Yellow; break }
+        if ($AgentsOnly) { $targets = @($targets | Where-Object { @($_.supportedHosts) -contains 'Copilot' }) }
+        if ($targets.Count -eq 0) { Write-Host $(if ($AllAgents) { 'No agents found.' } else { 'No risky agent found. Use -AllAgents for every agent, or -ForAgent <name> for chosen agents.' }) -ForegroundColor Yellow; break }
         Write-Host ("Checking {0} agent(s) against the tenant's Conditional Access policies..." -f $targets.Count) -ForegroundColor DarkGray
         $report = Get-AgentCaReport -Packages $targets
         $rows = @($report.Rows)
@@ -5505,14 +5542,26 @@ switch ($PSCmdlet.ParameterSetName) {
             @($rows | Where-Object { $_.Kind -eq 'Possible' }).Count, @($rows | Where-Object { $_.Kind -eq 'Unprotected' }).Count) -ForegroundColor Cyan
         Write-Host ("{0} of {1} Conditional Access policies target agent identities.{2}" -f $report.AgentPolicies, $report.PolicyCount,
             $(if ($report.AgentUserPolicies) { " $($report.AgentUserPolicies) target agent user accounts and were not evaluated." } else { '' })) -ForegroundColor DarkGray
-        $rows | Sort-Object @{ e = { @{ 'Unprotected' = 0; 'No effect' = 1; 'Report-only' = 2; 'Possible' = 3; 'Protected' = 4 }[$_.Kind] } }, Agent |
-            Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'Entra risk'; e = { $_.EntraRisk } }, @{ n = 'verdict'; e = { $_.Kind } }, @{ n = 'detail'; e = { $_.Verdict } } | Format-Table -AutoSize -Wrap | Out-Host
+        $ordered = @($rows | Sort-Object @{ e = { $script:CaKindOrder[$_.Kind] } }, Agent)
+        if ($AllAgents) {
+            Write-Host "`nBy coverage:" -ForegroundColor Cyan
+            Get-AgentCaGroups $rows | Select-Object @{ n = 'verdict'; e = { $_.Verdict } }, @{ n = 'agents'; e = { $_.Agents } }, @{ n = 'blocked now'; e = { $_.BlockedNow } }, @{ n = 'covered by'; e = { $_.CoveredBy } } | Format-Table -AutoSize -Wrap | Out-Host
+            $columns = @(@{ n = 'agent'; e = { $_.Agent } }, @{ n = 'Entra risk'; e = { $_.EntraRisk } }, @{ n = 'verdict'; e = { $_.Kind } }, @{ n = 'blocked now'; e = { if ($_.BlockedNow) { 'Yes' } else { 'No' } } })
+            if (@($rows | ForEach-Object { Get-AgentCaCovering $_ } | Get-Distinct).Count -gt 1) { $columns += @{ n = 'covered by'; e = { Get-AgentCaCovering $_ } } }
+            $ordered | Select-Object $columns | Format-Table -AutoSize -Wrap | Out-Host
+        }
+        else {
+            $ordered | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'Entra risk'; e = { $_.EntraRisk } }, @{ n = 'verdict'; e = { $_.Kind } }, @{ n = 'detail'; e = { $_.Verdict } } | Format-Table -AutoSize -Wrap | Out-Host
+        }
         if ($report.NeverApply.Count) { Write-Warning ("Enabled, but it protects no resources so it never applies: {0}. Set its target resources." -f ($report.NeverApply -join '; ')) }
         if ($report.NotBlockedNow.Count) { Write-Host ("{0} agent(s) are covered by a policy but not blocked now, because Entra has not flagged them. -ConfirmCompromised raises an agent's risk to High, which the policy then enforces." -f $report.NotBlockedNow.Count) -ForegroundColor Yellow }
-        if ($report.NoIdentity.Count) { Write-Warning ("No Entra agent identity, so Conditional Access for agents cannot apply: {0}" -f (($report.NoIdentity | Select-Object -First 8) -join '; ')) }
+        if ($report.NoIdentity.Count) {
+            $names = @($report.NoIdentity | Select-Object -First 8)
+            Write-Warning ("{0} agent(s) have no Entra agent identity, so Conditional Access for agents cannot apply{1}" -f $report.NoIdentity.Count, $(if ($report.NoIdentity.Count -le 8) { ": $($names -join '; ')" } else { " (for example: $($names -join '; '))" }))
+        }
         Write-Host 'This covers an agent signing in as itself. Policies for the on-behalf-of flow target users, and agent user accounts have their own policies. An attribute rule is shown, not evaluated.' -ForegroundColor DarkGray
         Export-ActionLog -Records @($rows | ForEach-Object {
-            [pscustomobject]@{ Agent = $_.Agent; Id = $_.Id; IdentityId = $_.IdentityId; EntraRisk = $_.EntraRisk; Verdict = $_.Kind; Detail = $_.Verdict; BlockedNow = $_.BlockedNow
+            [pscustomobject]@{ Agent = $_.Agent; Id = $_.Id; IdentityId = $_.IdentityId; EntraRisk = $_.EntraRisk; Verdict = $_.Kind; Detail = $_.Verdict; BlockedNow = $_.BlockedNow; CoveredBy = (Get-AgentCaCovering $_)
                                PoliciesThatApply = (@($_.Policies | Where-Object { $_.Applies -eq 'Yes' } | ForEach-Object { '{0} [{1}{2}]' -f $_.Policy, $_.State, $(if ($_.NoEffect) { ', protects no resources' } else { '' }) }) -join '; ') } })
     }
     'BlockLocalAgent' {
