@@ -5513,7 +5513,7 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host 'This covers an agent signing in as itself. Policies for the on-behalf-of flow target users, and agent user accounts have their own policies. An attribute rule is shown, not evaluated.' -ForegroundColor DarkGray
         Export-ActionLog -Records @($rows | ForEach-Object {
             [pscustomobject]@{ Agent = $_.Agent; Id = $_.Id; IdentityId = $_.IdentityId; EntraRisk = $_.EntraRisk; Verdict = $_.Kind; Detail = $_.Verdict; BlockedNow = $_.BlockedNow
-                               PoliciesThatApply = (@($_.Policies | Where-Object { $_.Applies -eq 'Yes' } | ForEach-Object { '{0} [{1}]' -f $_.Policy, $_.State }) -join '; ') } })
+                               PoliciesThatApply = (@($_.Policies | Where-Object { $_.Applies -eq 'Yes' } | ForEach-Object { '{0} [{1}{2}]' -f $_.Policy, $_.State, $(if ($_.NoEffect) { ', protects no resources' } else { '' }) }) -join '; ') } })
     }
     'BlockLocalAgent' {
         $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
