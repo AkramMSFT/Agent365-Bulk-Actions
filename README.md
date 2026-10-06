@@ -47,7 +47,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Accountability | Give Entra agent identities a sponsor (and optionally an owner), proposed from the owner chain | `-Accountability`, `-AddSponsor` |
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
-| Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk | `-EndpointAi` |
+| Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
@@ -99,6 +99,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `AgentIdentity.EnableDisable.All` | `-DisableIdentity` when the tool has to disable an identity itself, and the console |
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
 | `IdentityRiskyAgent.ReadWrite.All` | Reading an agent identity's Entra risk and confirming it compromised or dismissing the risk. Needs the Security Administrator role. The console asks for it only when you use that action. |
+| `CustomDetection.ReadWrite.All` | Blocking a local AI agent on a device (a Defender custom detection rule) and reading which are blocked. Needs a Defender role that manages custom detections and can remediate files. The console asks for it only when you use that action. |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
 | `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
@@ -120,6 +121,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | Graph beta `/copilot/admin/catalog/packages` | Block, unblock and reassign, which `v1.0` does not offer |
 | Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections, the per-agent records (tools, MCP servers, sharing) and the endpoint telemetry behind Endpoint AI |
 | Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
+| Graph beta `/security/rules/detectionRules` | Blocking a local AI agent on a device (a Defender custom detection rule that stops and quarantines its files) |
 | Graph beta `/identityProtection/riskyAgents` | Reading an agent identity's risk, confirming it compromised or dismissing the risk |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
 
@@ -350,6 +352,25 @@ Things to know:
 - **Removed agents are left out.** An agent Defender marks as deleted or uninstalled is not listed. An older version of an agent that was reinstalled is counted once.
 
 
+#### Block a local AI agent on a device
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01" -WhatIf      # show the files, change nothing
+.\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01" -OutFile .\block.csv
+.\Agent365-Bulk-Actions.ps1 -UnblockLocalAgent "Ollama" -ForDevice "lab-pc-01"           # delete the rule
+.\Agent365-Bulk-Actions.ps1 -Undo .\block.csv                                           # the same, from the log
+```
+
+In the console, select a tool in the Endpoint AI window and press **Block on this device...** (or **Remove block**). A **Blocked** column shows what is blocked.
+
+- **What it does.** It creates a Microsoft Defender custom detection rule named `Agent365 Bulk Actions: block <tool> on <device>`. The rule matches only that device and only the program files the tool was seen running from, and its action is *stop and quarantine file*. A version folder in the path (for example `Claude_1.52.3.0`) matches any version, so an update is covered. Other devices are not affected.
+- **Why not Microsoft's own block.** The Shadow AI page in the Microsoft 365 admin center blocks only OpenClaw, Node.js-based agents (blocking one blocks them all, and Node.js with them) and VS Code extensions, through an Intune policy on managed Windows devices. Ollama, Claude, GitHub Copilot CLI and ChatGPT Desktop are listed as not blockable there.
+- **Timing.** Defender runs the rule when it is created and then every hour. The files are stopped and quarantined each time it finds them, so the effect is not instant.
+- **What cannot be blocked.** MCP server and model-file rows (they are not programs of their own), files in the Windows folder, and Microsoft's own app packages. A tool installed from the Microsoft Store is allowed, with a warning: Defender may not be able to quarantine files in that protected folder.
+- **Undo.** Deleting the rule (`-UnblockLocalAgent`, `-Undo`, **Remove block**) stops further quarantines. Files already quarantined stay quarantined until you restore them in Microsoft Defender. The service accepts the delete at once, but its rule list can keep showing the rule for several minutes.
+- **Requirements.** The `CustomDetection.ReadWrite.All` permission, and a Defender role that manages custom detections and can remediate files, such as Security Administrator. The device must be onboarded to Defender for Endpoint. The API is beta.
+
+
 ### Contain and clean up
 
 ```powershell
@@ -440,7 +461,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Add accountability | *Ownership > Missing an Entra sponsor* (or *sponsor or owner*) lists identities with a gap; **Apply suggested** adds the proposed person after a confirmation. |
 | Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. Tick **Also apply this choice to deployment** to make who the agent is installed for follow the same choice (nobody, the same users and groups, or everyone); there is no separate deployment list. The *Access* filter lists agents open to everyone, restricted or closed. |
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
-| Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. |
+| Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
@@ -472,6 +493,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-ConfirmCompromised` | names and/or ids | Confirm these agents' Entra identities as compromised (risk level High). |
 | `-DismissRisk` | names and/or ids | Dismiss the Entra risk of these agents' identities. |
 | `-Restrict` | names and/or ids | Change who can use these agents. |
+| `-BlockLocalAgent` | tool names (wildcards allowed) | Have Defender stop and quarantine these local AI agents on the devices in `-ForDevice`. |
+| `-UnblockLocalAgent` | tool names (wildcards allowed) | Remove the block rule of these local AI agents on the devices in `-ForDevice`. |
 | `-EndpointAi` | switch | Local AI agents and shadow AI on Defender-onboarded devices, with telemetry and risk. |
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
@@ -514,8 +537,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-ForAgent` | `-AiActivity` | names and/or ids | List the individual events of these agents. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
-| `-EndpointDays` | `-EndpointAi` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
-| `-ForDevice` | `-EndpointAi` | device names (wildcards allowed) | Show the full evidence for the tools on these devices. |
+| `-EndpointDays` | `-EndpointAi`, `-BlockLocalAgent` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
+| `-ForDevice` | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` | device names (wildcards allowed) | Show the full evidence for the tools on these devices, or the devices to block or unblock on. |
 | `-Sanctioned` | `-EndpointAi` | tool or vendor names | Names you have approved (substring match). Others show as Unsanctioned. |
 | `-MinDaysBlocked` | `-DeleteCandidates` | integer, default 30 | Minimum days blocked. |
 | `-History` | `-DeleteCandidates` | paths | Extra logs or folders that record when agents were blocked. |
@@ -527,7 +550,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 ## Limitations
 
-- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls and the Entra agent-risk calls target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
+- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
 - **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
 - **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in (create it with `-SignIn`, as the account that runs the task) until it expires; the run then fails with a message to run `-SignIn` again.

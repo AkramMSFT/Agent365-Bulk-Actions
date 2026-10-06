@@ -1892,3 +1892,227 @@ Describe 'Endpoint AI: lists given on the command line' {
         @(ConvertTo-NameList @('', ' ,')).Count | Should -Be 0
     }
 }
+
+Describe 'Local AI agent block: the rule' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe', 'C:\Users\alice\AppData\Local\Programs\Ollama\lib\ollama\llama-server.exe'), [string]$DeviceId = '1a044ec134703a7684c3421732bbf03b1f9884d7')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+    }
+    It 'names a rule after the tool and the first 12 characters of the device id, with safe characters only' {
+        Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId '1a044ec134703a7684c3421732bbf03b1f9884d7' | Should -Be 'a365ba-block-ollama-1a044ec13470'
+        Get-LocalAgentBlockId -ToolKey 'defender:Acme Helper' -DeviceId 'AB-12' | Should -Be 'a365ba-block-defender-acme-helper-ab12'
+    }
+    It 'turns a path into a pattern that ignores the version folder but nothing else' {
+        $rx = { param($p) '(?i)^(' + (ConvertTo-PathRegex $p) + ')$' }
+        $claude = 'C:\Program Files\WindowsApps\Claude_1.52386.3.0_x64__pzs8sxrjxfjjc\app\claude.exe'
+        [regex]::IsMatch($claude, (& $rx $claude)) | Should -BeTrue
+        [regex]::IsMatch('C:\Program Files\WindowsApps\Claude_1.60000.1.0_x64__pzs8sxrjxfjjc\app\claude.exe', (& $rx $claude)) | Should -BeTrue
+        [regex]::IsMatch('C:\Users\bob\claude.exe', (& $rx $claude)) | Should -BeFalse
+        $rg = 'C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.87\ripgrep\bin\win32-x64\rg.exe'
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\ripgrep\bin\win32-x64\rg.exe', (& $rx $rg)) | Should -BeTrue
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\ripgrep\bin\win32-x64\rgXexe', (& $rx $rg)) | Should -BeFalse
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\other\bin\win32-x64\rg.exe', (& $rx $rg)) | Should -BeFalse
+        (ConvertTo-PathRegex 'C:\Program Files\x\a.exe') | Should -Not -BeLike '*\ *'
+    }
+    It 'says why a row cannot be blocked' {
+        Test-LocalAgentBlockable (New-BlockRow) | Should -Be ''
+        Test-LocalAgentBlockable (New-BlockRow -DeviceId '') | Should -BeLike '*no device id*'
+        Test-LocalAgentBlockable (New-BlockRow -ToolKey 'mcp-server' -Tool 'MCP server (local)') | Should -BeLike '*not a program*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @()) | Should -BeLike '*nothing to match*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Windows\System32\tool.exe')) | Should -BeLike '*Windows folder*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Microsoft.MicrosoftOfficeHub_19.1.0.0_x64__8wekyb3d8bbwe\M365Copilot.exe')) | Should -BeLike '*Microsoft''s own app packages*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Claude_1.5.0.0_x64__abc\app\claude.exe')) | Should -Be ''
+        Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\Windows\System32\tool.exe', 'D:\apps\tool.exe', 'D:\apps\tool.exe')) | Should -Be @('D:\apps\tool.exe')
+        (Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\x\App_1.2.3\a.exe', 'C:\x\App_1.2.4\a.exe'))) | Should -Be @('C:\x\App_<version>\a.exe')
+        (Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\x\App_1.2.3\a.exe', 'C:\x\App_1.2.4\a.exe')) -Raw).Count | Should -Be 2
+        Get-LocalAgentBlockWarning (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Claude_1.5.0.0_x64__abc\app\claude.exe')) | Should -BeLike 'Installed from the Microsoft Store*'
+        Get-LocalAgentBlockWarning (New-BlockRow) | Should -Be ''
+    }
+    It 'limits the query to the one device and the files that tool ran from' {
+        $q = New-LocalAgentBlockQuery (New-BlockRow)
+        $q | Should -BeLike '*DeviceProcessEvents*'
+        $q | Should -BeLike '*DeviceId == "1a044ec134703a7684c3421732bbf03b1f9884d7"*'
+        $q | Should -BeLike '*FolderPath matches regex @"(?i)^(C:\\Users\\alice\\AppData\\Local\\Programs\\Ollama\\ollama\.exe|C:\\Users\\alice*'
+        $q | Should -BeLike '*| project Timestamp, ReportId, DeviceId, DeviceName, FileName, FolderPath, SHA1, SHA256, ProcessCommandLine*'
+    }
+    It 'builds a rule that stops and quarantines on that device and carries the columns the action needs' {
+        $r = New-LocalAgentBlockRule -Row (New-BlockRow) -Operator 'admin@x.com'
+        $r.id | Should -Be 'a365ba-block-ollama-1a044ec13470'
+        $r.displayName | Should -Be 'Agent365 Bulk Actions: block Ollama on lab'
+        $r.status | Should -Be 'enabled'
+        $r.schedule.frequency | Should -Be 'PT1H'
+        $r.description | Should -BeLike '*admin@x.com*'
+        $a = $r.detectionAction.automatedActions.stopAndQuarantineFiles
+        @($a).Count | Should -Be 1
+        $a[0].deviceIdColumn | Should -Be 'DeviceId'; $a[0].sha1Column | Should -Be 'SHA1'
+        $a[0].'@odata.type' | Should -Be '#microsoft.graph.security.stopAndQuarantineFileAction'
+        $r.detectionAction.alertTemplate.entityMappings.hosts[0].deviceIdColumn | Should -Be 'DeviceId'
+        $r.detectionAction.alertTemplate.severity | Should -Be 'informational'
+        ($r | ConvertTo-Json -Depth 12) | Should -Match '"stopAndQuarantineFiles":\s*\['
+    }
+}
+
+Describe 'Local AI agent block: creating and removing' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'), [string]$DeviceId = '1a044ec134703a7684c3421732bbf03b1f9884d7')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+    }
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+    }
+    It 'lists only the rules this tool made, following the next link' {
+        Mock Invoke-Graph {
+            $script:calls += $Uri
+            if ($Uri -like '*skip=1') { @{ value = @(@{ id = 'a365ba-block-cursor-aaa'; displayName = 'c' }) } }
+            else { @{ value = @(@{ id = 'a365ba-block-ollama-bbb'; displayName = 'o' }, @{ id = 'someone-elses-rule'; displayName = 'x' }); '@odata.nextLink' = 'https://graph.microsoft.com/beta/security/rules/detectionRules?skip=1' } }
+        }
+        $b = Get-LocalAgentBlocks
+        ($b.Keys | Sort-Object) | Should -Be @('a365ba-block-cursor-aaa', 'a365ba-block-ollama-bbb')
+        $script:calls.Count | Should -Be 2
+    }
+    It 'creates the rule on the beta detection rules endpoint and logs the files and rule id' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri; Body = $Body } } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Action | Should -Be 'blocklocalagent'
+        $log[0].RuleId | Should -Be 'a365ba-block-ollama-1a044ec13470'
+        $log[0].Files | Should -Be 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Uri | Should -Be 'https://graph.microsoft.com/beta/security/rules/detectionRules'
+        ($script:calls[0].Body | ConvertFrom-Json).id | Should -Be 'a365ba-block-ollama-1a044ec13470'
+    }
+    It 'skips a row that is already blocked or cannot be blocked, and sends nothing' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri } } else { @{ value = @(@{ id = 'a365ba-block-ollama-1a044ec13470'; displayName = 'o' }) } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @((New-BlockRow), (New-BlockRow -ToolKey 'mcp-server' -Tool 'MCP server (local)')) -PassThru)
+        ($log | Where-Object Tool -eq 'Ollama').Error | Should -BeLike 'Already blocked*'
+        ($log | Where-Object Tool -eq 'MCP server (local)').Error | Should -BeLike '*not a program*'
+        @($log | Where-Object Result -eq 'Skipped').Count | Should -Be 2
+        $script:calls.Count | Should -Be 0
+    }
+    It 'changes nothing when the proceed check says no (-WhatIf)' {
+        Mock Test-Proceed { $false }
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri } } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'WhatIf'
+        $script:calls.Count | Should -Be 0
+    }
+    It 'records a refusal with the permission and role that are needed' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { throw 'Forbidden' } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Failed'
+        $log[0].Error | Should -BeLike '*CustomDetection.ReadWrite.All*'
+    }
+    It 'removes a rule by id and reports a failure without stopping' {
+        Mock Invoke-Graph { $script:calls += , @{ Method = $Method; Uri = $Uri }; if ($Uri -like '*bad*') { throw 'boom' } }
+        $rules = @([pscustomobject]@{ id = 'a365ba-block-ollama-aaa'; displayName = 'Agent365 Bulk Actions: block Ollama on lab' }, [pscustomobject]@{ id = 'a365ba-block-bad-bbb'; displayName = 'Agent365 Bulk Actions: block Bad on lab' })
+        $log = @(Invoke-LocalAgentUnblock -Rules $rules -PassThru)
+        ($log | Where-Object RuleId -eq 'a365ba-block-ollama-aaa').Result | Should -Be 'Done'
+        ($log | Where-Object RuleId -eq 'a365ba-block-bad-bbb').Result | Should -Be 'Failed'
+        $script:calls[0].Method | Should -Be 'DELETE'
+        $script:calls[0].Uri | Should -Be 'https://graph.microsoft.com/beta/security/rules/detectionRules/a365ba-block-ollama-aaa'
+    }
+    It 'marks a row as blocked when its rule exists' {
+        $data = @{
+            Agents = @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' })
+            Processes = @(); Mcp = @(); Files = @(); Outbound = @(); Listening = @(); Software = @(); Vulnerabilities = @(); Alerts = @(); Devices = @()
+        }
+        (@(New-EndpointAiRows -Data $data) | Select-Object -First 1).Blocked | Should -Be ''
+        $blocks = @{ (Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId 'dev1') = @{ id = 'x' } }
+        $row = @(New-EndpointAiRows -Data $data -Blocks $blocks) | Select-Object -First 1
+        $row.Blocked | Should -Be 'Blocked'
+        $row.ToolKey | Should -Be 'ollama'
+    }
+}
+
+Describe 'Local AI agent block: how the service behaves' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'), [string]$DeviceId = '1a044ec134703a7684c3421732bbf03b1f9884d7')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+        $script:ruleId = 'a365ba-block-ollama-1a044ec13470'
+    }
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+        $script:RecentlyUnblocked = @{}
+    }
+    It 'counts only an enabled rule that was not just removed as blocking' {
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'enabled' } } -RuleId $script:ruleId | Should -BeTrue
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'disabled' } } -RuleId $script:ruleId | Should -BeFalse
+        Test-LocalAgentBlockActive -Blocks @{} -RuleId $script:ruleId | Should -BeFalse
+        $script:RecentlyUnblocked[$script:ruleId] = Get-Date
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'enabled' } } -RuleId $script:ruleId | Should -BeFalse
+    }
+    It 'treats a rule the service no longer knows as removed, not as a failure' {
+        Mock Invoke-Graph { throw 'Custom detection rule with ID x was not found. NotFound' }
+        $log = @(Invoke-LocalAgentUnblock -Rules @([pscustomobject]@{ id = $script:ruleId; displayName = 'r' }) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Error | Should -BeLike '*no longer had the rule*'
+    }
+    It 'does not trust the list for a rule it just removed, so blocking again creates it afresh' {
+        Mock Invoke-Graph {
+            if ($Method -eq 'DELETE') { return }
+            if ($Method -in 'POST', 'PATCH') { $script:calls += , @{ Method = $Method; Uri = $Uri }; return }
+            @{ value = @(@{ id = $script:ruleId; status = 'enabled'; displayName = 'o' }) }
+        }
+        $null = Invoke-LocalAgentUnblock -Rules @([pscustomobject]@{ id = $script:ruleId; displayName = 'r' }) -PassThru
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Method | Should -Be 'POST'
+        $script:RecentlyUnblocked.ContainsKey($script:ruleId) | Should -BeFalse
+    }
+    It 'switches a disabled rule back on with a complete update that carries its id' {
+        Mock Invoke-Graph {
+            if ($Method -in 'POST', 'PATCH') { $script:calls += , @{ Method = $Method; Uri = $Uri; Body = $Body }; return }
+            @{ value = @(@{ id = $script:ruleId; status = 'disabled'; displayName = 'o' }) }
+        }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Method | Should -Be 'PATCH'
+        $script:calls[0].Uri | Should -Be "https://graph.microsoft.com/beta/security/rules/detectionRules/$script:ruleId"
+        $body = $script:calls[0].Body | ConvertFrom-Json
+        $body.id | Should -Be $script:ruleId
+        $body.status | Should -Be 'enabled'
+        $body.detectionAction.automatedActions.stopAndQuarantineFiles[0].sha1Column | Should -Be 'SHA1'
+    }
+    It 'updates the rule instead when creating it says it already exists' {
+        Mock Invoke-Graph {
+            if ($Method -eq 'POST') { $script:calls += , @{ Method = 'POST' }; throw 'A rule with this id already exists' }
+            if ($Method -eq 'PATCH') { $script:calls += , @{ Method = 'PATCH' }; return }
+            @{ value = @() }
+        }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        ($script:calls | ForEach-Object { $_.Method }) | Should -Be @('POST', 'PATCH')
+    }
+    It 'still reports any other creation error' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { throw 'Bad request: query is invalid' } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Failed'
+        $log[0].Error | Should -BeLike '*query is invalid*'
+    }
+    It 'marks a row as blocked only for an enabled rule' {
+        $data = @{
+            Agents = @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' })
+            Processes = @(); Mcp = @(); Files = @(); Outbound = @(); Listening = @(); Software = @(); Vulnerabilities = @(); Alerts = @(); Devices = @()
+        }
+        $rid = Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId 'dev1'
+        (@(New-EndpointAiRows -Data $data -Blocks @{ $rid = @{ id = $rid; status = 'disabled' } }) | Select-Object -First 1).Blocked | Should -Be ''
+        (@(New-EndpointAiRows -Data $data -Blocks @{ $rid = @{ id = $rid; status = 'enabled' } }) | Select-Object -First 1).Blocked | Should -Be 'Blocked'
+    }
+}
