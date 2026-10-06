@@ -22,6 +22,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Entra accountability](#entra-accountability)
   - [Restrict who can use an agent](#restrict-who-can-use-an-agent)
   - [AI activity from Purview](#ai-activity-from-purview)
+  - [Endpoint AI: local agents and shadow AI](#endpoint-ai-local-agents-and-shadow-ai)
   - [Contain and clean up](#contain-and-clean-up)
   - [Respond to a compromised agent](#respond-to-a-compromised-agent)
   - [Policy file](#policy-file)
@@ -46,6 +47,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Accountability | Give Entra agent identities a sponsor (and optionally an owner), proposed from the owner chain | `-Accountability`, `-AddSponsor` |
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
+| Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk | `-EndpointAi` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
@@ -58,6 +60,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 - **PowerShell 7 or later** is recommended. The `Microsoft.Graph.Authentication` module installs itself on first run.
 - An administrator who can consent to the permissions listed below, for example an AI Administrator or Global Administrator.
 - Stale-by-activity, risky agents, inventory details and policies also read **Defender Advanced Hunting**: a Microsoft Defender or Microsoft 365 E5 license with Security for AI onboarded.
+- Endpoint AI needs devices onboarded to **Microsoft Defender for Endpoint** (Windows or macOS). Defender's own local agent discovery needs Plan 2.
 - The console needs Windows.
 
 ## Quick start
@@ -91,7 +94,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | --- | --- |
 | `CopilotPackages.Read.All` | Read-only modes (`-List`, `-Detail`, `-Inventory`, `-Snapshot`, and any mode with `-Action list`) |
 | `CopilotPackages.ReadWrite.All` | Blocking, unblocking, reassigning and restricting agents |
-| `ThreatHunting.Read.All` | Activity-based staleness, risky agents, inventory details, delete candidates, policies |
+| `ThreatHunting.Read.All` | Activity-based staleness, risky agents, inventory details, delete candidates, policies, Endpoint AI |
 | `User.Read.All`, `AgentIdentity.Read.All` | Ownership, accountability, inventory and the console |
 | `AgentIdentity.EnableDisable.All` | `-DisableIdentity` when the tool has to disable an identity itself, and the console |
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
@@ -115,7 +118,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | --- | --- |
 | Graph `v1.0` `/copilot/admin/catalog/packages` | Listing agents, details and the availability scope (PATCH) |
 | Graph beta `/copilot/admin/catalog/packages` | Block, unblock and reassign, which `v1.0` does not offer |
-| Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections and the per-agent records (tools, MCP servers, sharing) |
+| Graph `/security/runHuntingQuery` (Defender Advanced Hunting) | Usage telemetry, alerts, detections, the per-agent records (tools, MCP servers, sharing) and the endpoint telemetry behind Endpoint AI |
 | Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
 | Graph beta `/identityProtection/riskyAgents` | Reading an agent identity's risk, confirming it compromised or dismissing the risk |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
@@ -298,6 +301,55 @@ Things to know:
 - A search takes about a minute for 7 days and about ten minutes for 30. Ranges longer than 30 days are split into windows that run side by side. The audit retention of your licence bounds `-AiDays` (maximum 180).
 - Each run creates audit searches named `Agent365-Bulk-Actions AI activity ...`. The service does not allow deleting them through the API, so they stay in the Purview audit search history until you remove them there.
 
+### Endpoint AI: local agents and shadow AI
+
+Agents are not only in the cloud. People install coding agents, desktop assistants, agentic IDEs and local model runtimes on their own devices, often without anyone reviewing them. `-EndpointAi` finds them on devices onboarded to Microsoft Defender for Endpoint and shows what each one did and which risks it carries. It only reads.
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -EndpointAi                                   # every AI tool found, worst first
+.\Agent365-Bulk-Actions.ps1 -EndpointAi -RiskyOnly -EndpointDays 14       # high and medium risk, last two weeks
+.\Agent365-Bulk-Actions.ps1 -EndpointAi -ForDevice "lab-*"                # the full evidence for the tools on matching devices
+.\Agent365-Bulk-Actions.ps1 -EndpointAi -Sanctioned "GitHub","Microsoft" -OutFile .\endpoint-ai.csv
+```
+
+In the console, **Endpoint AI...** (top row) opens the same view: a grid of tools, with the evidence for the selected one underneath.
+
+**What it reads.**
+
+| Source | What it adds |
+| --- | --- |
+| Defender's local agent discovery (`AgentsInfo`, platform `LocalAgents`) | The agent, its vendor and version, the account it runs under, whether its host process is trusted, whether it approves its own actions, and its MCP servers. Needs Defender for Endpoint Plan 2. |
+| Process telemetry | Which tools ran, when, started by what, from where, and with which flags. Also finds tools Defender's discovery does not list, such as LM Studio, GPT4All or a local MCP server started with `npx`. |
+| Network telemetry | The services each tool connected to, and every port it listens on, including whether it is reachable from other machines. |
+| Software inventory and vulnerabilities | The installed version, and its known vulnerabilities. |
+| File telemetry | Model files and MCP configuration files written to disk. |
+| Alerts and device details | Alerts on the device, and the device's exposure level and asset value. |
+
+**Risk.** Each tool gets the highest level of the rules it triggers, and every reason is shown.
+
+| Level | Rule |
+| --- | --- |
+| High | It approves its own actions (Defender's flag), or was started with a flag that skips approvals (`--dangerously-skip-permissions`, `--yolo`, `--full-auto`, `--allow-all-tools`). |
+| High | It listens on an address other than loopback, so other machines can reach it (for example a model server on `0.0.0.0:11434`). |
+| High | The installed version has a critical vulnerability. |
+| High or Medium | AI-related alerts fired within 15 minutes of the tool running: High when any is High or Critical, otherwise Medium. |
+| Medium | The installed version has a high-severity vulnerability. |
+| Medium | Its host process is not trusted, or a local MCP server is fetched by a package runner (`npx`, `uvx`) every time it starts. |
+| Medium | It runs on a device Defender rates as high value. |
+| Low | The device has a High exposure level, MCP servers are configured, model or MCP configuration files were written, or (when you pass `-Sanctioned`) the tool is not on your list. |
+
+`-Sanctioned` takes tool or vendor names (substring match) that you have approved. A tool then shows as Sanctioned or Unsanctioned; without the list every tool is Unreviewed and the list rule does not apply.
+
+Things to know:
+
+- **Only onboarded devices are visible.** The summary says how many devices are onboarded. A tool on a device that is not onboarded is not listed.
+- **Prompts and credentials are hidden.** Command lines are shown with the text after `-p`, `--prompt` or `--message`, API keys, bearer tokens and `sk-` keys replaced.
+- **Alerts name the device, not the process.** An alert is counted against a tool only when it fired within 15 minutes of that tool running, so the match is by timing. Other alerts on the device are listed in the evidence without affecting the level.
+- **Defender keeps about 30 days** of endpoint telemetry. The software inventory and Defender's discovery record are current.
+- **The portal's own risk level needs a different licence.** Microsoft 365 E7, or Agent 365 with Defender for Endpoint Plan 2, adds a risk level, risk indicators and recommendations in the Defender portal's AI agent inventory. They are not available through Advanced Hunting, so this tool computes its own from the rules above.
+- **Removed agents are left out.** An agent Defender marks as deleted or uninstalled is not listed. An older version of an agent that was reinstalled is counted once.
+
+
 ### Contain and clean up
 
 ```powershell
@@ -388,6 +440,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Add accountability | *Ownership > Missing an Entra sponsor* (or *sponsor or owner*) lists identities with a gap; **Apply suggested** adds the proposed person after a confirmation. |
 | Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. Tick **Also apply this choice to deployment** to make who the agent is installed for follow the same choice (nobody, the same users and groups, or everyone); there is no separate deployment list. The *Access* filter lists agents open to everyone, restricted or closed. |
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
+| Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
@@ -419,6 +472,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-ConfirmCompromised` | names and/or ids | Confirm these agents' Entra identities as compromised (risk level High). |
 | `-DismissRisk` | names and/or ids | Dismiss the Entra risk of these agents' identities. |
 | `-Restrict` | names and/or ids | Change who can use these agents. |
+| `-EndpointAi` | switch | Local AI agents and shadow AI on Defender-onboarded devices, with telemetry and risk. |
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
 | `-Policy` | path | Evaluate a JSON policy and print the plan. |
@@ -459,7 +513,10 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
 | `-ForAgent` | `-AiActivity` | names and/or ids | List the individual events of these agents. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
-| `-RiskyOnly` | `-AiActivity` | switch | Only events with a risk signal. |
+| `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
+| `-EndpointDays` | `-EndpointAi` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
+| `-ForDevice` | `-EndpointAi` | device names (wildcards allowed) | Show the full evidence for the tools on these devices. |
+| `-Sanctioned` | `-EndpointAi` | tool or vendor names | Names you have approved (substring match). Others show as Unsanctioned. |
 | `-MinDaysBlocked` | `-DeleteCandidates` | integer, default 30 | Minimum days blocked. |
 | `-History` | `-DeleteCandidates` | paths | Extra logs or folders that record when agents were blocked. |
 | `-IncludeUnknown` | `-DeleteCandidates` | switch | Also list agents whose block date is unknown. |
