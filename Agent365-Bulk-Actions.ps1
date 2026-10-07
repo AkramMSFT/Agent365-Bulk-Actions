@@ -97,7 +97,7 @@
   Open the graphical console (Windows).
 
 .NOTES
-  Add -DeviceCode if interactive sign-in misbehaves. Advanced Hunting keeps about 30 days, so -By activity can
+  Where no sign-in window can be shown, the tool falls back to a device code by itself; add -DeviceCode to use one from the start. Advanced Hunting keeps about 30 days, so -By activity can
   prove inactivity for at most 30 days; -StaleDays of 30 or more with -By activity means "no activity in the
   last 30 days". See the repository README for every mode, permission and parameter, and LICENSE for terms.
 #>
@@ -388,6 +388,61 @@ function Get-SignInHelp {
     }
     $Message
 }
+
+# Why a sign-in window cannot be expected in this session, or an empty string when one can. A remote shell has no desktop to show it on.
+function Get-NoWindowReason {
+    if ($env:ACC_CLOUD -or "$env:AZUREPS_HOST_ENVIRONMENT" -like 'cloud-shell*') { return 'Azure Cloud Shell' }
+    if ($env:SSH_CONNECTION -or $env:SSH_CLIENT -or $env:SSH_TTY) { return 'an SSH session' }
+    if ($IsLinux -and -not $env:DISPLAY -and -not $env:WAYLAND_DISPLAY) { return 'a session with no desktop' }
+    ''
+}
+
+# A person at a terminal can read a device code; a scheduled task, a service or a pipe cannot.
+function Test-SignInPromptPossible {
+    [bool]([Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not ([Environment]::GetCommandLineArgs() | Where-Object { $_ -match '(?i)^-noni' }))
+}
+
+# Has this account signed in with the tool or the Graph module before? A saved sign-in is reused without a window or a code.
+function Test-SavedSignIn {
+    Test-Path -LiteralPath (Join-Path $HOME '.mg/mg.authrecord.json')
+}
+
+# Sign in. The Microsoft sign-in window is the normal route. Where none can be shown (a remote shell, a server without a browser, a
+# window that fails to open) and a person is at the terminal, fall back to a device code: a code and a page address printed here, to be
+# entered on any device. A session nobody can answer (a scheduled task) gets the instruction to run -SignIn instead.
+function Connect-GraphSession {
+    param([hashtable]$Connect, [switch]$DeviceCode)
+    $viaCode = {
+        $c = $Connect.Clone(); $c['UseDeviceCode'] = $true
+        Write-Host 'Sign in with a device code: open https://microsoft.com/devicelogin on any device, enter the code shown below and finish the sign-in. A code works for about two minutes.' -ForegroundColor Cyan
+        for ($try = 1; ; $try++) {
+            try { Connect-MgGraph @c; return }
+            catch {
+                if ($try -ge 3 -or $_.Exception.Message -notmatch '(?i)timed out|expired|expire') { throw (Get-SignInHelp $_.Exception.Message) }
+                Write-Host 'The code expired before it was used. Getting a new one...' -ForegroundColor Yellow
+            }
+        }
+    }
+    if ($DeviceCode) { & $viaCode; return }
+    $person = Test-SignInPromptPossible
+    $why = Get-NoWindowReason
+    if ($why -and $person -and -not (Test-SavedSignIn)) {
+        Write-Host ("No sign-in window can be shown in {0}, so signing in with a device code." -f $why) -ForegroundColor Yellow
+        & $viaCode; return
+    }
+    if ($person -and -not (Test-SavedSignIn)) { Write-Host 'Signing in: a Microsoft sign-in window should open. If nothing appears, press Ctrl+C and run again with -DeviceCode.' -ForegroundColor DarkGray }
+    try { Connect-MgGraph @Connect }
+    catch {
+        $msg = $_.Exception.Message
+        $windowProblem = $msg -match '(?i)window handle|InteractiveBrowserCredential|interactive|browser|DISPLAY|timed out|timeout'
+        $declined = $msg -match '(?i)cancel|AADSTS|denied|declined'
+        if ($person -and $windowProblem -and -not $declined) {
+            Write-Host 'A sign-in window could not be shown here, so signing in with a device code instead.' -ForegroundColor Yellow
+            & $viaCode; return
+        }
+        throw (Get-SignInHelp $msg)
+    }
+}
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory', 'Compromise', 'DismissRisk')) -or
@@ -424,10 +479,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -a
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
-if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
-if (-not $script:LoadOnly) {
-    try { Connect-MgGraph @connect } catch { throw (Get-SignInHelp $_.Exception.Message) }
-}
+if (-not $script:LoadOnly) { Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode }
 
 $script:ThrottleHits = 0   # incremented on every throttled retry; write loops watch it to adapt their pace
 function Add-ThrottleHit { $script:ThrottleHits++ }
@@ -4620,7 +4672,7 @@ function Set-DetailWindowContent {
 function Test-GraphScope { param([string]$Scope) @((Get-MgContext).Scopes) -contains $Scope }
 function Request-GraphScope {
     param([string]$Scope)
-    Connect-MgGraph -Scopes @(@((Get-MgContext).Scopes) + $Scope | Select-Object -Unique) -NoWelcome
+    Connect-GraphSession -Connect @{ Scopes = @(@((Get-MgContext).Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
 }
 
 # Fill the pane under the events with everything known about the highlighted one.

@@ -2415,3 +2415,83 @@ Describe 'Agent users' {
         (Get-AgentUserSummary @()).Interactions | Should -Be 0
     }
 }
+
+Describe 'Sign-in fallback' {
+    BeforeAll {
+        function Connect-MgGraph { param([string[]]$Scopes, [switch]$NoWelcome, [switch]$UseDeviceCode, [string]$TenantId) }
+        $script:cn = @{ Scopes = @('CopilotPackages.Read.All'); NoWelcome = $true }
+    }
+    BeforeEach { Mock Write-Host {} }
+    It 'signs in with a device code at once when asked' {
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -DeviceCode
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'uses the sign-in window when one can be shown' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like '*press Ctrl+C and run again with -DeviceCode*' }
+    }
+    It 'says nothing extra when a saved sign-in makes the window unnecessary' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Write-Host -Times 0 -Exactly
+    }
+    It 'falls back to a device code when the window cannot be shown and a person is at the terminal' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured. See https://aka.ms/msal-net-wam#parent-window-handles' } }
+        { Connect-GraphSession -Connect $script:cn } | Should -Not -Throw
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'tells a session nobody can answer to run -SignIn, and offers no code' {
+        Mock Test-SignInPromptPossible { $false }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured.' } }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*-SignIn*'
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'does not fall back when the person cancels or the service refuses' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { throw 'User canceled authentication.' }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*canceled*'
+        Mock Connect-MgGraph { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*AADSTS65001*'
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'goes straight to a device code in a remote shell with no saved sign-in, and tries the saved one first when there is one' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }
+        Mock Connect-MgGraph {}
+        Mock Test-SavedSignIn { $false }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+        Mock Test-SavedSignIn { $true }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+    }
+    It 'asks for a new code when one expires, up to three times' {
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; if ($script:codes -lt 3) { throw 'Authentication timed out. The device code expired.' } }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Not -Throw
+        $script:codes | Should -Be 3
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; throw 'Authentication timed out. The device code expired.' }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*timed out*'
+        $script:codes | Should -Be 3
+    }
+    It 'sees a remote shell and a session nobody can answer' {
+        $keep = @{ ACC = $env:ACC_CLOUD; SSH = $env:SSH_CONNECTION }
+        try {
+            $env:ACC_CLOUD = $null; $env:SSH_CONNECTION = '10.0.0.1 5000 10.0.0.2 22'; $env:SSH_CLIENT = $null; $env:SSH_TTY = $null
+            Get-NoWindowReason | Should -Be 'an SSH session'
+            $env:SSH_CONNECTION = $null; $env:ACC_CLOUD = '1'
+            Get-NoWindowReason | Should -Be 'Azure Cloud Shell'
+        } finally { $env:ACC_CLOUD = $keep.ACC; $env:SSH_CONNECTION = $keep.SSH }
+        Test-SignInPromptPossible | Should -BeOfType ([bool])
+    }
+}
