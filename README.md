@@ -26,6 +26,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Contain and clean up](#contain-and-clean-up)
   - [Respond to a compromised agent](#respond-to-a-compromised-agent)
   - [Check Conditional Access for agents](#check-conditional-access-for-agents)
+  - [Agent users and licenses](#agent-users-and-licenses)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -48,6 +49,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Accountability | Give Entra agent identities a sponsor (and optionally an owner), proposed from the owner chain | `-Accountability`, `-AddSponsor` |
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
+| Agent users | Which users interacted with which agent in the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license | `-AgentUsers` |
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
@@ -430,6 +432,24 @@ Read-only. For each agent it answers one question: would Microsoft Entra Conditi
 - **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
 - **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below. With nothing ticked it checks every agent that has an Entra identity.
 
+### Agent users and licenses
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -AgentUsers                                  # last 30 days, every agent
+.\Agent365-Bulk-Actions.ps1 -AgentUsers -UserDays 7                      # last 7 days (7, 14 or 30)
+.\Agent365-Bulk-Actions.ps1 -AgentUsers -UserDays 14 -Unlicensed         # only users with neither an Agent 365 nor an E7 license
+.\Agent365-Bulk-Actions.ps1 -AgentUsers -ForAgent "Contoso HR Agent" -OutFile .\agent-users.csv
+```
+
+Read-only. It answers who interacts with which agent in the last 7, 14 or 30 days, and whether each of those users holds an Agent 365 or a Microsoft 365 E7 license.
+
+- **Interactions.** They come from Defender Advanced Hunting: the user-attributed `InvokeAgent`, `CopilotInteraction` and `ConnectedAIAppInteraction` events, matched to a catalog agent through every id the agent appears under (registry id, Entra agent id, observability id, source id, bot id, blueprint). One read covers all three periods. Defender keeps about 30 days, so 30 is the longest period.
+- **Output.** A summary line, a *By agent* table (users, interactions, users without a license), then a *By user* table. `-OutFile` writes one row per agent and user with the counts for 7, 14 and 30 days, the last interaction, `Licensed`, `License` and the SKUs.
+- **License.** Read from each user's license details, which include licenses assigned through groups. A user counts as licensed when they hold the `AGENT_365` plan (the standalone Agent 365 SKUs, or a bundle that contains the plan) or a SKU whose name contains E7, unless the Agent 365 plan is turned off for that user. The column says which: `Agent 365`, `E7`, `Agent 365 (in <SKU>)`, `Agent 365 plan turned off` or `None`.
+- **Accounts that are not users.** An id that is not a directory user (an agent identity, or an account since deleted) is listed by the name on the event, marked *Not applicable*, and never counted as unlicensed.
+- **Requirements.** `ThreatHunting.Read.All`, `User.Read.All` and `CopilotPackages.Read.All`, all already part of `-SignIn`. Reading license details also needs an Entra role such as License Administrator, User Administrator or Global Reader.
+- **In the console**, **Agent users...** opens the same data in a window with a 7, 14 or 30 day selector, a *No Agent 365 or E7 license only* filter, a search box and export. It covers the ticked agents, or every agent when none is ticked.
+
 ### Policy file
 
 Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
@@ -495,6 +515,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
 | Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
+| See who uses an agent | **Agent users...** lists the users who interacted with each agent over the last 7, 14 or 30 days, with whether each has an Agent 365 or E7 license. It covers the ticked agents, or every agent when none is ticked. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
@@ -530,6 +551,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-UnblockLocalAgent` | tool names (wildcards allowed) | Remove the block rule of these local AI agents on the devices in `-ForDevice`. |
 | `-EndpointAi` | switch | Local AI agents and shadow AI on Defender-onboarded devices, with telemetry and risk. |
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
+| `-AgentUsers` | switch | Which users interacted with which agent, and whether each has an Agent 365 or E7 license. Read-only. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
 | `-Policy` | path | Evaluate a JSON policy and print the plan. |
 | `-Snapshot` | path | Save the inventory to a JSON file. |
@@ -568,7 +590,9 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
 | `-AllAgents` | `-CheckConditionalAccess` | switch | Check every agent in the catalog instead of the risky ones. Not with `-ForAgent`. |
-| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess` | names and/or ids | List the individual events of these agents, or check these agents instead of the risky ones. |
+| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess`, `-AgentUsers` | names and/or ids | List the individual events of these agents, check these agents instead of the risky ones, or show only the users of these agents. |
+| `-UserDays` | `-AgentUsers` | 7, 14 or 30, default 30 | The period for interactions. |
+| `-Unlicensed` | `-AgentUsers` | switch | Only users who have neither an Agent 365 nor an E7 license. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
 | `-EndpointDays` | `-EndpointAi`, `-BlockLocalAgent` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
@@ -584,6 +608,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 ## Limitations
 
+- **Agent users counts what the audit trail can attribute.** An interaction appears only when Defender ties it to a user and the event carries an id that maps to a catalog agent. Agents that emit no user-attributed events, and events with no agent id, are not counted. Retention is about 30 days.
+- **E7 is recognised by name or by its Agent 365 plan.** The Learn licensing reference lists no E7 SKU yet, so a user counts as E7-licensed when a SKU name contains E7, and as Agent 365-licensed when a SKU carries the `AGENT_365` plan.
 - **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls, the Conditional Access policy read and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
 - **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
@@ -607,6 +633,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | Confirm compromised says "accepted" but the state is not visible | Entra applies it a minute or two after accepting it. Check the Risky agents report in Microsoft Entra, or raise `-WaitSeconds`. The Security Administrator role and `IdentityRiskyAgent.ReadWrite.All` are required. |
 | Conditional Access check says a Defender-risky agent is not blocked now | Expected. Conditional Access reads the agent risk Entra holds, which comes from Entra's own detections or from confirming the agent compromised; Defender alerts do not change it. |
 | Conditional Access check is refused | Grant `Policy.Read.All` and `IdentityRiskyAgent.Read.All` (or `IdentityRiskyAgent.ReadWrite.All`). Reading policies needs a role such as Security Reader or Conditional Access Administrator. |
+| Agent users shows nothing | The feed may be stale or the agents may not emit user-attributed events. Check the latest CloudAppEvents rows with ActionType InvokeAgent in Advanced Hunting, and widen the period. |
+| Agent users says license details could not be read | The signed-in account needs an Entra role that can read license details (License Administrator, User Administrator, Global Reader). |
 | Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
 ## Appendix: hunting queries

@@ -2291,3 +2291,127 @@ Describe 'Conditional Access check: tenant findings' {
         ($r.Rows | Where-Object Agent -eq 'Quiet').EntraRisk | Should -Be 'unknown'
     }
 }
+Describe 'Agent users' {
+    BeforeAll {
+        function New-LicenseDetail {
+            param([string]$Part, [string]$Plan = 'AGENT_365', [string]$Status = 'Success')
+            [pscustomobject]@{ skuPartNumber = $Part; servicePlans = @([pscustomobject]@{ servicePlanName = $Plan; provisioningStatus = $Status }) }
+        }
+        function New-AuRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$User = 'Ann', [string]$UserId = 'u1', [string]$Upn = 'ann@contoso.com', [string]$Kind = 'User',
+                  [int]$N7 = 0, [int]$N14 = 0, [int]$N30 = 0, $Has = $true)
+            [pscustomobject]@{ Agent = $Agent; AgentId = $AgentId; User = $User; Upn = $Upn; UserId = $UserId; Kind = $Kind; Interactions = $N30; N7 = $N7; N14 = $N14; N30 = $N30
+                               Last = [datetime]'2026-10-06 10:00'; Licensed = $(if ($Has -eq $true) { 'Yes' } elseif ($Has -eq $false) { 'No' } else { 'n/a' }); HasLicense = $Has
+                               License = $(if ($Has) { 'Agent 365' } else { 'None' }); LicenseDetail = '' }
+        }
+    }
+    It 'recognises a standalone Agent 365 license, in either SKU' {
+        $a = Get-AgentLicenseState @(New-LicenseDetail 'AGENT_365')
+        $a.Has | Should -BeTrue; $a.Label | Should -Be 'Agent 365'; $a.Detail | Should -Be 'AGENT_365'
+        $t = Get-AgentLicenseState @(New-LicenseDetail 'MICROSOFT_AGENT_365_TIER_3')
+        $t.Has | Should -BeTrue; $t.Label | Should -Be 'Agent 365'
+    }
+    It 'recognises E7 by its name, and a bundle by the Agent 365 plan it holds' {
+        $e7 = Get-AgentLicenseState @(New-LicenseDetail 'Microsoft_365_E7' -Plan 'EXCHANGE_S_ENTERPRISE')
+        $e7.Has | Should -BeTrue; $e7.Label | Should -Be 'E7'
+        (Get-AgentLicenseState @(New-LicenseDetail 'M365_E7')).Label | Should -Be 'E7'
+        $b = Get-AgentLicenseState @(New-LicenseDetail 'SOME_SUITE')
+        $b.Has | Should -BeTrue; $b.Label | Should -Be 'Agent 365 (in SOME_SUITE)'
+    }
+    It 'does not take E5 or an unrelated license for either' {
+        $n = Get-AgentLicenseState @((New-LicenseDetail 'Microsoft_365_E5_(no_Teams)' -Plan 'EXCHANGE_S_ENTERPRISE'), (New-LicenseDetail 'FLOW_FREE' -Plan 'FLOW_FREE'))
+        $n.Has | Should -BeFalse; $n.Label | Should -Be 'None'
+        (Get-AgentLicenseState @()).Label | Should -Be 'None'
+        (Get-AgentLicenseState $null).Has | Should -BeFalse
+    }
+    It 'joins several licenses and does not count one whose Agent 365 plan is turned off' {
+        $both = Get-AgentLicenseState @((New-LicenseDetail 'Microsoft_365_E7' -Plan 'X'), (New-LicenseDetail 'AGENT_365'))
+        $both.Label | Should -Be 'E7 + Agent 365'; $both.Detail | Should -Be 'Microsoft_365_E7, AGENT_365'
+        $off = Get-AgentLicenseState @(New-LicenseDetail 'AGENT_365' -Status 'Disabled')
+        $off.Has | Should -BeFalse; $off.Label | Should -Be 'Agent 365 plan turned off'; $off.Detail | Should -Be 'AGENT_365'
+        (Get-AgentLicenseState @((New-LicenseDetail 'AGENT_365' -Status 'Disabled'), (New-LicenseDetail 'MICROSOFT_AGENT_365_TIER_3'))).Has | Should -BeTrue
+    }
+    It 'reads each account once, with its name, type and license, and copes with ids that are not users' {
+        Mock Invoke-GraphBatch {
+            $script:sent = @($Requests)
+            @{
+                'u:a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'Ann'; userPrincipalName = 'ann@contoso.com'; userType = 'Member' } }
+                'l:a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @(New-LicenseDetail 'AGENT_365') } }
+                'u:b' = [pscustomobject]@{ Status = 404; Body = $null }
+                'l:b' = [pscustomobject]@{ Status = 404; Body = $null }
+                'u:c' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'Gus'; userPrincipalName = 'gus_x#EXT#@contoso.com'; userType = 'Guest' } }
+                'l:c' = [pscustomobject]@{ Status = 403; Body = $null }
+            }
+        }
+        $acc = Get-AgentUserAccounts -UserIds @('a', 'b', 'c', 'a', '')
+        @($script:sent).Count | Should -Be 6
+        @($script:sent | ForEach-Object { $_.id } | Get-Distinct).Count | Should -Be 6
+        $acc['a'].Found | Should -BeTrue; $acc['a'].Name | Should -Be 'Ann'; $acc['a'].Kind | Should -Be 'User'; $acc['a'].Has | Should -BeTrue; $acc['a'].License | Should -Be 'Agent 365'
+        $acc['b'].Found | Should -BeFalse; $acc['b'].Kind | Should -Be 'Not a directory user'; $acc['b'].Has | Should -BeNullOrEmpty; $acc['b'].License | Should -Be 'Not applicable'
+        $acc['c'].Kind | Should -Be 'Guest'; $acc['c'].Has | Should -BeNullOrEmpty; $acc['c'].License | Should -BeLike 'Unknown*'
+    }
+    It 'asks Defender for user-attributed agent events and returns counts for 7, 14 and 30 days' {
+        $script:AgentUserKql | Should -BeLike '*"InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction"*'
+        $script:AgentUserKql | Should -BeLike '*isnotempty(AccountObjectId)*'
+        $script:AgentUserKql | Should -BeLike '*N7 = countif(Timestamp > ago(7d))*N14 = countif(Timestamp > ago(14d))*N30 = count()*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ CatalogId = 'T_ABC'; AccountObjectId = 'u1'; AccountName = 'Ann'; N7 = 2; N14 = 3; N30 = 5; Last = '2026-10-06T10:27:38.1234567Z' }) }
+        $r = @(Get-AgentUserInteractions)
+        $r.Count | Should -Be 1
+        $r[0].CatalogId | Should -Be 't_abc'; $r[0].UserId | Should -Be 'u1'; $r[0].N7 | Should -Be 2; $r[0].N14 | Should -Be 3; $r[0].N30 | Should -Be 5
+        $r[0].Last | Should -BeOfType ([datetime])
+    }
+    It 'names agents from the catalog, keeps unknown agents by id and limits to chosen agents' {
+        Mock Get-AgentUserInteractions {
+            @([pscustomobject]@{ CatalogId = 't_a'; UserId = 'u1'; Name = 'Ann (event)'; N7 = 1; N14 = 2; N30 = 3; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ CatalogId = 't_b'; UserId = 'u2'; Name = 'Agent Bot'; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-10-01' },
+              [pscustomobject]@{ CatalogId = 't_gone'; UserId = 'u1'; Name = 'Ann (event)'; N7 = 0; N14 = 1; N30 = 1; Last = [datetime]'2026-09-30' })
+        }
+        Mock Get-AgentUserAccounts {
+            @{ 'u1' = [pscustomobject]@{ Found = $true; Name = 'Ann'; Upn = 'ann@contoso.com'; Kind = 'User'; Has = $true; License = 'Agent 365'; Detail = 'AGENT_365' }
+               'u2' = [pscustomobject]@{ Found = $false; Name = ''; Upn = ''; Kind = 'Not a directory user'; Has = $null; License = 'Not applicable'; Detail = '' } }
+        }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $all = Get-AgentUsersReport -Packages $pk
+        $all.Rows.Count | Should -Be 3
+        $a = $all.Rows | Where-Object AgentId -eq 'T_A'
+        $a.Agent | Should -Be 'Alpha'; $a.User | Should -Be 'Ann'; $a.Upn | Should -Be 'ann@contoso.com'; $a.Licensed | Should -Be 'Yes'; $a.N7 | Should -Be 1; $a.N30 | Should -Be 3
+        $b = $all.Rows | Where-Object AgentId -eq 'T_B'
+        $b.User | Should -Be 'Agent Bot'; $b.Licensed | Should -Be 'n/a'; $b.Kind | Should -Be 'Not a directory user'
+        ($all.Rows | Where-Object AgentId -eq 't_gone').Agent | Should -Be 't_gone'
+        $some = Get-AgentUsersReport -Packages $pk -OnlyIds @('T_A')
+        @($some.Rows).Count | Should -Be 1; $some.Rows[0].Agent | Should -Be 'Alpha'
+    }
+    It 'selects the rows of one period, only the unlicensed, or those matching a text' {
+        $rows = @(
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Ann' -UserId 'u1' -N7 2 -N14 3 -N30 5),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bob' -UserId 'u2' -Upn 'bob@contoso.com' -N7 0 -N14 1 -N30 9 -Has $false),
+            (New-AuRow -Agent 'Beta' -AgentId 'T_B' -User 'Cy' -UserId 'u3' -Upn 'cy@contoso.com' -N7 0 -N14 0 -N30 2 -Has $null -Kind 'Not a directory user'))
+        $d7 = @(Select-AgentUserRows -Rows $rows -Days 7)
+        $d7.Count | Should -Be 1; $d7[0].User | Should -Be 'Ann'; $d7[0].Interactions | Should -Be 2
+        $d14 = @(Select-AgentUserRows -Rows $rows -Days 14)
+        $d14.Count | Should -Be 2; ($d14 | Where-Object User -eq 'Bob').Interactions | Should -Be 1
+        $d30 = @(Select-AgentUserRows -Rows $rows -Days 30)
+        $d30.Count | Should -Be 3
+        ($d30 | ForEach-Object { $_.User }) | Should -Be @('Bob', 'Ann', 'Cy')   # by agent, then the most interactions first
+        @(Select-AgentUserRows -Rows $rows -Days 30 -UnlicensedOnly).User | Should -Be @('Bob')
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text 'BOB').Count | Should -Be 1
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text 'beta').User | Should -Be @('Cy')
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+        $rows[0].Interactions | Should -Be 5   # the report's own rows are left as they were
+    }
+    It 'counts users, agents, interactions and the users without a license, apart from accounts that are not users' {
+        $rows = @(
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Ann' -UserId 'u1' -N30 5),
+            (New-AuRow -Agent 'Beta' -AgentId 'T_B' -User 'Ann' -UserId 'u1' -N30 3),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bob' -UserId 'u2' -Upn 'bob@contoso.com' -N30 9 -Has $false),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bot' -UserId 'u3' -Upn '' -N30 2 -Has $null -Kind 'Not a directory user'))
+        $s = Get-AgentUserSummary $rows
+        $s.Users | Should -Be 2; $s.Agents | Should -Be 2; $s.Interactions | Should -Be 19; $s.OtherAccounts | Should -Be 1; $s.Unlicensed | Should -Be 1
+        $s.UnlicensedNames | Should -Be @('bob@contoso.com')
+        $by = @(Get-AgentUserByAgent $rows)
+        $by.Count | Should -Be 2
+        $by[0].Agent | Should -Be 'Alpha'; $by[0].Users | Should -Be 3; $by[0].Interactions | Should -Be 16; $by[0].Unlicensed | Should -Be 1
+        $by[1].Agent | Should -Be 'Beta'; $by[1].Unlicensed | Should -Be 0
+        (Get-AgentUserSummary @()).Interactions | Should -Be 0
+    }
+}
