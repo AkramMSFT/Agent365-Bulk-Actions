@@ -86,7 +86,7 @@ cd C:\Path\To\Scripts
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-**Signing in.** `-SignIn` starts the sign-in from the terminal and keeps the session for your Windows account. Microsoft Entra offers no way to type an administrator's password into a terminal (accounts with multi-factor authentication cannot use it, and this tool never handles a password), so the sign-in itself is completed in the Microsoft sign-in window that opens. After that, every mode, scheduled runs included, reuses the saved session silently until it expires or is revoked. A run that cannot show a window and has no saved session stops with a message that tells you to run `-SignIn`. `-DeviceCode` prints a code instead of opening a window, but the code must be entered within two minutes.
+**Signing in.** `-SignIn` starts the sign-in from the terminal and keeps the session for your Windows account. Microsoft Entra offers no way to type an administrator's password into a terminal (accounts with multi-factor authentication cannot use it, and this tool never handles a password), so the sign-in itself is completed in the Microsoft sign-in window that opens. After that, every mode, scheduled runs included, reuses the saved session silently until it expires or is revoked. Where no window can be shown and you are at the terminal (an SSH or Cloud Shell session, a Linux machine with no desktop, a window that fails to open), the tool falls back to a **device code** by itself: it prints a short code, you open https://microsoft.com/devicelogin on any device, enter the code and finish the sign-in. A code works for about two minutes, and the tool asks for a new one up to three times. `-DeviceCode` uses a code from the start. A run nobody can answer (a scheduled task) cannot use a code, so without a saved session it stops with a message that tells you to run `-SignIn`.
 
 Add `-TenantId <guid-or-domain>` to target a specific tenant. Everything that changes something prints what it will do, asks once (use `-Force` to skip the question) and can write a log with `-OutFile`.
 
@@ -570,7 +570,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-WhatIf` | any write | switch | Show what would change; change nothing. |
 | `-OutFile` | most modes | path (.csv or .json) | Write a result log, or export the result. |
 | `-TenantId` | all | GUID or domain | Target a specific tenant. |
-| `-DeviceCode` | all | switch | Print a device code instead of opening a sign-in window. The code expires after two minutes; `-SignIn` is the more reliable route. |
+| `-DeviceCode` | all | switch | Sign in with a device code from the start, instead of a sign-in window. Without it the tool still falls back to a code by itself where no window can be shown. A code works for about two minutes; the tool asks for a new one up to three times. |
 | `-DisableIdentity` | block, unblock | switch | Verify the Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
 | `-Impact` | block, unblock, stale, risky | switch | Show active users, sessions and last use before acting. |
 | `-StaleDays` | `-Stale` | 1 to 3650 | Age threshold in days. |
@@ -626,8 +626,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | "No package named 'X'" | Run `-List` for the exact display name or id. |
 | "Multiple packages named 'X'" | Two packages share the name; pass the exact `P_` or `T_` id. |
 | Advanced Hunting query failed | Check `ThreatHunting.Read.All` consent, an E5 or Defender license and Security for AI onboarding, or use `-By modified`. |
-| "No saved sign-in ... cannot show a sign-in window" | Run `.\Agent365-Bulk-Actions.ps1 -SignIn` in a terminal, as the same Windows account that runs the tool. |
-| The sign-in window does not appear | Look behind other windows. If it still does not open, `-DeviceCode` prints a code instead; enter it within two minutes. |
+| "No saved sign-in ... cannot show a sign-in window" | This appears only in a session nobody can answer, such as a scheduled task. Run `.\Agent365-Bulk-Actions.ps1 -SignIn` in a terminal, as the same Windows account that runs the tool. |
+| The sign-in window does not appear | When the tool can tell the window failed it switches to a device code by itself. If it just waits and nothing opens, look behind other windows, then press Ctrl+C and run again with `-DeviceCode`. |
 | `-StaleDays` of 30 or more seems to under-report | Expected: telemetry covers about 30 days. Use `-By modified` or `-IncludeNeverSeen`. |
 | Audit search is refused | Grant `AuditLogsQuery.Read.All` (admin consent) and hold a Purview audit role. |
 | Confirm compromised says "accepted" but the state is not visible | Entra applies it a minute or two after accepting it. Check the Risky agents report in Microsoft Entra, or raise `-WaitSeconds`. The Security Administrator role and `IdentityRiskyAgent.ReadWrite.All` are required. |
