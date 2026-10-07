@@ -3805,6 +3805,20 @@ $GuiXaml = @'
       </Setter>
     </Style>
 
+    <Style x:Key="ColFilter" TargetType="Button">
+      <Setter Property="Foreground" Value="#9CA3AF"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="Transparent" CornerRadius="4" Padding="5,1" Margin="6,0,0,0">
+              <TextBlock Text="{TemplateBinding Content}" Foreground="{TemplateBinding Foreground}" FontSize="11" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#E5E7EB"/></Trigger></ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <Style x:Key="Seg" TargetType="RadioButton">
       <Setter Property="Cursor" Value="Hand"/>
       <Setter Property="Template">
@@ -5159,6 +5173,95 @@ function Get-FailureSummary {
     (@($Records | Where-Object { $_.Result -eq 'Failed' } | Select-Object -First 5 | ForEach-Object { "$($_.DisplayName): $($_.Error)" }) -join "`n")
 }
 
+# ---------------------------------------------------------------------------------------------
+# Column filters on the console grid. Every column header has a small funnel that opens a box with a text search and the values the
+# column holds, with counts. Text and ticked values narrow the grid together, and the filters of different columns add up. A filter
+# lives only while its column is on screen.
+# ---------------------------------------------------------------------------------------------
+
+# One column's filter: text its cell must contain and/or the exact values it may have. An empty filter allows everything.
+function New-ColumnFilter {
+    [pscustomobject]@{ Text = ''; Values = (New-Object 'System.Collections.Generic.HashSet[string]') }
+}
+
+function Test-ColumnFilterActive {
+    param($Filter)
+    [bool]($Filter -and ($Filter.Text -or $Filter.Values.Count))
+}
+
+# The text a cell shows, for filtering. An empty cell reads as '(blank)' so it can be picked too.
+function Get-CellText {
+    param($Row, [string]$Prop)
+    $v = $Row.$Prop
+    $s = if ($null -eq $v) { '' } else { [string]$v }
+    if ($s.Trim()) { $s } else { '(blank)' }
+}
+
+function Test-ColumnFilterMatch {
+    param([string]$Cell, $Filter)
+    if ($Filter.Values.Count -and -not $Filter.Values.Contains($Cell)) { return $false }
+    if ($Filter.Text -and $Cell.IndexOf($Filter.Text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    $true
+}
+
+# The values a column holds across the rows, most common first, with counts, for the list in the filter box. Text narrows the list.
+function Get-ColumnChoices {
+    param([object[]]$Rows, [string]$Prop, [string]$Text, [int]$Max = 200)
+    $groups = @($Rows | Group-Object { Get-CellText $_ $Prop } |
+        Where-Object { -not $Text -or $_.Name.IndexOf($Text, [StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+        Sort-Object @{ e = { -$_.Count } }, Name)
+    [pscustomobject]@{ Total = $groups.Count; Items = @($groups | Select-Object -First $Max | ForEach-Object { [pscustomobject]@{ Value = $_.Name; Count = $_.Count } }) }
+}
+
+# Refill the value list of the open filter box from the rows and the text typed.
+function Update-ColumnFilterList {
+    $st = $script:colPop
+    if (-not $st) { return }
+    $choices = Get-ColumnChoices -Rows @($script:ctx.Rows) -Prop $st.Prop -Text $st.Filter.Text
+    $st.List.Children.Clear()
+    foreach ($c in $choices.Items) {
+        $cb = New-Object Windows.Controls.CheckBox
+        $cb.Content = ('{0}  ({1})' -f $c.Value, $c.Count); $cb.Tag = $c.Value; $cb.Margin = New-Object Windows.Thickness(0, 3, 0, 3)
+        $cb.IsChecked = $st.Filter.Values.Contains($c.Value)
+        $cb.Add_Checked({ param($s, $e) [void]$script:colPop.Filter.Values.Add([string]$s.Tag); & $script:ctx.ColChanged })
+        $cb.Add_Unchecked({ param($s, $e) [void]$script:colPop.Filter.Values.Remove([string]$s.Tag); & $script:ctx.ColChanged })
+        [void]$st.List.Children.Add($cb)
+    }
+    $st.Note.Text = if ($choices.Total -eq 0) { 'No value contains that text.' }
+                    elseif ($choices.Total -gt @($choices.Items).Count) { 'Showing the {0} most common of {1} values. Type to narrow the list.' -f @($choices.Items).Count, $choices.Total }
+                    else { '{0} value(s). Tick some to show only those; the text box matches part of a value.' -f $choices.Total }
+}
+
+# Open the filter box under a column's funnel.
+function Show-ColumnFilter {
+    param([string]$Header, [System.Windows.FrameworkElement]$Anchor)
+    if ($script:colPop) { $script:colPop.Popup.IsOpen = $false }
+    $f = $script:ctx.ColFilters[$Header]
+    $pop = New-Object Windows.Controls.Primitives.Popup
+    $pop.PlacementTarget = $Anchor; $pop.Placement = [Windows.Controls.Primitives.PlacementMode]::Bottom; $pop.StaysOpen = $false; $pop.AllowsTransparency = $true
+
+    $stack = New-Object Windows.Controls.StackPanel
+    $title = New-Object Windows.Controls.TextBlock; $title.Text = "Filter: $Header"; $title.FontWeight = [Windows.FontWeights]::SemiBold; $title.Margin = New-Object Windows.Thickness(0, 0, 0, 8)
+    $text = New-Object Windows.Controls.TextBox; $text.Text = $f.Text; $text.ToolTip = 'Show rows whose value contains this text.'
+    $list = New-Object Windows.Controls.StackPanel
+    $scroll = New-Object Windows.Controls.ScrollViewer; $scroll.MaxHeight = 240; $scroll.VerticalScrollBarVisibility = 'Auto'; $scroll.Content = $list; $scroll.Margin = New-Object Windows.Thickness(0, 8, 0, 0)
+    $note = New-Object Windows.Controls.TextBlock; $note.TextWrapping = 'Wrap'; $note.Foreground = [Windows.Media.Brushes]::Gray; $note.FontSize = 11.5; $note.Margin = New-Object Windows.Thickness(0, 8, 0, 0)
+    $clear = New-Object Windows.Controls.Button; $clear.Content = 'Clear this filter'; $clear.Style = $script:w.FindResource('BtnLink'); $clear.HorizontalAlignment = 'Left'; $clear.Margin = New-Object Windows.Thickness(0, 6, 0, 0)
+    foreach ($el in $title, $text, $scroll, $note, $clear) { [void]$stack.Children.Add($el) }
+
+    $box = New-Object Windows.Controls.Border
+    $box.Background = [Windows.Media.Brushes]::White; $box.BorderBrush = (New-Object Windows.Media.BrushConverter).ConvertFromString('#D1D5DB'); $box.BorderThickness = New-Object Windows.Thickness(1)
+    $box.CornerRadius = New-Object Windows.CornerRadius(8); $box.Padding = New-Object Windows.Thickness(12); $box.Width = 300; $box.Child = $stack
+    $pop.Child = $box
+
+    $script:colPop = @{ Popup = $pop; Header = $Header; Prop = $script:ctx.ColProp[$Header]; Filter = $f; List = $list; Note = $note; Text = $text; Box = $box }
+    $text.Add_TextChanged({ param($s, $e) $script:colPop.Filter.Text = $s.Text.Trim(); Update-ColumnFilterList; & $script:ctx.ColChanged })
+    $clear.Add_Click({ param($s, $e) $st = $script:colPop; $st.Filter.Text = ''; $st.Filter.Values.Clear(); $st.Text.Text = ''; Update-ColumnFilterList; & $script:ctx.ColChanged })
+    Update-ColumnFilterList
+    $pop.IsOpen = $true
+    [void]$text.Focus()
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
@@ -5244,6 +5347,7 @@ function New-ConsoleWindow {
         if ($script:ui.FltActive.IsChecked  -and $o.IsBlocked)       { return $false }
         if ($script:ui.FltBlocked.IsChecked -and -not $o.IsBlocked)  { return $false }
         if ($script:ui.AgentsOnlyBox.IsChecked -and $o.Hosts -notmatch 'Copilot') { return $false }
+        foreach ($a in $script:ctx.ColActive) { if (-not (Test-ColumnFilterMatch (Get-CellText $o $a.Prop) $a.Filter)) { return $false } }
         foreach ($s in $script:ctx.OwnerSet, $script:ctx.BlockedSet, $script:ctx.ToolsSet, $script:ctx.PermSet, $script:ctx.AccessSet) {
             if ($null -ne $s -and -not $s.Contains($o.Id)) { return $false }
         }
@@ -5259,10 +5363,54 @@ function New-ConsoleWindow {
     }
     $script:ctx.View.Filter = [Predicate[object]]$script:ctx.Filter
 
+    # Column filters (see Show-ColumnFilter): one filter per column, kept while the column is on screen.
+    $script:ctx.ColFilters = @{}; $script:ctx.ColProp = @{}; $script:ctx.ColName = @{}; $script:ctx.ColButton = @{}; $script:ctx.ColActive = @()
+    # Work out which filters are on and show it on the funnels: a filled blue one for a filtered column.
+    $script:ctx.ColRecalc = {
+        $script:ctx.ColActive = @($script:ctx.ColFilters.GetEnumerator() | Where-Object { Test-ColumnFilterActive $_.Value } |
+            ForEach-Object { [pscustomobject]@{ Header = $_.Key; Prop = $script:ctx.ColProp[$_.Key]; Filter = $_.Value } })
+        foreach ($h in @($script:ctx.ColButton.Keys)) {
+            $b = $script:ctx.ColButton[$h]; $on = Test-ColumnFilterActive $script:ctx.ColFilters[$h]
+            $b.Content = [string][char]$(if ($on) { 0x25BC } else { 0x25BE })
+            $b.Foreground = (New-Object Windows.Media.BrushConverter).ConvertFromString($(if ($on) { '#0F6CBD' } else { '#9CA3AF' }))
+            $b.ToolTip = if ($on) { 'Filtered. Click to change or clear this filter.' } else { 'Filter this column' }
+        }
+    }
+    $script:ctx.ColChanged = {
+        & $script:ctx.ColRecalc
+        & $script:ctx.Refilter
+        $on = @($script:ctx.ColActive)
+        & $script:ctx.Idle $(if ($on.Count) { "{0} agent(s) shown, filtered on {1}." -f @($script:ctx.View).Count, (($on | ForEach-Object { $_.Header }) -join ', ') } else { 'Column filters cleared.' })
+    }
+    $script:ctx.ColClearAll = {
+        if ($script:colPop) { $script:colPop.Popup.IsOpen = $false }
+        foreach ($f in @($script:ctx.ColFilters.Values)) { $f.Text = ''; $f.Values.Clear() }
+        & $script:ctx.ColRecalc
+    }
+    # Give every column that shows text a header with a funnel; the label stays a label, so clicking it still sorts.
+    $script:ctx.InitColumnFilters = {
+        foreach ($c in $script:ui.Grid.Columns) {
+            if ($c.Header -isnot [string]) { continue }
+            $name = [string]$c.Header
+            $prop = if ($c -is [Windows.Controls.DataGridBoundColumn]) { [string]$c.Binding.Path.Path } elseif ($name -in 'Status', 'Risk') { $name } else { '' }
+            if (-not $prop) { continue }
+            $script:ctx.ColName[$c] = $name; $script:ctx.ColProp[$name] = $prop; $script:ctx.ColFilters[$name] = New-ColumnFilter
+            $label = New-Object Windows.Controls.TextBlock; $label.Text = $name; $label.VerticalAlignment = 'Center'
+            $btn = New-Object Windows.Controls.Button; $btn.Style = $script:w.FindResource('ColFilter'); $btn.Tag = $name
+            $btn.Add_Click({ param($s, $e) Show-ColumnFilter -Header ([string]$s.Tag) -Anchor $s })
+            $panel = New-Object Windows.Controls.StackPanel; $panel.Orientation = 'Horizontal'
+            [void]$panel.Children.Add($label); [void]$panel.Children.Add($btn)
+            $script:ctx.ColButton[$name] = $btn
+            $c.Header = $panel
+        }
+        & $script:ctx.ColRecalc
+    }
+    & $script:ctx.InitColumnFilters
+
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
                $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
-               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet -or $null -ne $script:ctx.AccessSet)
+               $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet -or $null -ne $script:ctx.AccessSet -or @($script:ctx.ColActive).Count -gt 0)
     }
     $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary; & $script:ctx.Columns; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
 
@@ -5308,7 +5456,7 @@ function New-ConsoleWindow {
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
         $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
         $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0; $script:ui.ToolsBox.SelectedIndex = 0; $script:ui.PermBox.SelectedIndex = 0; $script:ui.AccessBox.SelectedIndex = 0
-        & $script:ctx.ClearAccess; & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm
+        & $script:ctx.ClearAccess; & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm; & $script:ctx.ColClearAll
         $script:ctx.Resetting = $false
     }
 
@@ -5407,9 +5555,15 @@ function New-ConsoleWindow {
             'Permissions held' = ($null -ne $script:ctx.PermSet)
             'Available to' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.AccessSet)
         }
+        $dropped = $false
         foreach ($c in $script:ui.Grid.Columns) {
-            if ($c.Header -is [string] -and $on.ContainsKey($c.Header)) { $c.Visibility = if ($on[$c.Header]) { 'Visible' } else { 'Collapsed' } }
+            $h = if ($script:ctx.ColName.ContainsKey($c)) { $script:ctx.ColName[$c] } elseif ($c.Header -is [string]) { $c.Header } else { $null }
+            if ($h -and $on.ContainsKey($h)) {
+                $c.Visibility = if ($on[$h]) { 'Visible' } else { 'Collapsed' }
+                if (-not $on[$h] -and $script:ctx.ColFilters.ContainsKey($h) -and (Test-ColumnFilterActive $script:ctx.ColFilters[$h])) { $script:ctx.ColFilters[$h].Text = ''; $script:ctx.ColFilters[$h].Values.Clear(); $dropped = $true }
+            }
         }
+        if ($dropped) { & $script:ctx.ColRecalc; $script:ctx.View.Refresh(); & $script:ctx.Summary }
     }
 
     $script:ctx.ClearOwner = {

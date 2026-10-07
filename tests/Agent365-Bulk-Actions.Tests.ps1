@@ -2495,3 +2495,62 @@ Describe 'Sign-in fallback' {
         Test-SignInPromptPossible | Should -BeOfType ([bool])
     }
 }
+
+Describe 'Column filters' {
+    BeforeAll {
+        function New-CfRow { param([string]$Name, [string]$Kind, [string]$Platform = '', $Owner = $null) [pscustomobject]@{ Name = $Name; Kind = $Kind; Platform = $Platform; Owner = $Owner } }
+        $script:cfRows = @(
+            (New-CfRow 'Alpha Agent' 'Org-published' 'Copilot Studio' 'ann'),
+            (New-CfRow 'Beta bot' 'Org-published' 'Foundry'),
+            (New-CfRow 'Gamma Agent' 'Microsoft' 'Copilot Studio' 'bob'),
+            (New-CfRow 'Delta' 'Shared by a creator' '  '),
+            (New-CfRow 'Epsilon' 'Org-published' 'Copilot Studio' 'ann'))
+    }
+    It 'starts empty and is active once it holds text or values' {
+        $f = New-ColumnFilter
+        Test-ColumnFilterActive $f | Should -BeFalse
+        $f.Text = 'x'; Test-ColumnFilterActive $f | Should -BeTrue
+        $f.Text = ''; [void]$f.Values.Add('v'); Test-ColumnFilterActive $f | Should -BeTrue
+        $f.Values.Clear(); Test-ColumnFilterActive $f | Should -BeFalse
+        Test-ColumnFilterActive $null | Should -BeFalse
+    }
+    It 'reads an empty or missing cell as (blank)' {
+        Get-CellText $script:cfRows[1] 'Owner' | Should -Be '(blank)'
+        Get-CellText $script:cfRows[3] 'Platform' | Should -Be '(blank)'
+        Get-CellText $script:cfRows[0] 'Owner' | Should -Be 'ann'
+        Get-CellText $script:cfRows[0] 'NoSuchColumn' | Should -Be '(blank)'
+    }
+    It 'matches by part of the text, ignoring case' {
+        $f = New-ColumnFilter; $f.Text = 'AGENT'
+        Test-ColumnFilterMatch 'Alpha Agent' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Beta bot' $f | Should -BeFalse
+    }
+    It 'matches by the exact values ticked, and by both together' {
+        $f = New-ColumnFilter; [void]$f.Values.Add('Org-published'); [void]$f.Values.Add('Microsoft')
+        Test-ColumnFilterMatch 'Org-published' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Org' $f | Should -BeFalse
+        Test-ColumnFilterMatch 'Shared by a creator' $f | Should -BeFalse
+        $f.Text = 'micro'
+        Test-ColumnFilterMatch 'Microsoft' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Org-published' $f | Should -BeFalse
+    }
+    It 'lets a blank cell be picked' {
+        $f = New-ColumnFilter; [void]$f.Values.Add('(blank)')
+        @($script:cfRows | Where-Object { Test-ColumnFilterMatch (Get-CellText $_ 'Owner') $f }).Name | Should -Be @('Beta bot', 'Delta')
+    }
+    It 'lists the values of a column with counts, most common first' {
+        $c = Get-ColumnChoices -Rows $script:cfRows -Prop 'Kind'
+        $c.Total | Should -Be 3
+        ($c.Items | ForEach-Object { '{0}={1}' -f $_.Value, $_.Count }) | Should -Be @('Org-published=3', 'Microsoft=1', 'Shared by a creator=1')
+        $o = Get-ColumnChoices -Rows $script:cfRows -Prop 'Owner'
+        ($o.Items | ForEach-Object { '{0}={1}' -f $_.Value, $_.Count }) | Should -Be @('(blank)=2', 'ann=2', 'bob=1')   # a tie is broken by name
+    }
+    It 'narrows the list by text and caps it, reporting the full number of values' {
+        $n = Get-ColumnChoices -Rows $script:cfRows -Prop 'Platform' -Text 'copil'
+        $n.Total | Should -Be 1; $n.Items[0].Value | Should -Be 'Copilot Studio'; $n.Items[0].Count | Should -Be 3
+        (Get-ColumnChoices -Rows $script:cfRows -Prop 'Platform' -Text 'zzz').Total | Should -Be 0
+        $many = 1..30 | ForEach-Object { New-CfRow "Agent $_" 'k' }
+        $cap = Get-ColumnChoices -Rows $many -Prop 'Name' -Max 10
+        $cap.Total | Should -Be 30; @($cap.Items).Count | Should -Be 10
+    }
+}
