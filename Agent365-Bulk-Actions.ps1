@@ -69,6 +69,10 @@
   or -AllAgents for every agent in the catalog, summarised by the policies that cover them.
 
 .EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -AgentUsers -UserDays 14
+  Which users interacted with which agent in the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. -Unlicensed lists only users without one; -ForAgent <name> limits it to chosen agents.
+
+.EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
   Have Defender stop and quarantine a local AI agent on one device. -UnblockLocalAgent or -Undo <log> removes the rule.
 
@@ -144,7 +148,8 @@ param(
 
     [Parameter(ParameterSetName = 'AiActivity')]
     [Parameter(ParameterSetName = 'CaCheck')]
-    [string[]]$ForAgent,                    # AI activity: show the individual events of these agents. Conditional Access check: check these agents (names or ids) instead of every risky one
+    [Parameter(ParameterSetName = 'AgentUsers')]
+    [string[]]$ForAgent,                    # AI activity: show the individual events of these agents. Conditional Access check: check these agents (names or ids) instead of every risky one. Agent users: only these agents
 
     [Parameter(ParameterSetName = 'AiActivity')]
     [ValidateRange(1, 180)]
@@ -314,6 +319,16 @@ param(
     [Parameter(ParameterSetName = 'CaCheck')]
     [switch]$AllAgents,                     # Conditional Access check: every agent in the catalog, not only the risky ones
 
+    [Parameter(ParameterSetName = 'AgentUsers', Mandatory)]
+    [switch]$AgentUsers,                    # which users interacted with which agent, and whether each has an Agent 365 or E7 license
+
+    [Parameter(ParameterSetName = 'AgentUsers')]
+    [ValidateSet(7, 14, 30)]
+    [int]$UserDays = 30,                    # agent users: the period in days (Defender keeps about 30)
+
+    [Parameter(ParameterSetName = 'AgentUsers')]
+    [switch]$Unlicensed,                    # agent users: only users who have neither an Agent 365 nor an E7 license
+
     [Parameter(ParameterSetName = 'BlockLocalAgent', Mandatory)]
     [string[]]$BlockLocalAgent,             # have Defender stop and quarantine these local AI agents (names, wildcards allowed) on the devices in -ForDevice
 
@@ -406,6 +421,7 @@ if ($PSCmdlet.ParameterSetName -eq 'BlockLocalAgent') { $scopes = @('ThreatHunti
 if ($PSCmdlet.ParameterSetName -eq 'UnblockLocalAgent') { $scopes = @('CustomDetection.ReadWrite.All') }
 if ($PSCmdlet.ParameterSetName -eq 'CaCheck') { $scopes = @('CopilotPackages.Read.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'ThreatHunting.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blocklocalagent')) { $scopes += 'CustomDetection.ReadWrite.All' }
+if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if ($DeviceCode) { $connect['UseDeviceCode'] = $true }
@@ -1993,6 +2009,181 @@ function Get-AgentCaDetailRows {
     }
     if (-not @($Row.Policies).Count) { & $add 'Policies' '(none)' 'No Conditional Access policy targets this agent.' }
     $out.ToArray()
+}
+
+# ---------------------------------------------------------------------------------------------
+# Agent users: which users interact with which agent over the last 7, 14 or 30 days, and whether each holds an Agent 365 or a
+# Microsoft 365 E7 license. Interactions are the user-attributed agent events in Defender Advanced Hunting (CloudAppEvents),
+# matched to a catalog agent through every id an agent appears under. Licenses come from each user's license details, which
+# include licenses assigned through groups. Read-only.
+# ---------------------------------------------------------------------------------------------
+$script:AgentUserKql = @'
+let inv = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | project CatalogId = tolower(tostring(r.titleId)),
+              Keys = pack_array(tolower(tostring(AgentId)), tolower(tostring(EntraAgentID)), tolower(tostring(ObservabilityID)),
+                                tolower(tostring(SourceAgentId)), tolower(tostring(r.botId)))
+    | mv-expand Key = Keys to typeof(string)
+    | where isnotempty(Key) and isnotempty(CatalogId)
+    | distinct CatalogId, Key;
+let blueprints = AgentsInfo
+    | summarize arg_max(Timestamp, *) by AgentId
+    | extend r = todynamic(RawAgentInfo)
+    | where isnotempty(EntraBlueprintID) and isnotempty(tostring(r.titleId))
+    | summarize CatalogId = take_any(tolower(tostring(r.titleId))), Agents = dcount(AgentId) by Key = tolower(tostring(EntraBlueprintID))
+    | where Agents == 1
+    | project CatalogId, Key;
+let ev = CloudAppEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction")
+    | where isnotempty(AccountObjectId)
+    | extend d = todynamic(RawEventData)
+    | extend EventId = tostring(d.Id),
+             K = tolower(tostring(iff(ActionType == "InvokeAgent", d.TargetAgentId, d.AgentId))),
+             P = tolower(tostring(iff(ActionType == "InvokeAgent", d.PlatformTargetAgentId, d.PlatformAgentId))),
+             B = tolower(tostring(iff(ActionType == "InvokeAgent", d.TargetAgentBlueprintID, d.AgentBlueprintId)))
+    | where isnotempty(EventId)
+    | project Timestamp, AccountObjectId, AccountDisplayName, EventId, K, P, B;
+let direct = union
+    (ev | where isnotempty(K) | join kind=inner inv on $left.K == $right.Key),
+    (ev | where isnotempty(P) | join kind=inner inv on $left.P == $right.Key);
+union direct, (ev | join kind=leftanti direct on EventId | where isnotempty(B) | join kind=inner blueprints on $left.B == $right.Key)
+| summarize arg_max(Timestamp, AccountObjectId, AccountDisplayName, CatalogId) by EventId
+| summarize N7 = countif(Timestamp > ago(7d)), N14 = countif(Timestamp > ago(14d)), N30 = count(), Last = max(Timestamp), AccountName = take_any(AccountDisplayName)
+    by CatalogId, AccountObjectId
+| order by N30 desc
+'@
+
+# Interactions per agent and user over the last 30 days, with the counts for 7, 14 and 30 days.
+function Get-AgentUserInteractions {
+    $rows = Invoke-HuntingQuery -Query $script:AgentUserKql -Hint 'Check ThreatHunting.Read.All consent, an E5/Defender license, and that Security for AI is onboarded.'
+    @($rows | ForEach-Object {
+        [pscustomobject]@{
+            CatalogId = ([string]$_.CatalogId).ToLowerInvariant(); UserId = [string]$_.AccountObjectId; Name = [string]$_.AccountName
+            N7 = [int]$_.N7; N14 = [int]$_.N14; N30 = [int]$_.N30; Last = (ConvertTo-EndpointTime $_.Last)
+        }
+    })
+}
+
+# One user's Agent 365 or E7 license, from their license details (direct and group-assigned). A license counts unless its Agent 365
+# plan is turned off. E7 is recognised by the SKU name, because the plans inside a bundle can change.
+function Get-AgentLicenseState {
+    param([object[]]$Details)
+    $have = New-Object 'System.Collections.Generic.List[string]'
+    $skus = New-Object 'System.Collections.Generic.List[string]'
+    $off = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($d in @($Details)) {
+        $part = [string]$d.skuPartNumber
+        $plan = @($d.servicePlans | Where-Object { $_.servicePlanName -eq 'AGENT_365' })[0]
+        $isE7 = $part -match '(?i)(^|[^a-z0-9])E7($|[^a-z0-9])'
+        $isAgent = $part -match '(?i)AGENT_365'
+        if (-not ($isE7 -or $isAgent -or $plan)) { continue }
+        if ($plan -and [string]$plan.provisioningStatus -eq 'Disabled') { $off.Add($part); continue }
+        $skus.Add($part)
+        $label = if ($isE7) { 'E7' } elseif ($isAgent) { 'Agent 365' } else { "Agent 365 (in $part)" }
+        if (-not $have.Contains($label)) { $have.Add($label) }
+    }
+    if ($have.Count) { [pscustomobject]@{ Has = $true; Label = ($have -join ' + '); Detail = ($skus -join ', ') } }
+    elseif ($off.Count) { [pscustomobject]@{ Has = $false; Label = 'Agent 365 plan turned off'; Detail = ($off -join ', ') } }
+    else { [pscustomobject]@{ Has = $false; Label = 'None'; Detail = '' } }
+}
+
+# Name, account type and license of each account that appears in the interactions. An id that is not a directory user (an agent
+# identity, or an account that has been deleted) has no license to check.
+function Get-AgentUserAccounts {
+    param([string[]]$UserIds)
+    $ids = @($UserIds | Where-Object { $_ } | Get-Distinct)
+    $accounts = @{}
+    if ($ids.Count -eq 0) { return $accounts }
+    $requests = foreach ($id in $ids) {
+        @{ id = "u:$id"; method = 'GET'; url = ('/users/{0}?$select=id,displayName,userPrincipalName,userType,accountEnabled' -f $id) }
+        @{ id = "l:$id"; method = 'GET'; url = "/users/$id/licenseDetails" }
+    }
+    $res = Invoke-GraphBatch -Version v1.0 -Requests @($requests) -Activity 'Reading users and their licenses'
+    foreach ($id in $ids) {
+        $u = $res["u:$id"]; $l = $res["l:$id"]
+        if ($u -and $u.Status -eq 200) {
+            $b = $u.Body
+            $lic = if ($l -and $l.Status -eq 200) { Get-AgentLicenseState @($l.Body.value) }
+                   else { [pscustomobject]@{ Has = $null; Label = 'Unknown (license details could not be read)'; Detail = '' } }
+            $kind = if ("$($b.'@odata.type')" -match 'agentUser') { 'Agent user' } elseif ([string]$b.userType -eq 'Guest') { 'Guest' } else { 'User' }
+            $accounts[$id] = [pscustomobject]@{ Found = $true; Name = [string]$b.displayName; Upn = [string]$b.userPrincipalName; Kind = $kind
+                                                Has = $lic.Has; License = $lic.Label; Detail = $lic.Detail }
+        } else {
+            $accounts[$id] = [pscustomobject]@{ Found = $false; Name = ''; Upn = ''; Kind = 'Not a directory user'; Has = $null; License = 'Not applicable'; Detail = '' }
+        }
+    }
+    $accounts
+}
+
+# Everything for the last 30 days: one row per agent and user. -OnlyIds limits it to chosen catalog agents.
+function Get-AgentUsersReport {
+    param([object[]]$Packages, [string[]]$OnlyIds, [scriptblock]$OnStatus)
+    $say = { param($m) if ($OnStatus) { & $OnStatus $m } }
+    & $say 'Reading agent interactions from Microsoft Defender Advanced Hunting...'
+    $inter = @(Get-AgentUserInteractions)
+    if ($OnlyIds) { $keep = @($OnlyIds | ForEach-Object { ([string]$_).ToLowerInvariant() }); $inter = @($inter | Where-Object { $keep -contains $_.CatalogId }) }
+    $byId = @{}
+    foreach ($p in @($Packages)) { $byId[([string]$p.id).ToLowerInvariant()] = $p }
+    & $say ('Reading {0} account(s) and their licenses...' -f @($inter | ForEach-Object { $_.UserId } | Get-Distinct).Count)
+    $accounts = Get-AgentUserAccounts -UserIds @($inter | ForEach-Object { $_.UserId })
+    $rows = foreach ($i in $inter) {
+        $a = $accounts[$i.UserId]; $p = $byId[$i.CatalogId]
+        [pscustomobject]@{
+            Agent = $(if ($p) { [string]$p.displayName } else { $i.CatalogId }); AgentId = $(if ($p) { [string]$p.id } else { $i.CatalogId })
+            User = $(if ($a.Name) { $a.Name } else { $i.Name }); Upn = $a.Upn; UserId = $i.UserId; Kind = $a.Kind
+            Interactions = $i.N30; N7 = $i.N7; N14 = $i.N14; N30 = $i.N30; Last = $i.Last
+            Licensed = $(if ($a.Has -eq $true) { 'Yes' } elseif ($a.Has -eq $false) { 'No' } else { 'n/a' })
+            HasLicense = $a.Has; License = $a.License; LicenseDetail = $a.Detail
+        }
+    }
+    [pscustomobject]@{ Rows = @($rows) }
+}
+
+# The rows of one period (7, 14 or 30 days): users with at least one interaction in it, the count for that period in Interactions,
+# optionally only users without an Agent 365 or E7 license, or whose agent, name or account contains the text.
+function Select-AgentUserRows {
+    param([object[]]$Rows, [ValidateSet(7, 14, 30)][int]$Days = 30, [switch]$UnlicensedOnly, [string]$Text)
+    $col = "N$Days"
+    $picked = foreach ($r in @($Rows)) {
+        if ($r.$col -le 0) { continue }
+        if ($UnlicensedOnly -and $r.HasLicense -ne $false) { continue }
+        if ($Text -and ("$($r.Agent) $($r.User) $($r.Upn)").IndexOf($Text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $copy = $r | Select-Object *
+        $copy.Interactions = [int]$r.$col
+        $copy
+    }
+    @($picked | Sort-Object Agent, @{ e = { -$_.Interactions } }, User)
+}
+
+# Counts for a set of rows. Accounts that are not directory users are counted apart, since they hold no license.
+function Get-AgentUserSummary {
+    param([object[]]$Rows)
+    $all = @($Rows)
+    $people = @($all | Where-Object { $_.Kind -ne 'Not a directory user' })
+    $without = @($people | Where-Object { $_.HasLicense -eq $false })
+    [pscustomobject]@{
+        Interactions = [int](@($all | ForEach-Object { $_.Interactions }) | Measure-Object -Sum).Sum
+        Agents = @($all | ForEach-Object { $_.AgentId } | Get-Distinct).Count
+        Users = @($people | ForEach-Object { $_.UserId } | Get-Distinct).Count
+        OtherAccounts = @($all | Where-Object { $_.Kind -eq 'Not a directory user' } | ForEach-Object { $_.UserId } | Get-Distinct).Count
+        Unlicensed = @($without | ForEach-Object { $_.UserId } | Get-Distinct).Count
+        UnlicensedNames = @($without | ForEach-Object { if ($_.Upn) { $_.Upn } else { $_.User } } | Get-Distinct)
+    }
+}
+
+# One line per agent: how many users, how many interactions, how many of those users have no Agent 365 or E7 license.
+function Get-AgentUserByAgent {
+    param([object[]]$Rows)
+    @($Rows | Group-Object AgentId | ForEach-Object {
+        $g = @($_.Group)
+        [pscustomobject]@{
+            Agent = $g[0].Agent; Users = @($g | ForEach-Object { $_.UserId } | Get-Distinct).Count
+            Interactions = [int](@($g | ForEach-Object { $_.Interactions }) | Measure-Object -Sum).Sum
+            Unlicensed = @($g | Where-Object { $_.HasLicense -eq $false } | ForEach-Object { $_.UserId } | Get-Distinct).Count
+        }
+    } | Sort-Object @{ e = { -$_.Interactions } }, Agent)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -3847,6 +4038,7 @@ $GuiXaml = @'
         <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
           <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
           <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
+          <Button x:Name="BtnAgentUsers" Content="Agent users..." Style="{StaticResource Btn}" Margin="0,0,8,0" ToolTip="Which users interacted with which agent over the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
           <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" IsEnabled="False"/>
@@ -4752,6 +4944,125 @@ function New-CaCheckWindow {
     $d
 }
 
+$AgentUsersXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Agent users" Width="1240" Height="700" MinWidth="900" MinHeight="480" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Who uses which agent"/>
+        <TextBlock x:Name="AuSummary" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap" Text="Loading..."/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="16,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <Button x:Name="BtnAuExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON, with the counts for 7, 14 and 30 days."/>
+        <Button x:Name="BtnAuLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the interactions and licenses again."/>
+        <TextBox x:Name="AuSearch" DockPanel.Dock="Right" Width="200" Height="30" Margin="12,0,0,0" VerticalContentAlignment="Center" ToolTip="Show only rows whose agent, user or account contains this text."/>
+        <CheckBox x:Name="AuUnlicensed" Content="No Agent 365 or E7 license only" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Show only users who have neither an Agent 365 nor a Microsoft 365 E7 license."/>
+        <ComboBox x:Name="AuDaysBox" DockPanel.Dock="Right" SelectedIndex="2" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Show users who interacted with an agent in this period. Defender keeps about 30 days.">
+          <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+        </ComboBox>
+        <TextBlock x:Name="AuNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+      </DockPanel>
+    </Border>
+    <DataGrid x:Name="AuGrid" Grid.Row="2" Style="{StaticResource Grid}">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Agent" Binding="{Binding Agent}" Width="1.4*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="User" Binding="{Binding User}" Width="1*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Account" Binding="{Binding Upn}" Width="2*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Type" Binding="{Binding Kind}" Width="125" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Interactions" Binding="{Binding Interactions}" Width="95" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Last interaction" Binding="{Binding Last, StringFormat=yyyy-MM-dd HH:mm}" Width="135" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Licensed" Binding="{Binding Licensed}" Width="80">
+          <DataGridTextColumn.ElementStyle>
+            <Style TargetType="TextBlock">
+              <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="#6B7280"/><Setter Property="VerticalAlignment" Value="Top"/><Setter Property="Padding" Value="0,6"/>
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding Licensed}" Value="No"><Setter Property="Foreground" Value="#B91C1C"/></DataTrigger>
+                <DataTrigger Binding="{Binding Licensed}" Value="Yes"><Setter Property="Foreground" Value="#0B6A0B"/></DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </DataGridTextColumn.ElementStyle>
+        </DataGridTextColumn>
+        <DataGridTextColumn Header="Agent 365 or E7" Binding="{Binding License}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="SKUs" Binding="{Binding LicenseDetail}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Grid.Row="3" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Padding="16,8">
+      <TextBlock TextWrapping="Wrap" Foreground="#6B7280" Text="Counts are the interactions the audit trail ties to a user and to a catalog agent; Defender keeps about 30 days. A license counts unless its Agent 365 plan is turned off. Licenses assigned through groups are included."/>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Fill the window from the report it holds, or read the report first (-Load). The period, the license filter and the search only
+# change what is shown; all three periods come from the one read.
+function Update-AgentUsersWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('AuNote'); $grid = $Window.FindName('AuGrid'); $btn = $Window.FindName('BtnAuLoad'); $summary = $Window.FindName('AuSummary')
+    if ($Load) {
+        try {
+            $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $Window.Tag = Get-AgentUsersReport -Packages $script:auState.Packages -OnlyIds $script:auState.OnlyIds -OnStatus $pump
+        } catch {
+            $note.Text = 'Could not read the agent interactions: ' + $_.Exception.Message
+            return
+        } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
+    }
+    $report = $Window.Tag
+    if (-not $report) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
+    $days = [int]$Window.FindName('AuDaysBox').SelectedItem.Tag
+    $inPeriod = @(Select-AgentUserRows -Rows $report.Rows -Days $days)
+    $shown = @(Select-AgentUserRows -Rows $report.Rows -Days $days -UnlicensedOnly:([bool]$Window.FindName('AuUnlicensed').IsChecked) -Text $Window.FindName('AuSearch').Text)
+    $grid.ItemsSource = $shown
+    $s = Get-AgentUserSummary $inPeriod
+    $summary.Text = ("Last {0} days: {1} user(s) with {2} agent(s), {3} interaction(s). {4} user(s) have no Agent 365 or E7 license.{5}" -f $days, $s.Users, $s.Agents, $s.Interactions, $s.Unlicensed,
+        $(if ($s.OtherAccounts) { " $($s.OtherAccounts) account(s) are not directory users (agent identities or deleted accounts) and need no license." } else { '' }))
+    $scope = if ($script:auState.OnlyIds.Count) { "the $($script:auState.OnlyIds.Count) ticked agent(s)" } else { 'any agent' }
+    $note.Text = if ($shown.Count) { "{0} row(s){1}." -f $shown.Count, $(if ($script:auState.OnlyIds.Count) { ", limited to $scope" } else { '' }) }
+                 else { "No user interacted with $scope in this period, or none matches the filters." }
+}
+
+function New-AgentUsersWindow {
+    param([System.Windows.Window]$Owner, [object[]]$Packages, [string[]]$OnlyIds)
+    $d = [Windows.Markup.XamlReader]::Parse($AgentUsersXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:auWindow = $d
+    $script:auState = @{ Packages = @($Packages); OnlyIds = @($OnlyIds | Where-Object { $_ }) }
+    $d.FindName('BtnAuLoad').Add_Click({ Update-AgentUsersWindow -Window $script:auWindow -Load })
+    $d.FindName('AuDaysBox').Add_SelectionChanged({ Update-AgentUsersWindow -Window $script:auWindow })
+    $d.FindName('AuUnlicensed').Add_Click({ Update-AgentUsersWindow -Window $script:auWindow })
+    $d.FindName('AuSearch').Add_TextChanged({ Update-AgentUsersWindow -Window $script:auWindow })
+    $d.FindName('BtnAuExport').Add_Click({
+        $shown = @($script:auWindow.FindName('AuGrid').ItemsSource)
+        if ($shown.Count -eq 0) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agent-users.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($shown | Select-Object Agent, User, Upn, Kind, @{ n = 'Interactions'; e = { $_.Interactions } }, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } },
+                                        Last, Licensed, License, LicenseDetail)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+    })
+    $d.Add_ContentRendered({ if (-not $script:auWindow.Tag) { Update-AgentUsersWindow -Window $script:auWindow -Load } })
+    $d
+}
+
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($DetailXaml)
@@ -4801,7 +5112,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -5268,6 +5579,10 @@ function New-ConsoleWindow {
     }
     $script:ui.BtnAi.Add_Click({ & $script:ctx.ShowDetails 'AI' })
     $script:ui.BtnEndpointAi.Add_Click({ (New-EndpointAiWindow -Owner $script:w).ShowDialog() | Out-Null })
+    $script:ui.BtnAgentUsers.Add_Click({
+        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
+        (New-AgentUsersWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
+    })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
@@ -5563,6 +5878,30 @@ switch ($PSCmdlet.ParameterSetName) {
         Export-ActionLog -Records @($rows | ForEach-Object {
             [pscustomobject]@{ Agent = $_.Agent; Id = $_.Id; IdentityId = $_.IdentityId; EntraRisk = $_.EntraRisk; Verdict = $_.Kind; Detail = $_.Verdict; BlockedNow = $_.BlockedNow; CoveredBy = (Get-AgentCaCovering $_)
                                PoliciesThatApply = (@($_.Policies | Where-Object { $_.Applies -eq 'Yes' } | ForEach-Object { '{0} [{1}{2}]' -f $_.Policy, $_.State, $(if ($_.NoEffect) { ', protects no resources' } else { '' }) }) -join '; ') } })
+    }
+    'AgentUsers' {
+        $ForAgent = ConvertTo-NameList $ForAgent
+        $pk = @(Get-Packages)
+        $only = @(if ($ForAgent) { Resolve-Packages $ForAgent -Catalog $pk | ForEach-Object { $_.id } })
+        $report = Get-AgentUsersReport -Packages $pk -OnlyIds $only -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        $inPeriod = @(Select-AgentUserRows -Rows $report.Rows -Days $UserDays)
+        if ($inPeriod.Count -eq 0) { Write-Host ("No user interacted with {0} in the last {1} days." -f $(if ($ForAgent) { 'those agents' } else { 'an agent' }), $UserDays) -ForegroundColor Yellow; break }
+        $rows = @(Select-AgentUserRows -Rows $report.Rows -Days $UserDays -UnlicensedOnly:$Unlicensed)
+        $s = Get-AgentUserSummary $inPeriod
+        Write-Host ("`nLast {0} days: {1} user(s) interacted with {2} agent(s), {3} interaction(s). {4} user(s) have no Agent 365 or E7 license." -f $UserDays, $s.Users, $s.Agents, $s.Interactions, $s.Unlicensed) -ForegroundColor Cyan
+        if ($s.OtherAccounts) { Write-Host ("{0} account(s) are not directory users (agent identities or deleted accounts) and need no license." -f $s.OtherAccounts) -ForegroundColor DarkGray }
+        if ($rows.Count) {
+            Write-Host "`nBy agent:" -ForegroundColor Cyan
+            Get-AgentUserByAgent $rows | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'users'; e = { $_.Users } }, @{ n = 'interactions'; e = { $_.Interactions } }, @{ n = 'users without license'; e = { $_.Unlicensed } } | Format-Table -AutoSize -Wrap | Out-Host
+            Write-Host 'By user:' -ForegroundColor Cyan
+            $rows | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'user'; e = { $_.User } }, @{ n = 'interactions'; e = { $_.Interactions } },
+                @{ n = 'Agent 365 or E7'; e = { $_.License } }, @{ n = 'last'; e = { if ($_.Last) { $_.Last.ToString('yyyy-MM-dd') } } } | Format-Table -AutoSize -Wrap | Out-Host
+        } else { Write-Host 'Every user who interacted with an agent in this period has an Agent 365 or E7 license.' -ForegroundColor Green }
+        if ($s.Unlicensed) { Write-Warning ("Without an Agent 365 or E7 license: {0}" -f ($s.UnlicensedNames -join '; ')) }
+        Write-Host 'Interactions are the ones the audit trail ties to a user and to a catalog agent; Defender keeps about 30 days. A license counts unless its Agent 365 plan is turned off.' -ForegroundColor DarkGray
+        Export-ActionLog -Records @($rows | ForEach-Object {
+            [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; User = $_.User; Account = $_.Upn; Type = $_.Kind; Interactions = $_.Interactions; Last7Days = $_.N7; Last14Days = $_.N14; Last30Days = $_.N30
+                               LastInteraction = $(if ($_.Last) { $_.Last.ToString('o') } else { '' }); Licensed = $_.Licensed; License = $_.License; Licenses = $_.LicenseDetail } })
     }
     'BlockLocalAgent' {
         $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
