@@ -73,6 +73,10 @@
   Which users interacted with which agent in the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. -Unlicensed lists only users without one; -ForAgent <name> limits it to chosen agents.
 
 .EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -AgentPolicyHits -HitDays 14
+  Which DLP rules matched and which DLP or Insider Risk alerts were raised on which agent in the last 7, 14 or 30 days. -ForAgent <name> limits it; -IncludeUnattributed also lists hits that name only a person.
+
+.EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
   Have Defender stop and quarantine a local AI agent on one device. -UnblockLocalAgent or -Undo <log> removes the rule.
 
@@ -149,6 +153,7 @@ param(
     [Parameter(ParameterSetName = 'AiActivity')]
     [Parameter(ParameterSetName = 'CaCheck')]
     [Parameter(ParameterSetName = 'AgentUsers')]
+    [Parameter(ParameterSetName = 'PolicyHits')]
     [string[]]$ForAgent,                    # AI activity: show the individual events of these agents. Conditional Access check: check these agents (names or ids) instead of every risky one. Agent users: only these agents
 
     [Parameter(ParameterSetName = 'AiActivity')]
@@ -329,6 +334,16 @@ param(
     [Parameter(ParameterSetName = 'AgentUsers')]
     [switch]$Unlicensed,                    # agent users: only users who have neither an Agent 365 nor an E7 license
 
+    [Parameter(ParameterSetName = 'PolicyHits', Mandatory)]
+    [switch]$AgentPolicyHits,               # which DLP rules matched and which DLP or Insider Risk alerts were raised on which agent
+
+    [Parameter(ParameterSetName = 'PolicyHits')]
+    [ValidateSet(7, 14, 30)]
+    [int]$HitDays = 30,                     # policy hits: the period in days (Defender keeps about 30)
+
+    [Parameter(ParameterSetName = 'PolicyHits')]
+    [switch]$IncludeUnattributed,           # policy hits: also list the hits that name only a person, so no agent can be named
+
     [Parameter(ParameterSetName = 'BlockLocalAgent', Mandatory)]
     [string[]]$BlockLocalAgent,             # have Defender stop and quarantine these local AI agents (names, wildcards allowed) on the devices in -ForDevice
 
@@ -372,7 +387,7 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 # Every permission the tool can use. -SignIn asks for all of them once, so no later mode has to prompt.
 $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
-                      'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All')
+                      'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All')
 
 # A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
@@ -502,6 +517,7 @@ if ($PSCmdlet.ParameterSetName -eq 'UnblockLocalAgent') { $scopes = @('CustomDet
 if ($PSCmdlet.ParameterSetName -eq 'CaCheck') { $scopes = @('CopilotPackages.Read.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'ThreatHunting.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blocklocalagent')) { $scopes += 'CustomDetection.ReadWrite.All' }
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
+if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
 if (-not $script:LoadOnly) { Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode -Fresh:($PSCmdlet.ParameterSetName -eq 'SignIn') }
@@ -2261,6 +2277,229 @@ function Get-AgentUserByAgent {
             Unlicensed = @($g | Where-Object { $_.HasLicense -eq $false } | ForEach-Object { $_.UserId } | Get-Distinct).Count
         }
     } | Sort-Object @{ e = { -$_.Interactions } }, Agent)
+}
+
+# ---------------------------------------------------------------------------------------------
+# Purview policy hits per agent: which Data Loss Prevention rules matched, and which Data Loss Prevention or Insider Risk alerts were
+# raised, tied to the agent they concern. What a hit names decides how it is tied: a DLP match can carry the agent's application id,
+# and a hit on an agent's own user account leads back to the agent through that account's parent identity. A hit that names only a
+# person stays unattributed and is counted as such. Communication Compliance has no source here. This is evidence of what fired,
+# not the policy definitions. Read-only.
+# ---------------------------------------------------------------------------------------------
+$script:AgentKeyKql = @'
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = todynamic(RawAgentInfo)
+| project CatalogId = tolower(tostring(r.titleId)),
+          Keys = pack_array(tolower(tostring(AgentId)), tolower(tostring(EntraAgentID)), tolower(tostring(EntraBlueprintID)),
+                            tolower(tostring(ObservabilityID)), tolower(tostring(SourceAgentId)), tolower(tostring(r.botId)))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key) and isnotempty(CatalogId)
+| distinct CatalogId, Key
+'@
+
+$script:DlpMatchKql = @'
+CloudAppEvents
+| where Timestamp > ago(30d) and ActionType =~ "DLPRuleMatch"
+| extend d = todynamic(RawEventData)
+| mv-expand p = d.PolicyDetails
+| mv-expand rule = p.Rules
+| project Timestamp, Workload = tostring(d.Workload), App = tolower(tostring(d.ApplicationName)), AccountObjectId, AccountDisplayName,
+          PolicyId = tostring(p.PolicyId), Policy = tostring(p.PolicyName), Rule = tostring(rule.RuleName), Severity = tostring(rule.Severity), Actions = tostring(rule.Actions)
+| summarize N7 = countif(Timestamp > ago(7d)), N14 = countif(Timestamp > ago(14d)), N30 = count(), Last = max(Timestamp), User = take_any(AccountDisplayName)
+    by Workload, App, AccountObjectId, PolicyId, Policy, Rule, Severity, Actions
+'@
+
+# Every id an agent appears under, mapped to the catalog agent it belongs to. A key that belongs to several agents (a blueprint they
+# share) is kept with all of them, so that it can be recognised as ambiguous.
+function Get-AgentKeyMap {
+    $rows = Invoke-HuntingQuery -Query $script:AgentKeyKql -Hint 'Check ThreatHunting.Read.All consent and that Security for AI is onboarded.'
+    $by = @{}
+    foreach ($r in $rows) {
+        $k = ([string]$r.Key).ToLowerInvariant(); $c = ([string]$r.CatalogId).ToLowerInvariant()
+        if (-not $by.ContainsKey($k)) { $by[$k] = New-Object 'System.Collections.Generic.HashSet[string]' }
+        [void]$by[$k].Add($c)
+    }
+    $by
+}
+
+# The one catalog agent a key stands for, or an empty string when it stands for none or for several.
+function Get-KeyAgent {
+    param([hashtable]$KeyMap, [string]$Key)
+    $k = ([string]$Key).ToLowerInvariant()
+    if ($k -and $KeyMap.ContainsKey($k) -and $KeyMap[$k].Count -eq 1) { @($KeyMap[$k])[0] } else { '' }
+}
+
+# Agent user accounts, each with the ids that lead back to its agent: the parent identity, that identity's application id and its blueprint.
+function Get-AgentUserMap {
+    $users = New-Object 'System.Collections.Generic.List[object]'
+    $uri = 'https://graph.microsoft.com/beta/users/microsoft.graph.agentUser?$select=id,displayName,identityParentId&$top=100'
+    do {
+        $page = Invoke-Graph -Uri $uri
+        foreach ($u in @($page.value)) { $users.Add($u) }
+        $uri = [string]$page.'@odata.nextLink'
+    } while ($uri)
+    $parents = @($users | ForEach-Object { [string]$_.identityParentId } | Where-Object { $_ } | Get-Distinct)
+    $sp = if ($parents.Count) { Invoke-GraphBatch -Version beta -Requests @($parents | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals/{0}?$select=id,appId,agentIdentityBlueprintId' -f $_) } }) } else { @{} }
+    $map = @{}
+    foreach ($u in $users) {
+        $r = $sp[[string]$u.identityParentId]
+        $b = if ($r -and $r.Status -eq 200) { $r.Body } else { $null }
+        $keys = @([string]$u.identityParentId, $(if ($b) { [string]$b.appId }), $(if ($b) { [string]$b.agentIdentityBlueprintId })) | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() }
+        $map[([string]$u.id).ToLowerInvariant()] = [pscustomobject]@{ Name = [string]$u.displayName; Keys = @($keys) }
+    }
+    $map
+}
+
+# Tie a hit to a catalog agent: by the application id it names, else by an agent user account among the accounts it names.
+function Resolve-HitAgent {
+    param([hashtable]$KeyMap, [hashtable]$UserMap, [string]$AppKey, [string[]]$UserIds)
+    $a = Get-KeyAgent $KeyMap $AppKey
+    if ($a) { return [pscustomobject]@{ CatalogId = $a; Via = 'application id' } }
+    foreach ($id in @($UserIds)) {
+        $u = $UserMap[([string]$id).ToLowerInvariant()]
+        if (-not $u) { continue }
+        foreach ($k in $u.Keys) {
+            $a = Get-KeyAgent $KeyMap $k
+            if ($a) { return [pscustomobject]@{ CatalogId = $a; Via = 'agent user' } }
+        }
+    }
+    $null
+}
+
+# DLP rule matches over 30 days, one row per policy, rule, workload, application and account, with counts for 7, 14 and 30 days.
+function Get-DlpMatchHits {
+    $rows = Invoke-HuntingQuery -Query $script:DlpMatchKql -Hint 'Check ThreatHunting.Read.All consent and that the Microsoft 365 audit feed reaches Defender.'
+    @($rows | ForEach-Object {
+        [pscustomobject]@{
+            Workload = [string]$_.Workload; App = [string]$_.App; UserId = [string]$_.AccountObjectId; User = [string]$_.User
+            PolicyId = [string]$_.PolicyId; Policy = [string]$_.Policy; Rule = [string]$_.Rule; Severity = [string]$_.Severity
+            Actions = (([string]$_.Actions -replace '[\[\]"]', '') -replace ',', ', ')
+            N7 = [int]$_.N7; N14 = [int]$_.N14; N30 = [int]$_.N30; Last = (ConvertTo-EndpointTime $_.Last)
+        }
+    })
+}
+
+# One alert in the few fields that matter: where it came from, the policy it names, and the accounts and applications it concerns.
+function ConvertTo-PurviewAlert {
+    param($Alert)
+    $evidence = @($Alert.evidence)
+    $users = @($evidence | Where-Object { "$($_.'@odata.type')" -like '*userEvidence' } | ForEach-Object { $_.userAccount } | Where-Object { $_ })
+    $apps = @($evidence | Where-Object { "$($_.'@odata.type')" -like '*cloudApplicationEvidence' } | ForEach-Object { [string]$_.appId } | Where-Object { $_ })
+    [pscustomobject]@{
+        Source = $(if ([string]$Alert.serviceSource -eq 'microsoftInsiderRiskManagement') { 'Insider Risk alert' } else { 'DLP alert' })
+        Title = [string]$Alert.title; PolicyId = [string]$Alert.alertPolicyId; Severity = ([string]$Alert.severity); Status = [string]$Alert.status
+        Created = (ConvertTo-EndpointTime $Alert.createdDateTime)
+        UserIds = @($users | ForEach-Object { [string]$_.azureAdUserId } | Where-Object { $_ })
+        User = (@($users | ForEach-Object { if ($_.userPrincipalName) { [string]$_.userPrincipalName } else { [string]$_.accountName } } | Where-Object { $_ }) -join '; ')
+        AppIds = $apps
+    }
+}
+
+# DLP and Insider Risk alerts of the last 30 days from the Microsoft Graph alerts API.
+function Get-PurviewAlerts {
+    $since = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($src in 'dataLossPrevention', 'microsoftInsiderRiskManagement') {
+        $uri = ('https://graph.microsoft.com/v1.0/security/alerts_v2?$filter=serviceSource eq ''{0}'' and createdDateTime ge {1}&$top=100' -f $src, $since)
+        do {
+            $page = Invoke-Graph -Uri $uri
+            foreach ($a in @($page.value)) { $out.Add((ConvertTo-PurviewAlert $a)) }
+            $uri = [string]$page.'@odata.nextLink'
+        } while ($uri)
+    }
+    $out.ToArray()
+}
+
+function New-PolicyHitRow {
+    param([string]$Agent, [string]$AgentId, [string]$Via, [string]$Source, [string]$Policy, [string]$Rule, [string]$Severity, [string]$Actions, [string]$Workload, [string]$User, [int]$N7, [int]$N14, [int]$N30, $Last, [string]$App = "")
+    [pscustomobject]@{ Agent = $Agent; AgentId = $AgentId; App = $App; Via = $Via; Source = $Source; Policy = $Policy; Rule = $Rule; Severity = $Severity; Actions = $Actions; Workload = $Workload
+                       User = $User; Hits = $N30; N7 = $N7; N14 = $N14; N30 = $N30; Last = $Last }
+}
+
+# Everything for the last 30 days. Each hit is tied to an agent where it can be; the rest carry no agent. -OnlyIds keeps the hits of
+# chosen catalog agents only.
+function Get-AgentPolicyHitsReport {
+    param([object[]]$Packages, [string[]]$OnlyIds, [scriptblock]$OnStatus)
+    $say = { param($m) if ($OnStatus) { & $OnStatus $m } }
+    & $say 'Reading the ids agents appear under from Microsoft Defender...'
+    $keyMap = Get-AgentKeyMap
+    & $say 'Reading agent user accounts...'
+    $userMap = @{}; $userNote = ''
+    try { $userMap = Get-AgentUserMap } catch { $userNote = 'Agent user accounts could not be read, so hits on them are not tied to an agent: ' + $_.Exception.Message }
+    & $say 'Reading DLP rule matches...'
+    $dlp = @(Get-DlpMatchHits)
+    & $say 'Reading DLP and Insider Risk alerts...'
+    $alerts = @(Get-PurviewAlerts)
+    $byId = @{}
+    foreach ($p in @($Packages)) { $byId[([string]$p.id).ToLowerInvariant()] = $p }
+    $name = { param($cid) if ($cid -and $byId.ContainsKey($cid)) { [string]$byId[$cid].displayName } elseif ($cid) { $cid } else { '' } }
+    $idOf = { param($cid) if ($cid -and $byId.ContainsKey($cid)) { [string]$byId[$cid].id } else { $cid } }
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($h in $dlp) {
+        $w = Resolve-HitAgent -KeyMap $keyMap -UserMap $userMap -AppKey $h.App -UserIds @($h.UserId)
+        $cid = if ($w) { $w.CatalogId } else { '' }
+        $rows.Add((New-PolicyHitRow -Agent (& $name $cid) -AgentId (& $idOf $cid) -Via $(if ($w) { $w.Via } else { '' }) -Source 'DLP match' -Policy $h.Policy -Rule $h.Rule -Severity $h.Severity -Actions $h.Actions -Workload $h.Workload -User $h.User -N7 $h.N7 -N14 $h.N14 -N30 $h.N30 -Last $h.Last -App $h.App))
+    }
+    $now = Get-Date
+    $tagged = foreach ($a in $alerts) {
+        $w = Resolve-HitAgent -KeyMap $keyMap -UserMap $userMap -AppKey ([string]@($a.AppIds)[0]) -UserIds @($a.UserIds)
+        if (-not $w) { foreach ($app in @($a.AppIds | Select-Object -Skip 1)) { $w = Resolve-HitAgent -KeyMap $keyMap -UserMap $userMap -AppKey $app -UserIds @(); if ($w) { break } } }
+        [pscustomobject]@{ Alert = $a; CatalogId = $(if ($w) { $w.CatalogId } else { '' }); Via = $(if ($w) { $w.Via } else { '' }) }
+    }
+    foreach ($g in @($tagged | Group-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.Alert.Source, $_.Alert.Title, $_.Alert.Severity, $_.CatalogId, $_.Alert.User })) {
+        $f = @($g.Group)[0]; $when = @($g.Group | ForEach-Object { $_.Alert.Created } | Where-Object { $_ })
+        $age = { param($days) @($when | Where-Object { $_ -gt $now.AddDays(-$days) }).Count }
+        $rows.Add((New-PolicyHitRow -Agent (& $name $f.CatalogId) -AgentId (& $idOf $f.CatalogId) -Via $f.Via -Source $f.Alert.Source -Policy $f.Alert.Title -Rule '' -Severity $f.Alert.Severity -Actions '' -Workload '' -User $f.Alert.User `
+            -N7 (& $age 7) -N14 (& $age 14) -N30 $g.Count -Last ($when | Sort-Object -Descending | Select-Object -First 1) -App ([string]@($f.Alert.AppIds)[0])))
+    }
+    $keep = $rows.ToArray()
+    if ($OnlyIds) { $only = @($OnlyIds | ForEach-Object { ([string]$_).ToLowerInvariant() }); $keep = @($keep | Where-Object { $_.AgentId -and ($only -contains $_.AgentId.ToLowerInvariant()) }) }
+    [pscustomobject]@{ Rows = $keep; Note = $userNote; AlertCount = $alerts.Count }
+}
+
+# The rows of one period (7, 14 or 30 days) with the count for that period in Hits; optionally only the hits tied to an agent, or
+# those whose agent, policy, rule or user contains the text.
+function Select-PolicyHitRows {
+    param([object[]]$Rows, [ValidateSet(7, 14, 30)][int]$Days = 30, [switch]$AttributedOnly, [string]$Text)
+    $col = "N$Days"
+    $picked = foreach ($r in @($Rows)) {
+        if ($r.$col -le 0) { continue }
+        if ($AttributedOnly -and -not $r.AgentId) { continue }
+        if ($Text -and ("$($r.Agent) $($r.Policy) $($r.Rule) $($r.User) $($r.Source)").IndexOf($Text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $copy = $r | Select-Object *
+        $copy.Hits = [int]$r.$col
+        $copy
+    }
+    @($picked | Sort-Object @{ e = { if ($_.AgentId) { 0 } else { 1 } } }, Agent, Source, @{ e = { -$_.Hits } }, Policy)
+}
+
+# Totals for a set of rows: hits by source, the agents they are tied to, and the hits that name only a person.
+function Get-PolicyHitSummary {
+    param([object[]]$Rows)
+    $all = @($Rows)
+    $sum = { param($set) [int](@($set | ForEach-Object { $_.Hits }) | Measure-Object -Sum).Sum }
+    [pscustomobject]@{
+        DlpMatches = (& $sum @($all | Where-Object { $_.Source -eq 'DLP match' }))
+        DlpAlerts = (& $sum @($all | Where-Object { $_.Source -eq 'DLP alert' }))
+        InsiderRisk = (& $sum @($all | Where-Object { $_.Source -eq 'Insider Risk alert' }))
+        Agents = @($all | Where-Object { $_.AgentId } | ForEach-Object { $_.AgentId } | Get-Distinct).Count
+        Unattributed = (& $sum @($all | Where-Object { -not $_.AgentId }))
+        Total = (& $sum $all)
+    }
+}
+
+# One line per agent: its hits by source, how many policies they came from and when the last one was.
+function Get-PolicyHitsByAgent {
+    param([object[]]$Rows)
+    @($Rows | Where-Object { $_.AgentId } | Group-Object AgentId | ForEach-Object {
+        $g = @($_.Group)
+        $n = { param($s) [int](@($g | Where-Object { $_.Source -eq $s } | ForEach-Object { $_.Hits }) | Measure-Object -Sum).Sum }
+        [pscustomobject]@{
+            Agent = $g[0].Agent; DlpMatches = (& $n 'DLP match'); DlpAlerts = (& $n 'DLP alert'); InsiderRisk = (& $n 'Insider Risk alert')
+            Policies = @($g | ForEach-Object { $_.Policy } | Get-Distinct).Count; Last = (@($g | ForEach-Object { $_.Last } | Where-Object { $_ }) | Sort-Object -Descending | Select-Object -First 1)
+        }
+    } | Sort-Object @{ e = { -($_.DlpMatches + $_.DlpAlerts + $_.InsiderRisk) } }, Agent)
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4127,12 +4366,13 @@ $GuiXaml = @'
           <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
         </StackPanel>
         <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
-          <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
-          <Button x:Name="BtnAgentUsers" Content="Agent users..." Style="{StaticResource Btn}" Margin="0,0,8,0" ToolTip="Which users interacted with which agent over the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
-          <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
-          <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" IsEnabled="False"/>
+          <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
+          <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
+          <Button x:Name="BtnAgentUsers" Content="Agent users..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which users interacted with which agent over the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
+          <Button x:Name="BtnPolicyHits" Content="Policy hits..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which Purview policies fired on which agents: DLP rule matches and DLP or Insider Risk alerts over the last 7, 14 or 30 days. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
+          <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
+          <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0"/>
+          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Padding="12,8" IsEnabled="False"/>
         </StackPanel>
         <StackPanel Grid.Row="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,10,0,0">
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Adds the suggested owner (or sponsor) to the ticked agents. Choose an Ownership filter first: Needs an owner, Missing an Entra sponsor, or Missing a sponsor or owner. Only rows that show a suggestion can be applied."/>
@@ -5154,6 +5394,113 @@ function New-AgentUsersWindow {
     $d
 }
 
+$PolicyHitsXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Policy hits" Width="1240" Height="700" MinWidth="900" MinHeight="480" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Purview policy hits on agents"/>
+        <TextBlock x:Name="PhSummary" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap" Text="Loading..."/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="16,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <Button x:Name="BtnPhExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON, with the counts for 7, 14 and 30 days."/>
+        <Button x:Name="BtnPhLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the matches and alerts again."/>
+        <TextBox x:Name="PhSearch" DockPanel.Dock="Right" Width="200" Height="30" Margin="12,0,0,0" VerticalContentAlignment="Center" ToolTip="Show only rows whose agent, policy, rule or user contains this text."/>
+        <CheckBox x:Name="PhAll" Content="Include hits not tied to an agent" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Also list hits that name only a person, so no agent can be named. They are counted in the summary either way."/>
+        <ComboBox x:Name="PhDaysBox" DockPanel.Dock="Right" SelectedIndex="2" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Show hits in this period. Defender keeps about 30 days.">
+          <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+        </ComboBox>
+        <TextBlock x:Name="PhNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+      </DockPanel>
+    </Border>
+    <DataGrid x:Name="PhGrid" Grid.Row="2" Style="{StaticResource Grid}">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Agent" Binding="{Binding Agent}" Width="1.4*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Source" Binding="{Binding Source}" Width="125" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Policy" Binding="{Binding Policy}" Width="1.8*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Rule" Binding="{Binding Rule}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Severity" Binding="{Binding Severity}" Width="80" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Hits" Binding="{Binding Hits}" Width="60" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Last hit" Binding="{Binding Last, StringFormat=yyyy-MM-dd HH:mm}" Width="135" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="User" Binding="{Binding User}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Tied by" Binding="{Binding Via}" Width="110" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Application id" Binding="{Binding App}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Grid.Row="3" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Padding="16,8">
+      <TextBlock TextWrapping="Wrap" Foreground="#6B7280" Text="This shows what fired, not which policies are configured for agents. A hit is tied to an agent through the application id it names or through an agent user account; hits that name only a person stay unattributed. Insider Risk alerts come through the Microsoft Graph alerts API; Communication Compliance has no source here."/>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Fill the window from the report it holds, or read the report first (-Load). The period, the unattributed switch and the search only
+# change what is shown; all three periods come from the one read.
+function Update-PolicyHitsWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('PhNote'); $grid = $Window.FindName('PhGrid'); $btn = $Window.FindName('BtnPhLoad'); $summary = $Window.FindName('PhSummary')
+    if ($Load) {
+        try {
+            $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $Window.Tag = Get-AgentPolicyHitsReport -Packages $script:phState.Packages -OnlyIds $script:phState.OnlyIds -OnStatus $pump
+        } catch {
+            $note.Text = 'Could not read the policy hits: ' + $_.Exception.Message
+            return
+        } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
+    }
+    $report = $Window.Tag
+    if (-not $report) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
+    $days = [int]$Window.FindName('PhDaysBox').SelectedItem.Tag
+    $inPeriod = @(Select-PolicyHitRows -Rows $report.Rows -Days $days)
+    $shown = @(Select-PolicyHitRows -Rows $report.Rows -Days $days -AttributedOnly:(-not [bool]$Window.FindName('PhAll').IsChecked) -Text $Window.FindName('PhSearch').Text)
+    $grid.ItemsSource = $shown
+    $s = Get-PolicyHitSummary $inPeriod
+    $summary.Text = ("Last {0} days: {1} hit(s) on {2} agent(s): {3} DLP rule match(es), {4} DLP alert(s), {5} Insider Risk alert(s). {6} hit(s) name only a person and are not tied to an agent." -f $days, ($s.Total - $s.Unattributed), $s.Agents, $s.DlpMatches, $s.DlpAlerts, $s.InsiderRisk, $s.Unattributed)
+    $limit = if ($script:phState.OnlyIds.Count) { ", limited to the $($script:phState.OnlyIds.Count) ticked agent(s)" } else { '' }
+    $note.Text = if ($report.Note) { $report.Note } elseif ($shown.Count) { "{0} row(s){1}." -f $shown.Count, $limit } else { "No hit in this period matches$limit, or none is tied to an agent (tick the box to see those)." }
+}
+
+function New-PolicyHitsWindow {
+    param([System.Windows.Window]$Owner, [object[]]$Packages, [string[]]$OnlyIds)
+    $d = [Windows.Markup.XamlReader]::Parse($PolicyHitsXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:phWindow = $d
+    $script:phState = @{ Packages = @($Packages); OnlyIds = @($OnlyIds | Where-Object { $_ }) }
+    $d.FindName('BtnPhLoad').Add_Click({ Update-PolicyHitsWindow -Window $script:phWindow -Load })
+    $d.FindName('PhDaysBox').Add_SelectionChanged({ Update-PolicyHitsWindow -Window $script:phWindow })
+    $d.FindName('PhAll').Add_Click({ Update-PolicyHitsWindow -Window $script:phWindow })
+    $d.FindName('PhSearch').Add_TextChanged({ Update-PolicyHitsWindow -Window $script:phWindow })
+    $d.FindName('BtnPhExport').Add_Click({
+        $shown = @($script:phWindow.FindName('PhGrid').ItemsSource)
+        if ($shown.Count -eq 0) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'policy-hits.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($shown | Select-Object Agent, Source, Policy, Rule, Severity, Actions, Workload, User, @{ n = 'ApplicationId'; e = { $_.App } }, @{ n = 'TiedBy'; e = { $_.Via } }, Hits, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } }, Last)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+    })
+    $d.Add_ContentRendered({ if (-not $script:phWindow.Tag) { Update-PolicyHitsWindow -Window $script:phWindow -Load } })
+    $d
+}
+
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($DetailXaml)
@@ -5292,7 +5639,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -5814,6 +6161,10 @@ function New-ConsoleWindow {
         $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
         (New-AgentUsersWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
     })
+    $script:ui.BtnPolicyHits.Add_Click({
+        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
+        (New-PolicyHitsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
+    })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
@@ -6133,6 +6484,37 @@ switch ($PSCmdlet.ParameterSetName) {
         Export-ActionLog -Records @($rows | ForEach-Object {
             [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; User = $_.User; Account = $_.Upn; Type = $_.Kind; Interactions = $_.Interactions; Last7Days = $_.N7; Last14Days = $_.N14; Last30Days = $_.N30
                                LastInteraction = $(if ($_.Last) { $_.Last.ToString('o') } else { '' }); Licensed = $_.Licensed; License = $_.License; Licenses = $_.LicenseDetail } })
+    }
+    'PolicyHits' {
+        $ForAgent = ConvertTo-NameList $ForAgent
+        $pk = @(Get-Packages)
+        $only = @(if ($ForAgent) { Resolve-Packages $ForAgent -Catalog $pk | ForEach-Object { $_.id } })
+        $report = Get-AgentPolicyHitsReport -Packages $pk -OnlyIds $only -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        if ($report.Note) { Write-Warning $report.Note }
+        $inPeriod = @(Select-PolicyHitRows -Rows $report.Rows -Days $HitDays)
+        $s = Get-PolicyHitSummary $inPeriod
+        if ($inPeriod.Count -eq 0) { Write-Host ("No DLP match or DLP or Insider Risk alert in the last {0} days{1}." -f $HitDays, $(if ($ForAgent) { ' for those agents' } else { '' })) -ForegroundColor Yellow; break }
+        Write-Host ("`nLast {0} days: {1} hit(s) on {2} agent(s): {3} DLP rule match(es), {4} DLP alert(s), {5} Insider Risk alert(s). {6} hit(s) name only a person, so they are not tied to an agent." -f $HitDays, ($s.Total - $s.Unattributed), $s.Agents, $s.DlpMatches, $s.DlpAlerts, $s.InsiderRisk, $s.Unattributed) -ForegroundColor Cyan
+        $tied = @(Select-PolicyHitRows -Rows $report.Rows -Days $HitDays -AttributedOnly)
+        if ($tied.Count) {
+            Write-Host "`nBy agent:" -ForegroundColor Cyan
+            Get-PolicyHitsByAgent $tied | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'DLP matches'; e = { $_.DlpMatches } }, @{ n = 'DLP alerts'; e = { $_.DlpAlerts } }, @{ n = 'Insider Risk alerts'; e = { $_.InsiderRisk } },
+                @{ n = 'policies'; e = { $_.Policies } }, @{ n = 'last'; e = { if ($_.Last) { $_.Last.ToString('yyyy-MM-dd HH:mm') } } } | Format-Table -AutoSize -Wrap | Out-Host
+            Write-Host 'By policy:' -ForegroundColor Cyan
+            $tied | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'source'; e = { $_.Source } }, @{ n = 'policy and rule'; e = { if ($_.Rule) { '{0} / {1}' -f $_.Policy, $_.Rule } else { $_.Policy } } },
+                @{ n = 'severity'; e = { $_.Severity } }, @{ n = 'hits'; e = { $_.Hits } }, @{ n = 'last'; e = { if ($_.Last) { $_.Last.ToString('yyyy-MM-dd') } } } | Format-Table -AutoSize -Wrap | Out-Host
+        } else { Write-Host 'No hit in this period could be tied to an agent.' -ForegroundColor Yellow }
+        if ($IncludeUnattributed -and $s.Unattributed) {
+            Write-Host 'Hits that name only a person (not tied to an agent):' -ForegroundColor Cyan
+            @($inPeriod | Where-Object { -not $_.AgentId } | Group-Object Source, Policy, Rule | ForEach-Object { $g = @($_.Group); [pscustomobject]@{ source = $g[0].Source; policy = $g[0].Policy; rule = $g[0].Rule; hits = [int](@($g | ForEach-Object { $_.Hits }) | Measure-Object -Sum).Sum
+                'application id' = (@($g | ForEach-Object { $_.App } | Where-Object { $_ } | Get-Distinct) -join '; ') } } | Sort-Object hits -Descending) | Format-Table -AutoSize -Wrap | Out-Host
+            Write-Host 'An application id in that last column that no agent in Defender''s inventory carries may be an agent that Defender does not list.' -ForegroundColor DarkGray
+        }
+        if ($s.InsiderRisk -eq 0) { Write-Host 'No Insider Risk alert in this period. Insider Risk alerts reach this tool through the Microsoft Graph alerts API; a risky-agents policy that raised none shows nothing here.' -ForegroundColor DarkGray }
+        Write-Host 'This shows what fired, not which policies are configured for agents. Communication Compliance has no alert or event source here. A hit is tied to an agent through the application id it names or through an agent user account; the rest stays unattributed.' -ForegroundColor DarkGray
+        Export-ActionLog -Records @($inPeriod | ForEach-Object {
+            [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; ApplicationId = $_.App; TiedBy = $_.Via; Source = $_.Source; Policy = $_.Policy; Rule = $_.Rule; Severity = $_.Severity; Actions = $_.Actions; Workload = $_.Workload; User = $_.User
+                               Hits = $_.Hits; Last7Days = $_.N7; Last14Days = $_.N14; Last30Days = $_.N30; LastHit = $(if ($_.Last) { $_.Last.ToString('o') } else { '' }) } })
     }
     'BlockLocalAgent' {
         $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice

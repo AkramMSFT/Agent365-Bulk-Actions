@@ -2610,3 +2610,125 @@ Describe 'Sign-in method note' {
         } finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
     }
 }
+
+Describe 'Purview policy hits' {
+    BeforeAll {
+        function New-KeyMap {
+            param([hashtable]$Pairs)
+            $m = @{}
+            foreach ($k in $Pairs.Keys) { $m[$k] = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($c in @($Pairs[$k])) { [void]$m[$k].Add($c) } }
+            $m
+        }
+        function New-PhRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$Source = 'DLP match', [string]$Policy = 'P1', [string]$Rule = 'R1', [int]$N7 = 0, [int]$N14 = 0, [int]$N30 = 0, [string]$App = '')
+            New-PolicyHitRow -Agent $Agent -AgentId $AgentId -Via $(if ($AgentId) { 'application id' } else { '' }) -Source $Source -Policy $Policy -Rule $Rule -Severity 'low' -Actions '' -Workload 'W' -User 'u' -N7 $N7 -N14 $N14 -N30 $N30 -Last ([datetime]'2026-10-06 10:00') -App $App
+        }
+    }
+    It 'maps every id an agent appears under to its catalog agent, and treats a shared id as ambiguous' {
+        Mock Invoke-HuntingQuery {
+            @([pscustomobject]@{ CatalogId = 'T_A'; Key = 'K1' }, [pscustomobject]@{ CatalogId = 'T_A'; Key = 'k2' },
+              [pscustomobject]@{ CatalogId = 'T_B'; Key = 'BP' }, [pscustomobject]@{ CatalogId = 'T_C'; Key = 'bp' })
+        }
+        $m = Get-AgentKeyMap
+        Get-KeyAgent $m 'K1' | Should -Be 't_a'
+        Get-KeyAgent $m 'K2' | Should -Be 't_a'
+        Get-KeyAgent $m 'BP' | Should -Be ''
+        Get-KeyAgent $m 'unknown' | Should -Be ''
+        Get-KeyAgent $m '' | Should -Be ''
+    }
+    It 'ties a hit to an agent by the application id it names, or by an agent user account, and leaves the rest alone' {
+        $km = New-KeyMap @{ 'app-1' = 't_a'; 'bp-9' = 't_b'; 'shared' = @('t_a', 't_b') }
+        $um = @{ 'u-agent' = [pscustomobject]@{ Name = 'Agent user'; Keys = @('parent-1', 'shared', 'bp-9') }; 'u-lost' = [pscustomobject]@{ Name = 'Lost'; Keys = @('nothing') } }
+        $a = Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey 'APP-1' -UserIds @('u-agent')
+        $a.CatalogId | Should -Be 't_a'; $a.Via | Should -Be 'application id'
+        $b = Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey '' -UserIds @('someone', 'U-AGENT')
+        $b.CatalogId | Should -Be 't_b'; $b.Via | Should -Be 'agent user'
+        Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey 'shared' -UserIds @() | Should -BeNullOrEmpty
+        Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey '' -UserIds @('u-lost', 'a-person') | Should -BeNullOrEmpty
+    }
+    It 'reads an alert: its source, the policy it names, and the accounts and applications it concerns' {
+        $raw = @{ title = 'DLP-Copilot Studio agent sensitive'; alertPolicyId = 'pol-1'; severity = 'low'; status = 'new'; serviceSource = 'dataLossPrevention'; createdDateTime = '2026-10-06T10:27:38.1234567Z'
+                  evidence = @(@{ '@odata.type' = '#microsoft.graph.security.userEvidence'; userAccount = @{ azureAdUserId = 'u-1'; userPrincipalName = 'ann@contoso.com'; accountName = 'ann' } },
+                               @{ '@odata.type' = '#microsoft.graph.security.cloudApplicationEvidence'; appId = 'app-1' },
+                               @{ '@odata.type' = '#microsoft.graph.security.fileEvidence' }) }
+        $a = ConvertTo-PurviewAlert $raw
+        $a.Source | Should -Be 'DLP alert'; $a.Title | Should -Be 'DLP-Copilot Studio agent sensitive'; $a.PolicyId | Should -Be 'pol-1'
+        $a.UserIds | Should -Be @('u-1'); $a.User | Should -Be 'ann@contoso.com'; $a.AppIds | Should -Be @('app-1'); $a.Created | Should -BeOfType ([datetime])
+        (ConvertTo-PurviewAlert @{ title = 'Risky agent'; serviceSource = 'microsoftInsiderRiskManagement'; evidence = @() }).Source | Should -Be 'Insider Risk alert'
+    }
+    It 'reads the agent user accounts with the ids that lead back to their agents' {
+        Mock Invoke-Graph { @{ value = @(@{ id = 'U-1'; displayName = 'Agent one'; identityParentId = 'P-1' }, @{ id = 'u-2'; displayName = 'Agent two'; identityParentId = 'p-2' }) } }
+        Mock Invoke-GraphBatch {
+            @{ 'P-1' = [pscustomobject]@{ Status = 200; Body = @{ appId = 'APP-1'; agentIdentityBlueprintId = 'BP-1' } }; 'p-2' = [pscustomobject]@{ Status = 404; Body = $null } }
+        }
+        $m = Get-AgentUserMap
+        $m['u-1'].Name | Should -Be 'Agent one'; $m['u-1'].Keys | Should -Be @('p-1', 'app-1', 'bp-1')
+        $m['u-2'].Keys | Should -Be @('p-2')
+    }
+    It 'reads the DLP matches Defender holds and tidies the action list' {
+        $script:DlpMatchKql | Should -BeLike '*DLPRuleMatch*N7 = countif(Timestamp > ago(7d))*N14 = countif(Timestamp > ago(14d))*N30 = count()*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Workload = 'ExtendedApplications'; App = 'app-1'; AccountObjectId = 'u-1'; User = 'Ann'; PolicyId = 'p'; Policy = 'Pol'; Rule = 'Rul'; Severity = 'Low'; Actions = '["GenerateAlert","RestrictAccess"]'; N7 = 1; N14 = 2; N30 = 3; Last = '2026-10-06T10:00:00Z' }) }
+        $h = @(Get-DlpMatchHits)
+        $h[0].Actions | Should -Be 'GenerateAlert, RestrictAccess'; $h[0].N30 | Should -Be 3; $h[0].Last | Should -BeOfType ([datetime]); $h[0].UserId | Should -Be 'u-1'
+    }
+    It 'builds the report: ties hits by application id and agent user, groups alerts, and keeps the rest unattributed' {
+        Mock Get-AgentKeyMap { New-KeyMap @{ 'app-1' = 't_a'; 'bp-9' = 't_b' } }
+        Mock Get-AgentUserMap { @{ 'u-agent' = [pscustomobject]@{ Name = 'Agent user'; Keys = @('p', 'bp-9') } } }
+        Mock Get-DlpMatchHits {
+            @([pscustomobject]@{ Workload = 'W'; App = 'app-1'; UserId = 'u-1'; User = 'Ann'; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'Block cards'; Severity = 'Low'; Actions = 'RestrictAccess'; N7 = 1; N14 = 2; N30 = 3; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ Workload = 'W'; App = 'unknown-app'; UserId = 'u-2'; User = 'Bob'; PolicyId = 'p2'; Policy = 'Generic DLP'; Rule = 'Generic'; Severity = 'Low'; Actions = ''; N7 = 0; N14 = 0; N30 = 5; Last = [datetime]'2026-09-20' })
+        }
+        $now = Get-Date
+        Mock Get-PurviewAlerts {
+            @([pscustomobject]@{ Source = 'DLP alert'; Title = 'DLP-Agent rule'; PolicyId = 'p3'; Severity = 'low'; Status = 'new'; Created = $now.AddDays(-2); UserIds = @('u-agent'); User = 'agent@x'; AppIds = @() },
+              [pscustomobject]@{ Source = 'DLP alert'; Title = 'DLP-Agent rule'; PolicyId = 'p3'; Severity = 'low'; Status = 'new'; Created = $now.AddDays(-20); UserIds = @('u-agent'); User = 'agent@x'; AppIds = @() },
+              [pscustomobject]@{ Source = 'Insider Risk alert'; Title = 'Risky agents'; PolicyId = 'p4'; Severity = 'high'; Status = 'new'; Created = $now.AddDays(-10); UserIds = @('a-person'); User = 'bob@x'; AppIds = @() })
+        }
+        $r = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $r.AlertCount | Should -Be 3; $r.Note | Should -Be ''
+        $a = $r.Rows | Where-Object { $_.Policy -eq 'Alpha DLP' }
+        $a.Agent | Should -Be 'Alpha'; $a.AgentId | Should -Be 'T_A'; $a.Via | Should -Be 'application id'; $a.App | Should -Be 'app-1'; $a.N30 | Should -Be 3
+        $u = $r.Rows | Where-Object { $_.Policy -eq 'Generic DLP' }
+        $u.AgentId | Should -Be ''; $u.Agent | Should -Be ''; $u.App | Should -Be 'unknown-app'
+        $d = $r.Rows | Where-Object { $_.Policy -eq 'DLP-Agent rule' }
+        @($d).Count | Should -Be 1
+        $d.Agent | Should -Be 'Beta'; $d.Via | Should -Be 'agent user'; $d.Source | Should -Be 'DLP alert'; $d.N7 | Should -Be 1; $d.N14 | Should -Be 1; $d.N30 | Should -Be 2
+        $i = $r.Rows | Where-Object { $_.Source -eq 'Insider Risk alert' }
+        $i.AgentId | Should -Be ''; $i.N7 | Should -Be 0; $i.N14 | Should -Be 1; $i.N30 | Should -Be 1
+        $only = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta')) -OnlyIds @('t_b')
+        @($only.Rows).Count | Should -Be 1; $only.Rows[0].Agent | Should -Be 'Beta'
+    }
+    It 'carries on and says so when the agent user accounts cannot be read' {
+        Mock Get-AgentKeyMap { New-KeyMap @{ 'app-1' = 't_a' } }
+        Mock Get-AgentUserMap { throw 'Insufficient privileges' }
+        Mock Get-DlpMatchHits { @([pscustomobject]@{ Workload = 'W'; App = 'app-1'; UserId = 'u'; User = 'U'; PolicyId = 'p'; Policy = 'P'; Rule = 'R'; Severity = 'Low'; Actions = ''; N7 = 1; N14 = 1; N30 = 1; Last = [datetime]'2026-10-06' }) }
+        Mock Get-PurviewAlerts { @() }
+        $r = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'))
+        $r.Note | Should -BeLike '*could not be read*Insufficient privileges*'
+        $r.Rows[0].Agent | Should -Be 'Alpha'
+    }
+    It 'selects one period, only the hits tied to an agent, or those matching a text' {
+        $rows = @((New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N7 2 -N14 3 -N30 5), (New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Source 'DLP alert' -Policy 'Cards alert' -N14 1 -N30 4),
+                  (New-PhRow -Agent '' -AgentId '' -Policy 'Generic' -N30 9), (New-PhRow -Agent 'Beta' -AgentId 'T_B' -Policy 'Other' -N30 1))
+        @(Select-PolicyHitRows -Rows $rows -Days 7).Count | Should -Be 1
+        (Select-PolicyHitRows -Rows $rows -Days 7)[0].Hits | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 14).Count | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 30).Count | Should -Be 4
+        (Select-PolicyHitRows -Rows $rows -Days 30)[-1].Policy | Should -Be 'Generic'   # hits with no agent come last
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -AttributedOnly).Count | Should -Be 3
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -Text 'CARDS').Count | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+        $rows[0].Hits | Should -Be 5
+    }
+    It 'totals hits by source and counts those that name only a person, then lists each agent' {
+        $rows = @((New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N30 5), (New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Source 'DLP alert' -Policy 'Cards alert' -N30 4),
+                  (New-PhRow -Agent '' -AgentId '' -Policy 'Generic' -N30 9), (New-PhRow -Agent 'Beta' -AgentId 'T_B' -Source 'Insider Risk alert' -Policy 'Risky' -N30 2))
+        $s = Get-PolicyHitSummary $rows
+        $s.DlpMatches | Should -Be 14; $s.DlpAlerts | Should -Be 4; $s.InsiderRisk | Should -Be 2; $s.Agents | Should -Be 2; $s.Unattributed | Should -Be 9; $s.Total | Should -Be 20
+        $by = @(Get-PolicyHitsByAgent $rows)
+        $by.Count | Should -Be 2
+        $by[0].Agent | Should -Be 'Alpha'; $by[0].DlpMatches | Should -Be 5; $by[0].DlpAlerts | Should -Be 4; $by[0].Policies | Should -Be 2
+        $by[1].Agent | Should -Be 'Beta'; $by[1].InsiderRisk | Should -Be 2
+        (Get-PolicyHitSummary @()).Total | Should -Be 0
+    }
+}

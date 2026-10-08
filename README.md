@@ -27,6 +27,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Respond to a compromised agent](#respond-to-a-compromised-agent)
   - [Check Conditional Access for agents](#check-conditional-access-for-agents)
   - [Agent users and licenses](#agent-users-and-licenses)
+  - [Purview policy hits on agents](#purview-policy-hits-on-agents)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -50,6 +51,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
 | Agent users | Which users interacted with which agent in the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license | `-AgentUsers` |
+| Policy hits | Which Purview policies fired on which agents: DLP rule matches and DLP or Insider Risk alerts over the last 7, 14 or 30 days | `-AgentPolicyHits` |
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
@@ -108,6 +110,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `CustomDetection.ReadWrite.All` | Blocking a local AI agent on a device (a Defender custom detection rule) and reading which are blocked. Needs a Defender role that manages custom detections and can remediate files. The console asks for it only when you use that action. |
 | `Policy.Read.All` | Reading Conditional Access policies (`-CheckConditionalAccess`). The console asks for it only when you use that action. |
 | `IdentityRiskyAgent.Read.All` | Reading an agent identity's Entra risk without changing it (`-CheckConditionalAccess`). `IdentityRiskyAgent.ReadWrite.All` also satisfies it. |
+| `SecurityAlert.Read.All` | Reading DLP and Insider Risk alerts (`-AgentPolicyHits`). |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
 | `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
@@ -452,6 +455,28 @@ Read-only. It answers who interacts with which agent in the last 7, 14 or 30 day
 - **Requirements.** `ThreatHunting.Read.All`, `User.Read.All` and `CopilotPackages.Read.All`, all already part of `-SignIn`. Reading license details also needs an Entra role such as License Administrator, User Administrator or Global Reader.
 - **In the console**, **Agent users...** opens the same data in a window with a 7, 14 or 30 day selector, a *No Agent 365 or E7 license only* filter, a search box and export. It covers the ticked agents, or every agent when none is ticked.
 
+### Purview policy hits on agents
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -AgentPolicyHits                                   # last 30 days, every agent
+.\Agent365-Bulk-Actions.ps1 -AgentPolicyHits -HitDays 7 -IncludeUnattributed   # 7, 14 or 30; also the hits that name only a person
+.\Agent365-Bulk-Actions.ps1 -AgentPolicyHits -ForAgent "Contoso HR Agent" -OutFile .\policy-hits.csv
+```
+
+Read-only. It shows which Purview policies **fired** on which agents. It is evidence of what happened, not a list of the policies configured for agents; the policy definitions are only available from Security & Compliance PowerShell and the Purview portal.
+
+| Source | What it holds | Where it comes from |
+| --- | --- | --- |
+| DLP match | The policy, rule, actions and severity of each Data Loss Prevention rule that matched, with who triggered it | Defender Advanced Hunting, `CloudAppEvents` events of type `DLPRuleMatch` |
+| DLP alert | An alert a DLP policy raised, with the policy it names | Microsoft Graph alerts API, source `dataLossPrevention` |
+| Insider Risk alert | An alert an Insider Risk Management policy raised, for example from the Risky agents template | Microsoft Graph alerts API, source `microsoftInsiderRiskManagement` |
+
+- **How a hit is tied to an agent.** A DLP match can carry the application id of the agent, which Defender's inventory maps to a catalog agent. A hit on an agent's own user account is tied through that account's parent identity, and from there through the identity's application id or blueprint. An id shared by several agents (a blueprint they have in common) is treated as ambiguous and not used. A hit that names only a person, such as the human who typed a sensitive prompt, cannot be tied to an agent: it is counted, listed with `-IncludeUnattributed` and shown with the application id it carries, if any, so that an agent missing from Defender's inventory can be spotted.
+- **Output.** A summary line, a *By agent* table (hits by source, policies, last hit), a *By policy* table, and with `-IncludeUnattributed` the hits that name only a person. `-OutFile` writes one row per policy, rule, agent and account with the counts for 7, 14 and 30 days.
+- **Not covered.** Communication Compliance has no alert or event source here. Insider Risk risk levels per agent are shown in the Purview portal's DSPM AI observability page, which has no API this tool uses. Advanced Hunting keeps about 30 days.
+- **Requirements.** `ThreatHunting.Read.All`, `SecurityAlert.Read.All`, `User.Read.All`, `CopilotPackages.Read.All`, `AgentIdentity.Read.All` and `Application.Read.All`, all part of `-SignIn`.
+- **In the console**, **Policy hits...** opens the same data in a window with a 7, 14 or 30 day selector, a switch for hits not tied to an agent, a search box and export. It covers the ticked agents, or every agent when none is ticked.
+
 ### Policy file
 
 Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
@@ -519,6 +544,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
 | Review AI activity | **AI activity...** opens the details window on that tab. |
 | See who uses an agent | **Agent users...** lists the users who interacted with each agent over the last 7, 14 or 30 days, with whether each has an Agent 365 or E7 license. It covers the ticked agents, or every agent when none is ticked. |
+| See which policies fired | **Policy hits...** lists the DLP rule matches and the DLP and Insider Risk alerts that concern each agent over the last 7, 14 or 30 days. It covers the ticked agents, or every agent when none is ticked. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
@@ -555,6 +581,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-EndpointAi` | switch | Local AI agents and shadow AI on Defender-onboarded devices, with telemetry and risk. |
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
 | `-AgentUsers` | switch | Which users interacted with which agent, and whether each has an Agent 365 or E7 license. Read-only. |
+| `-AgentPolicyHits` | switch | Which DLP rules matched and which DLP or Insider Risk alerts were raised on which agent. Read-only. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
 | `-Policy` | path | Evaluate a JSON policy and print the plan. |
 | `-Snapshot` | path | Save the inventory to a JSON file. |
@@ -593,9 +620,11 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
 | `-AllAgents` | `-CheckConditionalAccess` | switch | Check every agent in the catalog instead of the risky ones. Not with `-ForAgent`. |
-| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess`, `-AgentUsers` | names and/or ids | List the individual events of these agents, check these agents instead of the risky ones, or show only the users of these agents. |
+| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess`, `-AgentUsers`, `-AgentPolicyHits` | names and/or ids | List the individual events of these agents, check these agents instead of the risky ones, or show only the users of these agents. |
 | `-UserDays` | `-AgentUsers` | 7, 14 or 30, default 30 | The period for interactions. |
 | `-Unlicensed` | `-AgentUsers` | switch | Only users who have neither an Agent 365 nor an E7 license. |
+| `-HitDays` | `-AgentPolicyHits` | 7, 14 or 30, default 30 | The period for policy hits. |
+| `-IncludeUnattributed` | `-AgentPolicyHits` | switch | Also list the hits that name only a person, so no agent can be named. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
 | `-EndpointDays` | `-EndpointAi`, `-BlockLocalAgent` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
@@ -612,6 +641,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 ## Limitations
 
 - **Agent users counts what the audit trail can attribute.** An interaction appears only when Defender ties it to a user and the event carries an id that maps to a catalog agent. Agents that emit no user-attributed events, and events with no agent id, are not counted. Retention is about 30 days.
+- **Policy hits are evidence, not configuration.** `-AgentPolicyHits` shows what fired. A hit is tied to an agent only through the application id it names or an agent user account; a hit that names only a person stays unattributed, which can be most of them (117 of 121 in the tenant this was built against). Insider Risk alerts and Communication Compliance depend on the policies you have created, and Communication Compliance has no source at all.
 - **E7 is recognised by name or by its Agent 365 plan.** The Learn licensing reference lists no E7 SKU yet, so a user counts as E7-licensed when a SKU name contains E7, and as Agent 365-licensed when a SKU carries the `AGENT_365` plan.
 - **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls, the Conditional Access policy read and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
@@ -639,6 +669,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | Conditional Access check is refused | Grant `Policy.Read.All` and `IdentityRiskyAgent.Read.All` (or `IdentityRiskyAgent.ReadWrite.All`). Reading policies needs a role such as Security Reader or Conditional Access Administrator. |
 | Agent users shows nothing | The feed may be stale or the agents may not emit user-attributed events. Check the latest CloudAppEvents rows with ActionType InvokeAgent in Advanced Hunting, and widen the period. |
 | Agent users says license details could not be read | The signed-in account needs an Entra role that can read license details (License Administrator, User Administrator, Global Reader). |
+| Policy hits ties nothing to an agent | Many DLP events name the person who typed the prompt, not the agent. Run with `-IncludeUnattributed` to see them with the application id they carry. A per-agent policy ties its hits to the agent; a tenant-wide one cannot. |
+| Policy hits shows no Insider Risk alert | No Insider Risk policy raised one in the period, or none exists. Insider Risk alerts come from the Graph alerts API (source `microsoftInsiderRiskManagement`); the Risky agents risk levels are visible only in the Purview portal. |
 | Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
 ## Appendix: hunting queries
