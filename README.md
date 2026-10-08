@@ -475,11 +475,11 @@ Read-only. It shows which Purview policies **fired** on which agents. It is evid
 - **Output.** A summary line, a *By agent* table (hits by source, policies, last hit), a *By policy* table, and with `-IncludeUnattributed` the hits that name only a person. `-OutFile` writes one row per policy, rule, agent and account with the counts for 7, 14 and 30 days.
 - **Not covered.** Communication Compliance has no alert or event source here. Insider Risk risk levels per agent are shown in the Purview portal's DSPM AI observability page, which has no API this tool uses. Advanced Hunting keeps about 30 days.
 - **Requirements.** `ThreatHunting.Read.All`, `SecurityAlert.Read.All`, `User.Read.All`, `CopilotPackages.Read.All`, `AgentIdentity.Read.All` and `Application.Read.All`, all part of `-SignIn`.
-- **In the console**, **Policy hits...** opens the same data in a window with a 7, 14 or 30 day selector, a switch for hits not tied to an agent, a search box and export. It covers the ticked agents, or every agent when none is ticked; when you tick agents it says which of them had no hits. Select a row for the detail pane: how the hit was tied to the agent, what the policy did, the item with its path, the counts for 7, 14 and 30 days and where to look in Purview. **Defender alerts...** opens the list of Defender alerts that concern agents (below) for the same agents and period.
+- **In the console**, **Policy hits...** opens the same data in a window with a 7, 14 or 30 day selector, a switch for hits not tied to an agent, a search box and export. It covers the ticked agents, or every agent when none is ticked; when you tick agents it says which of them had no hits. Select a row for the detail pane: how the hit was tied to the agent, what the policy did, the item with its path, the counts for 7, 14 and 30 days and where to look in Purview. **Defender alerts...** in that window opens the list of Defender alerts that concern agents (below) for the same agents and period.
 
 #### Defender alerts on agents
 
-The **Defender alerts...** button in the Policy hits window lists the Defender alerts that concern agents, one row per alert, for the same agents and period: when it was raised, the agent, the alert, its severity and category, the Defender source, and how it was tied. Pick a severity and a period, search, export, or select an alert for the detail pane and press **Open in Defender** to open it in the Microsoft Defender portal.
+The **Defender alerts...** button on the main console (and the one in the Policy hits window) lists the Defender alerts that concern agents, one row per alert, for the ticked agents or all agents and a 7, 14 or 30 day period: when it was raised, the agent, the alert, its severity and category, the Defender source, and how it was tied. Pick a severity and a period, search, export, or select an alert for the detail pane and press **Open in Defender** to open it in the Microsoft Defender portal.
 
 - **What is listed.** An alert is listed when it carries the agent as an entity (Security for AI alerts, for example) or names the Azure AI resource a Foundry agent runs on. An alert naming an agent that Defender's inventory does not list is kept and named as the alert names it.
 - **What is not.** Defender for AI Services alerts about model deployments (jailbreak attempts against a model, LLM reconnaissance) name no agent, so they are not listed; they are in the Defender portal under Incidents and alerts.
@@ -536,7 +536,7 @@ The report lists agents that are new or removed, newly blocked or unblocked, and
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Export** and **Undo last run** on top; **Apply suggested**, **Restrict access...**, **Assign owner...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
+A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Agent users...**, **Policy hits...**, **Defender alerts...**, **Endpoint AI...**, **Export** and **Undo last run** on top (the window cannot be narrower than 1280 pixels, so this row always fits); **Apply suggested**, **Restrict access...**, **Assign owner...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
 
 | To do this | Use |
 | --- | --- |
@@ -552,6 +552,7 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Review AI activity | **AI activity...** opens the details window on that tab. |
 | See who uses an agent | **Agent users...** lists the users who interacted with each agent over the last 7, 14 or 30 days, with whether each has an Agent 365 or E7 license. It covers the ticked agents, or every agent when none is ticked. |
 | See which policies fired | **Policy hits...** lists the DLP rule matches and the DLP and Insider Risk alerts that concern each agent over the last 7, 14 or 30 days. It covers the ticked agents, or every agent when none is ticked. |
+| See Defender alerts on agents | **Defender alerts...** lists the Defender alerts that concern the ticked agents, or every agent when none is ticked, over the last 7, 14 or 30 days, with severity filters, a detail pane and **Open in Defender**. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. |
 | Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
 | Export | **Export** saves the grid as CSV or JSON. |
