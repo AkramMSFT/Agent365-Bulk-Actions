@@ -2732,3 +2732,118 @@ Describe 'Purview policy hits' {
         (Get-PolicyHitSummary @()).Total | Should -Be 0
     }
 }
+
+Describe 'Policy hits: clarity and Defender alerts' {
+    BeforeAll {
+        function New-KeyMap2 { param([hashtable]$Pairs) $m = @{}; foreach ($k in $Pairs.Keys) { $m[$k] = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($c in @($Pairs[$k])) { [void]$m[$k].Add($c) } }; $m }
+        function New-AlertRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$Title = 'Alert', [string]$Severity = 'Low', [datetime]$Time = (Get-Date).AddDays(-1), [string]$Category = 'Exfiltration')
+            [pscustomobject]@{ Time = $Time; AlertId = "id-$Title"; Agent = $Agent; AgentId = $AgentId; InInventory = [bool]$AgentId; Title = $Title; Severity = $Severity; Category = $Category; Source = 'Security for AI'; Via = 'Agent entity'; Link = "https://security.microsoft.com/alerts/id-$Title" }
+        }
+    }
+    It 'says in words where a hit happened' {
+        Get-PolicyWhereText -Location 'Copilot.M365' -Workload 'ExtendedApplications' | Should -Be 'Microsoft 365 Copilot'
+        Get-PolicyWhereText -Location '' -Workload 'MicrosoftTeams' | Should -Be 'Microsoft Teams'
+        Get-PolicyWhereText -Location '' -Workload 'ExtendedApplications' | Should -Be 'AI application'
+        Get-PolicyWhereText -Location 'Something.New' -Workload 'X' | Should -Be 'Something.New'
+        Get-PolicyWhereText -Location '' -Workload '' | Should -BeNullOrEmpty
+    }
+    It 'says in words what a rule did, and treats an alert as the action itself' {
+        Get-PolicyActionText 'GenerateAlert, RestrictAccess' 'DLP match' | Should -Be 'Raised an alert, blocked access'
+        Get-PolicyActionText 'NotifyUser' 'DLP match' | Should -Be 'Notified the user'
+        Get-PolicyActionText 'SomethingNew' 'DLP match' | Should -Be 'SomethingNew'
+        Get-PolicyActionText '' 'DLP match' | Should -Be 'Matched, no action recorded'
+        Get-PolicyActionText '' 'DLP alert' | Should -Be 'Raised an alert'
+        Get-PolicyActionText '' 'Insider Risk alert' | Should -Be 'Raised an alert'
+    }
+    It 'says in words how a hit was tied to an agent' {
+        Get-PolicyHitTiedText 'application id' | Should -Be 'App id on the event'
+        Get-PolicyHitTiedText 'agent user' | Should -BeLike '*own user account'
+        Get-PolicyHitTiedText '' | Should -Be 'Not tied to an agent'
+    }
+    It 'carries the item, the place and the plain-language fields on a DLP match' {
+        $script:DlpMatchKql | Should -BeLike '*Items = make_set(Item, 3)*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Workload = 'ExtendedApplications'; Loc = 'Copilot.M365'; App = 'app-1'; AccountObjectId = 'u-1'; User = 'Ann'; PolicyId = 'p'; Policy = 'Pol'; Rule = 'Rul'; Severity = ''
+                                                          Actions = '["GenerateAlert","RestrictAccess"]'; Items = @('Roster.docx', '', 'Roster.docx', 'Other.docx'); ItemPath = 'https://x/sites/s/Roster.docx'; N7 = 1; N14 = 2; N30 = 3; Last = '2026-10-06T10:00:00Z' }) }
+        $h = @(Get-DlpMatchHits)
+        $h[0].Where | Should -Be 'Microsoft 365 Copilot'; $h[0].Item | Should -Be 'Roster.docx; Other.docx'; $h[0].ItemPath | Should -Be 'https://x/sites/s/Roster.docx'
+        $row = New-PolicyHitRow -Agent 'A' -AgentId 'T_A' -Via 'application id' -Source 'DLP match' -Policy 'P' -Rule 'R' -Severity '' -Actions $h[0].Actions -Workload 'W' -User 'Ann' -N7 1 -N14 2 -N30 3 -Last (Get-Date) -Item $h[0].Item -Where $h[0].Where
+        $row.Did | Should -Be 'Raised an alert, blocked access'; $row.Tied | Should -Be 'App id on the event'; $row.Where | Should -Be 'Microsoft 365 Copilot'
+    }
+    It 'keeps an alert''s category and portal link' {
+        $a = ConvertTo-PurviewAlert @{ title = 'T'; serviceSource = 'dataLossPrevention'; category = 'Exfiltration'; alertWebUrl = 'https://security.microsoft.com/alerts/dl1?tid=t'; evidence = @() }
+        $a.Category | Should -Be 'Exfiltration'; $a.Link | Should -Be 'https://security.microsoft.com/alerts/dl1?tid=t'
+    }
+    It 'lists everything known about a hit, tied or not, and where to look' {
+        $tied = New-PolicyHitRow -Agent 'Alpha' -AgentId 'T_A' -Via 'application id' -Source 'DLP match' -Policy 'Alpha DLP' -Rule 'Block cards' -Severity '' -Actions 'RestrictAccess' -Workload 'W' -User 'Ann' -N7 1 -N14 2 -N30 3 -Last ([datetime]'2026-10-06 10:00') -App 'app-1' -Item 'Card.txt' -ItemPath 'https://x/Card.txt' -Where 'Microsoft Teams'
+        $d = @(Get-PolicyHitDetailRows $tied)
+        ($d | Where-Object Item -eq 'Catalog id').Info | Should -Be 'T_A'
+        ($d | Where-Object Item -eq 'How it is tied').Info | Should -BeLike '*application id app-1*'
+        ($d | Where-Object Item -eq 'What it did').Info | Should -Be 'Blocked access (RestrictAccess)'
+        ($d | Where-Object Item -eq 'Severity').Info | Should -Be 'Not recorded on this match'
+        ($d | Where-Object Item -eq 'Item').Info | Should -Be 'Card.txt  (https://x/Card.txt)'
+        ($d | Where-Object Item -eq 'Hits').Info | Should -Be '1 in the last 7 days, 2 in 14, 3 in 30'
+        ($d | Where-Object Section -eq 'Where to look').Info | Should -BeLike "*'Alpha DLP'*"
+        $loose = New-PolicyHitRow -Agent '' -AgentId '' -Via '' -Source 'DLP alert' -Policy 'DLP-X' -Rule '' -Severity 'low' -Actions '' -Workload '' -User 'ann@x' -N7 1 -N14 1 -N30 1 -Last (Get-Date) -App 'unknown-app' -Link 'https://security.microsoft.com/alerts/a1'
+        $l = @(Get-PolicyHitDetailRows $loose)
+        ($l | Where-Object { $_.Section -eq 'Agent' -and $_.Item -eq 'Agent' }).Info | Should -Be '(not tied to an agent)'
+        ($l | Where-Object Item -eq 'Why').Info | Should -BeLike '*names only a person (ann@x)*'
+        ($l | Where-Object Item -eq 'Application id').Info | Should -BeLike 'unknown-app*inventory*'
+        ($l | Where-Object Section -eq 'Where to look').Info | Should -Be 'Open the newest alert: https://security.microsoft.com/alerts/a1'
+        @($l | Where-Object Item -eq 'Catalog id').Count | Should -Be 0
+    }
+    It 'keeps every hit in AllRows for the tenant-wide context while Rows holds only the chosen agents' {
+        Mock Get-AgentKeyMap { New-KeyMap2 @{ 'app-1' = 't_a' } }
+        Mock Get-AgentUserMap { @{} }
+        Mock Get-DlpMatchHits {
+            @([pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = 'app-1'; UserId = 'u-1'; User = 'Ann'; Item = 'Card.txt'; ItemPath = ''; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'R'; Severity = ''; Actions = 'RestrictAccess'; N7 = 1; N14 = 1; N30 = 1; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = ''; UserId = 'u-2'; User = 'Bob'; Item = ''; ItemPath = ''; PolicyId = 'p2'; Policy = 'Generic DLP'; Rule = 'G'; Severity = ''; Actions = ''; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-09-20' })
+        }
+        Mock Get-PurviewAlerts { @() }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $all = Get-AgentPolicyHitsReport -Packages $pk
+        @($all.Rows).Count | Should -Be 2; @($all.AllRows).Count | Should -Be 2
+        $some = Get-AgentPolicyHitsReport -Packages $pk -OnlyIds @('T_B')
+        @($some.Rows).Count | Should -Be 0
+        @($some.AllRows).Count | Should -Be 2
+        (Get-PolicyHitSummary $some.AllRows).Unattributed | Should -Be 4
+        $mine = (Get-AgentPolicyHitsReport -Packages $pk -OnlyIds @('t_a')).Rows
+        $mine[0].Item | Should -Be 'Card.txt'; $mine[0].Did | Should -Be 'Blocked access'
+    }
+    It 'reads the Defender alerts that concern agents, with the portal link, naming agents the inventory lacks' {
+        $script:AgentAlertKql | Should -BeLike '*EntityType == "AIAgent"*EntityType == "CloudResource"*'
+        Mock Get-MgContext { [pscustomobject]@{ Account = 'a@b'; TenantId = 'ten-1' } }
+        Mock Invoke-HuntingQuery {
+            @([pscustomobject]@{ Timestamp = '2026-10-06T10:00:00Z'; AlertId = 'al1'; CatalogId = 'T_A'; Label = ''; Title = 'Jailbreak attempt'; Severity = 'High'; Category = 'InitialAccess'; ServiceSource = 'Microsoft Defender for Cloud'; DetectionSource = 'Microsoft Defender for AI Services'; Via = 'Agent entity' },
+              [pscustomobject]@{ Timestamp = '2026-10-05T10:00:00Z'; AlertId = 'al2'; CatalogId = ''; Label = 'Ghost agent'; Title = 'Odd tool call'; Severity = 'Low'; Category = 'Execution'; ServiceSource = 'Security for AI'; DetectionSource = 'Security for AI'; Via = 'Agent entity' })
+        }
+        $r = @(Get-AgentDefenderAlerts -Packages @((New-Pkg 'T_A' 'Alpha')))
+        $r.Count | Should -Be 2
+        $a = $r | Where-Object AlertId -eq 'al1'
+        $a.Agent | Should -Be 'Alpha'; $a.AgentId | Should -Be 'T_A'; $a.InInventory | Should -BeTrue; $a.Source | Should -Be 'Microsoft Defender for Cloud / Microsoft Defender for AI Services'
+        $a.Link | Should -Be 'https://security.microsoft.com/alerts/al1?tid=ten-1'; $a.Time | Should -BeOfType ([datetime])
+        $g = $r | Where-Object AlertId -eq 'al2'
+        $g.Agent | Should -Be 'Ghost agent'; $g.AgentId | Should -Be ''; $g.InInventory | Should -BeFalse; $g.Source | Should -Be 'Security for AI'
+    }
+    It 'selects the alerts of a period, at or above a severity, for chosen agents or a text, worst and newest first' {
+        $now = Get-Date
+        $rows = @((New-AlertRow -Title 'Old high' -Severity 'High' -Time $now.AddDays(-20)), (New-AlertRow -Title 'New low' -Severity 'Low' -Time $now.AddDays(-1)),
+                  (New-AlertRow -Title 'New high' -Severity 'High' -Time $now.AddDays(-2)), (New-AlertRow -Title 'Beta medium' -Agent 'Beta' -AgentId 'T_B' -Severity 'Medium' -Time $now.AddDays(-3)),
+                  (New-AlertRow -Title 'Unknown' -Agent 'Ghost' -AgentId '' -Severity 'Medium' -Time $now.AddDays(-4)))
+        (Select-AgentAlertRows -Rows $rows -Days 30 | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Old high', 'Beta medium', 'Unknown', 'New low')
+        (Select-AgentAlertRows -Rows $rows -Days 7 | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Beta medium', 'Unknown', 'New low')
+        (Select-AgentAlertRows -Rows $rows -Days 7 -MinSeverity 'Medium' | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Beta medium', 'Unknown')
+        (Select-AgentAlertRows -Rows $rows -Days 30 -OnlyIds @('t_b') | ForEach-Object { $_.Title }) | Should -Be @('Beta medium')
+        (Select-AgentAlertRows -Rows $rows -Days 30 -Text 'GHOST' | ForEach-Object { $_.Title }) | Should -Be @('Unknown')
+        @(Select-AgentAlertRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+    }
+    It 'lists everything known about a Defender alert' {
+        $d = @(Get-AgentAlertDetailRows (New-AlertRow -Title 'Jailbreak' -Severity 'High'))
+        ($d | Where-Object Item -eq 'Title').Info | Should -Be 'Jailbreak'
+        ($d | Where-Object Item -eq 'How it is tied').Info | Should -BeLike '*carries this agent*'
+        ($d | Where-Object Item -eq 'In the inventory').Info | Should -Be 'Yes'
+        ($d | Where-Object Section -eq 'Where to look').Info | Should -BeLike 'https://security.microsoft.com/alerts/*'
+        $g = @(Get-AgentAlertDetailRows (New-AlertRow -Title 'Odd' -Agent 'Ghost' -AgentId ''))
+        ($g | Where-Object Item -eq 'In the inventory').Info | Should -BeLike 'No:*'
+    }
+}
