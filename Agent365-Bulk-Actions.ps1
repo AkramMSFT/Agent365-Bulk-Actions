@@ -410,33 +410,53 @@ function Test-SavedSignIn {
     Test-Path -LiteralPath (Join-Path $HOME '.mg/mg.authrecord.json')
 }
 
-# Sign in. The Microsoft sign-in window is the normal route. Where none can be shown (a remote shell, a server without a browser, a
+# How the saved sign-in was made. The Graph module keeps a session made with a device code apart from one made with a window, and
+# only the same kind of connection can reuse it, so the tool notes the kind next to the saved session.
+function Get-SignInMethodPath {
+    Join-Path $HOME '.mg/a365.signin-method'
+}
+function Get-SignInMethod {
+    $f = Get-SignInMethodPath
+    if (Test-Path -LiteralPath $f) { ([string](Get-Content -LiteralPath $f -Raw)).Trim() } else { '' }
+}
+function Set-SignInMethod {
+    param([string]$Method)
+    $f = Get-SignInMethodPath
+    try {
+        if ($Method -eq 'devicecode') { Set-Content -LiteralPath $f -Value 'devicecode' -Encoding ascii }
+        else { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+    } catch { $null = $_ }
+}
+
+# Sign in. The Microsoft sign-in window always comes first. Only when it cannot be shown (a remote shell, a server without a browser, a
 # window that fails to open) and a person is at the terminal, fall back to a device code: a code and a page address printed here, to be
-# entered on any device. A session nobody can answer (a scheduled task) gets the instruction to run -SignIn instead.
+# entered on any device. A session made with a code can only be reused with a code, so an unattended or windowless run that finds one
+# reuses it that way and asks for a new code only when it has expired; at a terminal with a desktop the window is tried first and
+# replaces it (-Fresh, used by -SignIn, always starts over). A session nobody can answer (a scheduled task) gets one try and the
+# instruction to sign in.
 function Connect-GraphSession {
-    param([hashtable]$Connect, [switch]$DeviceCode)
+    param([hashtable]$Connect, [switch]$DeviceCode, [switch]$Fresh)
+    $person = Test-SignInPromptPossible
     $viaCode = {
         $c = $Connect.Clone(); $c['UseDeviceCode'] = $true
-        Write-Host 'Sign in with a device code: open https://microsoft.com/devicelogin on any device, enter the code shown below and finish the sign-in. A code works for about two minutes.' -ForegroundColor Cyan
+        if (-not (Test-SavedSignIn)) { Write-Host 'Signing in with a device code: open https://microsoft.com/devicelogin on any device and enter the code shown below. A code works for about two minutes.' -ForegroundColor Cyan }
+        $tries = if ($person) { 3 } else { 1 }
         for ($try = 1; ; $try++) {
-            try { Connect-MgGraph @c; return }
+            try { Connect-MgGraph @c; Set-SignInMethod 'devicecode'; return }
             catch {
                 $lapsed = $_.Exception.Message -match '(?i)timed out|expired|expire'
-                if ($lapsed -and $try -ge 3) { throw 'No code was entered in time. Run the command again and enter the code within two minutes of it appearing, or sign in on a machine where the Microsoft sign-in window can open (run -SignIn there).' }
+                if ($lapsed -and $try -ge $tries) { throw 'No code was entered in time. Run the command again and enter the code within two minutes of it appearing, or sign in on a machine where the Microsoft sign-in window can open (run -SignIn there).' }
                 if (-not $lapsed) { throw (Get-SignInHelp $_.Exception.Message) }
                 Write-Host 'The code expired before it was used. Getting a new one...' -ForegroundColor Yellow
             }
         }
     }
     if ($DeviceCode) { & $viaCode; return }
-    $person = Test-SignInPromptPossible
-    $why = Get-NoWindowReason
-    if ($why -and $person -and -not (Test-SavedSignIn)) {
-        Write-Host ("No sign-in window can be shown in {0}, so signing in with a device code." -f $why) -ForegroundColor Yellow
-        & $viaCode; return
-    }
+    # The window comes first. The one exception protects a session that already exists: when it was made with a code and nobody can be
+    # shown a window (an unattended run, a remote shell), a window attempt could only fail and delete it, so reuse it with a code.
+    if (-not $Fresh -and (Get-SignInMethod) -eq 'devicecode' -and (-not $person -or (Get-NoWindowReason))) { & $viaCode; return }
     if ($person -and -not (Test-SavedSignIn)) { Write-Host 'Signing in: a Microsoft sign-in window should open. If nothing appears, press Ctrl+C and run again with -DeviceCode.' -ForegroundColor DarkGray }
-    try { Connect-MgGraph @Connect }
+    try { Connect-MgGraph @Connect; Set-SignInMethod 'window' }
     catch {
         $msg = $_.Exception.Message
         $windowProblem = $msg -match '(?i)window handle|InteractiveBrowserCredential|interactive|browser|DISPLAY|timed out|timeout'
@@ -484,7 +504,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -a
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
-if (-not $script:LoadOnly) { Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode }
+if (-not $script:LoadOnly) { Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode -Fresh:($PSCmdlet.ParameterSetName -eq 'SignIn') }
 
 $script:ThrottleHits = 0   # incremented on every throttled retry; write loops watch it to adapt their pace
 function Add-ThrottleHit { $script:ThrottleHits++ }
@@ -6273,8 +6293,10 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host ("Signed in as {0} (tenant {1})." -f $c.Account, $c.TenantId) -ForegroundColor Green
         $missing = @($script:AllScopes | Where-Object { @($c.Scopes) -notcontains $_ })
         if ($missing.Count) { Write-Warning ("Not granted, so the modes that need them will ask again: {0}" -f ($missing -join ', ')) }
-        Write-Host 'The session is saved for this Windows account. Later runs, scheduled ones included, reuse it without a prompt until it expires or is revoked.' -ForegroundColor Cyan
-    }    'Compromise' {
+        if ((Get-SignInMethod) -eq 'devicecode') { Write-Host 'The session is saved for this Windows account. Later runs reuse it the same way, with a device code: a run asks for a new code only when this session has expired. A scheduled task cannot enter a code, so for scheduled runs sign in once with a window (-SignIn on a machine with a desktop).' -ForegroundColor Cyan }
+        else { Write-Host 'The session is saved for this Windows account. Later runs, scheduled ones included, reuse it without a prompt until it expires or is revoked.' -ForegroundColor Cyan }
+    }
+    'Compromise' {
         $targets = @(Resolve-Packages $ConfirmCompromised)
         $noIdentity = @($targets | Where-Object { -not $_.agentIdentityId })
         if ($noIdentity.Count) { Write-Warning ("No Entra agent identity, skipped: {0}" -f (($noIdentity | ForEach-Object { $_.displayName }) -join '; ')) }

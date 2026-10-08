@@ -2421,12 +2421,55 @@ Describe 'Sign-in fallback' {
         function Connect-MgGraph { param([string[]]$Scopes, [switch]$NoWelcome, [switch]$UseDeviceCode, [string]$TenantId) }
         $script:cn = @{ Scopes = @('CopilotPackages.Read.All'); NoWelcome = $true }
     }
-    BeforeEach { Mock Write-Host {} }
+    BeforeEach { Mock Write-Host {}; Mock Get-SignInMethod { '' }; Mock Set-SignInMethod {}; Mock Test-SavedSignIn { $false } }
     It 'signs in with a device code at once when asked' {
         Mock Connect-MgGraph {}
         Connect-GraphSession -Connect $script:cn -DeviceCode
         Should -Invoke Connect-MgGraph -Times 1 -Exactly
         Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'notes how the session was made, so the next run can reuse it' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -DeviceCode
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'devicecode' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'tries the window first at a terminal with a desktop, even when the saved session was made with a code' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Get-SignInMethod { 'devicecode' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'reuses a code session with a code, and no window attempt, when nobody can be shown a window' {
+        Mock Get-SignInMethod { 'devicecode' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Mock Test-SignInPromptPossible { $false }; Mock Get-NoWindowReason { '' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 2 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Write-Host -Times 0 -Exactly
+    }
+    It 'starts over with the window when -Fresh is used, whatever the saved session was' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Get-SignInMethod { 'devicecode' }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -Fresh
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'gives an unattended run one try at a code, not three' {
+        Mock Test-SignInPromptPossible { $false }
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; throw 'Authentication timed out after 120 seconds due to inactivity.' }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*No code was entered in time*'
+        $script:codes | Should -Be 1
     }
     It 'uses the sign-in window when one can be shown' {
         Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
@@ -2465,18 +2508,16 @@ Describe 'Sign-in fallback' {
         { Connect-GraphSession -Connect $script:cn } | Should -Throw '*AADSTS65001*'
         Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
     }
-    It 'goes straight to a device code in a remote shell with no saved sign-in, and tries the saved one first when there is one' {
-        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }
-        Mock Connect-MgGraph {}
-        Mock Test-SavedSignIn { $false }
-        Connect-GraphSession -Connect $script:cn
-        Should -Invoke Connect-MgGraph -Times 1 -Exactly
-        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
-        Mock Test-SavedSignIn { $true }
+    It 'tries the window first even in a remote shell, and uses a code only if the window fails' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured.' } }
         Connect-GraphSession -Connect $script:cn
         Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'devicecode' }
     }
     It 'asks for a new code when one expires, up to three times' {
+        Mock Test-SignInPromptPossible { $true }
         $script:codes = 0
         Mock Connect-MgGraph { $script:codes++; if ($script:codes -lt 3) { throw 'Authentication timed out. The device code expired.' } }
         { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Not -Throw
@@ -2554,5 +2595,18 @@ Describe 'Column filters' {
         $many = 1..30 | ForEach-Object { New-CfRow "Agent $_" 'k' }
         $cap = Get-ColumnChoices -Rows $many -Prop 'Name' -Max 10
         $cap.Total | Should -Be 30; @($cap.Items).Count | Should -Be 10
+    }
+}
+
+Describe 'Sign-in method note' {
+    It 'keeps the method in a file next to the saved session and clears it for a window sign-in' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ('a365-method-{0}.txt' -f [guid]::NewGuid())
+        try {
+            Mock Get-SignInMethodPath { $f }
+            Get-SignInMethod | Should -Be ''
+            Set-SignInMethod 'devicecode'; Get-SignInMethod | Should -Be 'devicecode'
+            Set-SignInMethod 'window'; Get-SignInMethod | Should -Be ''
+            Test-Path -LiteralPath $f | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
     }
 }
