@@ -4193,7 +4193,7 @@ function Get-DeleteCandidates {
 $GuiXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Agent 365 Bulk Actions" Width="1380" Height="780" MinWidth="1100" MinHeight="560"
+        Title="Agent 365 Bulk Actions" Width="1380" Height="780" MinWidth="1280" MinHeight="560"
         WindowStartupLocation="CenterScreen" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Window.Resources>
@@ -4547,6 +4547,7 @@ $GuiXaml = @'
           <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
           <Button x:Name="BtnAgentUsers" Content="Agent users..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which users interacted with which agent over the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
           <Button x:Name="BtnPolicyHits" Content="Policy hits..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which Purview policies fired on which agents: DLP rule matches and DLP or Insider Risk alerts over the last 7, 14 or 30 days. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
+          <Button x:Name="BtnDefenderAlerts" Content="Defender alerts..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="The Defender alerts that concern agents (Security for AI and others), over the last 7, 14 or 30 days, with severity filters and a link to open each in the Defender portal. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
           <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
           <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0"/>
           <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Padding="12,8" IsEnabled="False"/>
@@ -5991,7 +5992,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnDefenderAlerts', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -6516,6 +6517,10 @@ function New-ConsoleWindow {
     $script:ui.BtnPolicyHits.Add_Click({
         $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
         (New-PolicyHitsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
+    })
+    $script:ui.BtnDefenderAlerts.Add_Click({
+        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
+        (New-AgentAlertsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked -Days 30).ShowDialog() | Out-Null
     })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
