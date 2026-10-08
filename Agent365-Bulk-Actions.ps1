@@ -378,6 +378,9 @@ $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
 function Get-SignInHelp {
     param([string]$Message)
+    if ($Message -match '(?i)cancel') {
+        return ('Sign-in was cancelled before it finished. Run the command again and complete the Microsoft sign-in window, or add -DeviceCode to sign in with a code on any device. (Original error: ' + $Message.Split("`n")[0].Trim() + ')')
+    }
     if ($Message -match 'window handle|InteractiveBrowserCredential|interactive') {
         return ('There is no saved sign-in that covers the permissions this mode needs, and this session cannot show a sign-in window. ' +
                 'In a terminal on this PC, as the account that runs the tool, run: .\Agent365-Bulk-Actions.ps1 -SignIn. ' +
