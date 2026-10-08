@@ -2457,8 +2457,10 @@ Describe 'Sign-in fallback' {
     }
     It 'does not fall back when the person cancels or the service refuses' {
         Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
-        Mock Connect-MgGraph { throw 'User canceled authentication.' }
-        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*canceled*'
+        Mock Connect-MgGraph { throw 'InteractiveBrowserCredential authentication failed: User canceled authentication.' }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*cancelled before it finished*-DeviceCode*'
+        $said = try { Connect-GraphSession -Connect $script:cn; '' } catch { $_.Exception.Message }
+        $said | Should -Not -BeLike '*cannot show a sign-in window*'
         Mock Connect-MgGraph { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
         { Connect-GraphSession -Connect $script:cn } | Should -Throw '*AADSTS65001*'
         Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
