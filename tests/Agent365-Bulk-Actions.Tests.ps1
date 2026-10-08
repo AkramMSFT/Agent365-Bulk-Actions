@@ -2483,7 +2483,7 @@ Describe 'Sign-in fallback' {
         $script:codes | Should -Be 3
         $script:codes = 0
         Mock Connect-MgGraph { $script:codes++; throw 'Authentication timed out. The device code expired.' }
-        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*timed out*'
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*No code was entered in time*'
         $script:codes | Should -Be 3
     }
     It 'sees a remote shell and a session nobody can answer' {

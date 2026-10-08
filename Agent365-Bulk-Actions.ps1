@@ -421,7 +421,9 @@ function Connect-GraphSession {
         for ($try = 1; ; $try++) {
             try { Connect-MgGraph @c; return }
             catch {
-                if ($try -ge 3 -or $_.Exception.Message -notmatch '(?i)timed out|expired|expire') { throw (Get-SignInHelp $_.Exception.Message) }
+                $lapsed = $_.Exception.Message -match '(?i)timed out|expired|expire'
+                if ($lapsed -and $try -ge 3) { throw 'No code was entered in time. Run the command again and enter the code within two minutes of it appearing, or sign in on a machine where the Microsoft sign-in window can open (run -SignIn there).' }
+                if (-not $lapsed) { throw (Get-SignInHelp $_.Exception.Message) }
                 Write-Host 'The code expired before it was used. Getting a new one...' -ForegroundColor Yellow
             }
         }
