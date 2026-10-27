@@ -5062,7 +5062,7 @@ function Get-DeleteCandidates {
 $GuiXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Agent 365 Bulk Actions" Width="1380" Height="780" MinWidth="1280" MinHeight="560"
+        Title="Agent 365 Bulk Actions" Width="1500" Height="880" MinWidth="1320" MinHeight="620"
         WindowStartupLocation="CenterScreen" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Window.Resources>
@@ -5181,272 +5181,391 @@ $GuiXaml = @'
     <Style x:Key="Pill" TargetType="Border">
       <Setter Property="CornerRadius" Value="10"/><Setter Property="Padding" Value="10,2"/><Setter Property="HorizontalAlignment" Value="Left"/>
     </Style>
+    <!-- the shell: navigation like the Agent 365 portal, and the cards on Home and All agents -->
+    <Style x:Key="NavIcon" TargetType="TextBlock">
+      <Setter Property="FontFamily" Value="Segoe MDL2 Assets"/><Setter Property="FontSize" Value="15"/><Setter Property="Width" Value="24"/>
+      <Setter Property="Margin" Value="0,0,10,0"/><Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style x:Key="Nav" TargetType="RadioButton">
+      <Setter Property="GroupName" Value="nav"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Foreground" Value="{StaticResource Ink}"/><Setter Property="Padding" Value="14,9"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="RadioButton">
+            <Grid x:Name="bg" Background="Transparent" Margin="6,1">
+              <Border x:Name="bar" Width="3" HorizontalAlignment="Left" Background="#0F6CBD" CornerRadius="2" Margin="0,8" Visibility="Hidden"/>
+              <ContentPresenter Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bg" Property="Background" Value="#F0F0F0"/></Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="bar" Property="Visibility" Value="Visible"/><Setter TargetName="bg" Property="Background" Value="#EBEBEB"/><Setter Property="FontWeight" Value="SemiBold"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="NavChild" TargetType="RadioButton" BasedOn="{StaticResource Nav}"><Setter Property="Padding" Value="48,8,14,8"/></Style>
+    <Style x:Key="NavGroup" TargetType="Button">
+      <Setter Property="Cursor" Value="Hand"/><Setter Property="Foreground" Value="{StaticResource Ink}"/><Setter Property="Padding" Value="14,9"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="Transparent" Margin="6,1" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bg" Property="Background" Value="#F0F0F0"/></Trigger></ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="HomeCard" TargetType="Button">
+      <Setter Property="Cursor" Value="Hand"/><Setter Property="Width" Value="236"/><Setter Property="Margin" Value="0,0,14,14"/><Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="16,12">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="BorderBrush" Value="#0F6CBD"/></Trigger></ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="White"/><Setter Property="BorderBrush" Value="{StaticResource Line}"/><Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/><Setter Property="Padding" Value="16,8"/><Setter Property="Margin" Value="12,0,0,0"/><Setter Property="MinWidth" Value="130"/>
+    </Style>
+    <Style x:Key="CardLabel" TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource Muted}"/><Setter Property="TextWrapping" Value="Wrap"/></Style>
+    <Style x:Key="CardValue" TargetType="TextBlock"><Setter Property="FontSize" Value="24"/><Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="{StaticResource Ink}"/><Setter Property="Margin" Value="0,2,0,2"/></Style>
+    <Style x:Key="CardSub" TargetType="TextBlock"><Setter Property="Foreground" Value="{StaticResource Muted}"/><Setter Property="FontSize" Value="12"/><Setter Property="TextWrapping" Value="Wrap"/></Style>
   </Window.Resources>
 
   <Grid>
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
 
-    <!-- header -->
-    <Border Grid.Row="0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="24,16">
+    <!-- top bar -->
+    <Border Grid.Row="0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="20,10">
       <Grid>
-        <StackPanel>
-          <TextBlock Text="Agent 365 Bulk Actions" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource Ink}"/>
-          <TextBlock x:Name="Account" Foreground="{StaticResource Muted}" Margin="0,2,0,0"/>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="Agent 365 Bulk Actions" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource Ink}" VerticalAlignment="Center"/>
+          <TextBlock x:Name="Account" Foreground="{StaticResource Muted}" Margin="18,0,0,0" VerticalAlignment="Center"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
-          <Border Background="#F3F4F6" CornerRadius="8" Padding="14,6" Margin="0,0,10,0">
-            <StackPanel Orientation="Horizontal">
-              <TextBlock Text="Total " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountTotal" FontWeight="SemiBold" Margin="0,0,16,0"/>
-              <TextBlock Text="Blocked " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountBlocked" FontWeight="SemiBold" Foreground="#C42B1C" Margin="0,0,16,0"/>
-              <TextBlock Text="Showing " Foreground="{StaticResource Muted}"/><TextBlock x:Name="CountShown" FontWeight="SemiBold"/>
-            </StackPanel>
-          </Border>
-          <Button x:Name="BtnRefresh" Content="Refresh" Style="{StaticResource Btn}"/>
+          <TextBlock x:Name="ScopeText" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="The pages other than All agents cover the agents ticked there, or every agent when none is ticked."/>
+          <Button x:Name="BtnRefresh" Content="Refresh catalog" Style="{StaticResource Btn}" Padding="12,6" ToolTip="Read the agent catalog again. Pages that have read data read it again when you next open them."/>
         </StackPanel>
       </Grid>
     </Border>
 
-    <!-- toolbar -->
-    <Border Grid.Row="1" Padding="24,14,24,6">
-      <Grid>
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-        <Grid Grid.Row="0">
-          <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-          <TextBox x:Name="Search" Grid.Column="0" ToolTip="Search by name, publisher, platform or id"/>
-          <TextBlock Grid.Column="0" Text="Search agents" Foreground="#9CA3AF" IsHitTestVisible="False" Margin="12,0,0,0" VerticalAlignment="Center">
-            <TextBlock.Style>
-              <Style TargetType="TextBlock">
-                <Setter Property="Visibility" Value="Collapsed"/>
-                <Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=Search}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
-              </Style>
-            </TextBlock.Style>
-          </TextBlock>
-          <Border Grid.Column="1" Background="#E5E7EB" CornerRadius="7" Margin="14,0,0,0" Padding="1">
-            <StackPanel Orientation="Horizontal">
-              <RadioButton x:Name="FltAll" Content="All" GroupName="f" IsChecked="True" Style="{StaticResource Seg}"/>
-              <RadioButton x:Name="FltActive" Content="Active" GroupName="f" Style="{StaticResource Seg}"/>
-              <RadioButton x:Name="FltBlocked" Content="Blocked" GroupName="f" Style="{StaticResource Seg}"/>
-            </StackPanel>
-          </Border>
-          <Button x:Name="BtnReset" Grid.Column="2" Content="Reset filters" Style="{StaticResource Btn}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" IsEnabled="False"/>
-          <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
-            <CheckBox x:Name="DetailColsBox" Content="Tools and sharing columns" Margin="0,0,18,0" ToolTip="Adds tools, MCP servers, sharing and channels to the grid (reads Defender agent records once)."/>
-            <CheckBox x:Name="AgentsOnlyBox" Content="Copilot agents only"/>
-          </StackPanel>
-        </Grid>
-        <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
-          <StackPanel>
-          <WrapPanel VerticalAlignment="Center">
-            <TextBlock Text="FILTER BY" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
-            <TextBlock Text="Stale" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="StaleBox" Width="205" SelectedIndex="0">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="No activity for 7+ days" Tag="activity:7"/>
-              <ComboBoxItem Content="No activity for 14+ days" Tag="activity:14"/>
-              <ComboBoxItem Content="No activity for 21+ days" Tag="activity:21"/>
-              <ComboBoxItem Content="No activity for 29+ days" Tag="activity:29"/>
-              <ComboBoxItem Content="Not modified for 30+ days" Tag="modified:30"/>
-              <ComboBoxItem Content="Not modified for 60+ days" Tag="modified:60"/>
-              <ComboBoxItem Content="Not modified for 90+ days" Tag="modified:90"/>
-              <ComboBoxItem Content="Not modified for 180+ days" Tag="modified:180"/>
-              <ComboBoxItem Content="Not modified for 365+ days" Tag="modified:365"/>
-            </ComboBox>
-            <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="12,0,0,0" IsEnabled="False" ToolTip="Activity filters only: also match agents with no telemetry in the last 30 days"/>
-            <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
-            <TextBlock Text="Risk" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="RiskBox" Width="175" SelectedIndex="0">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Informational or above" Tag="Informational"/>
-              <ComboBoxItem Content="Low or above" Tag="Low"/>
-              <ComboBoxItem Content="Medium or above" Tag="Medium"/>
-              <ComboBoxItem Content="High only" Tag="High"/>
-            </ComboBox>
-            <TextBlock Text="from" VerticalAlignment="Center" Margin="10,0,8,0"/>
-            <ComboBox x:Name="SignalBox" Width="155" SelectedIndex="0" ToolTip="Alerts come from Security for AI. Detections are BehaviorInfo records (real-time protection, Prompt Shield) that may never raise an alert.">
-              <ComboBoxItem Content="Alerts + detections" Tag="Both"/>
-              <ComboBoxItem Content="Alerts only" Tag="Alerts"/>
-              <ComboBoxItem Content="Detections only" Tag="Detections"/>
-            </ComboBox>
-          </WrapPanel>
-          <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
-            <TextBlock Text="" Width="84"/>
-            <TextBlock Text="Ownership" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="OwnerBox" Width="190" SelectedIndex="0" ToolTip="Shared agents whose owner is missing, deleted or disabled, with a suggested replacement">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Needs an owner" Tag="needs"/>
-              <ComboBoxItem Content="Missing an Entra sponsor" Tag="nosponsor"/>
-              <ComboBoxItem Content="Missing a sponsor or owner (Entra)" Tag="noboth"/>
-            </ComboBox>
-            <TextBlock Text="Blocked" VerticalAlignment="Center" Margin="14,0,8,0"/>
-            <ComboBox x:Name="BlockedBox" Width="165" SelectedIndex="0" ToolTip="How long an agent has stayed blocked, from this tool's logs and the 30-day audit trail">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Any time" Tag="0"/>
-              <ComboBoxItem Content="7+ days" Tag="7"/>
-              <ComboBoxItem Content="30+ days" Tag="30"/>
-              <ComboBoxItem Content="60+ days" Tag="60"/>
-              <ComboBoxItem Content="90+ days" Tag="90"/>
-            </ComboBox>
-            <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
-            <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
-              <StackPanel Orientation="Horizontal">
-                <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter (default)"/>
-                <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
-              </StackPanel>
-            </Border>
-          </WrapPanel>
-          <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
-            <TextBlock Text="" Width="84"/>
-            <TextBlock Text="Tools" VerticalAlignment="Center" Margin="0,0,8,0" Width="64" TextAlignment="Right"/>
-            <ComboBox x:Name="ToolsBox" Width="190" SelectedIndex="0" ToolTip="Reads Defender's declared tools and MCP servers for each agent">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Uses an MCP server" Tag="mcp"/>
-              <ComboBoxItem Content="Has declared tools" Tag="tools"/>
-              <ComboBoxItem Content="Has no declared tools" Tag="none"/>
-            </ComboBox>
-            <TextBlock Text="Permissions" VerticalAlignment="Center" Margin="22,0,8,0"/>
-            <ComboBox x:Name="PermBox" Width="250" SelectedIndex="0" ToolTip="Scans the Entra permissions of every agent that has an identity (a few minutes the first time)">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Holds any Entra permission" Tag="any"/>
-              <ComboBoxItem Content="Holds a Microsoft Graph application permission" Tag="graphapp"/>
-              <ComboBoxItem Content="Holds an MCP server permission" Tag="mcp"/>
-            </ComboBox>
-            <TextBlock Text="Access" VerticalAlignment="Center" Margin="22,0,8,0"/>
-            <ComboBox x:Name="AccessBox" Width="190" SelectedIndex="0" ToolTip="Who each agent is available to. Narrowing it is a softer step than blocking.">
-              <ComboBoxItem Content="None" Tag=""/>
-              <ComboBoxItem Content="Open to everyone" Tag="allowedForAll"/>
-              <ComboBoxItem Content="Restricted to some" Tag="allowedForSome"/>
-              <ComboBoxItem Content="Available to nobody" Tag="allowedForNone"/>
-            </ComboBox>
-          </WrapPanel>
-          </StackPanel>
-        </Border>
-      </Grid>
-    </Border>
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="216"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
 
-    <!-- grid -->
-    <Border Grid.Row="2" Margin="24,8,24,0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8">
-      <Grid>
-        <DataGrid x:Name="Grid" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" CanUserResizeRows="False"
-                  HeadersVisibility="Column" GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#F0F1F3" BorderThickness="0"
-                  Background="White" SelectionMode="Single" RowHeaderWidth="0" IsReadOnly="False" SelectionUnit="FullRow">
-          <DataGrid.Columns>
-            <DataGridTemplateColumn Width="46" SortMemberPath="Checked">
-              <DataGridTemplateColumn.Header><CheckBox x:Name="HeaderCheck" HorizontalAlignment="Center" ToolTip="Select or clear every visible row"/></DataGridTemplateColumn.Header>
-              <DataGridTemplateColumn.CellTemplate><DataTemplate>
-                <CheckBox IsChecked="{Binding Checked, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-              </DataTemplate></DataGridTemplateColumn.CellTemplate>
-            </DataGridTemplateColumn>
-            <DataGridTextColumn Header="Agent" Binding="{Binding Name}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTemplateColumn Header="Status" Width="100" SortMemberPath="Status" IsReadOnly="True">
-              <DataGridTemplateColumn.CellTemplate><DataTemplate>
-                <Border>
-                  <Border.Style>
-                    <Style TargetType="Border" BasedOn="{StaticResource Pill}">
-                      <Setter Property="Background" Value="#DFF6DD"/>
-                      <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Background" Value="#FDE7E9"/></DataTrigger></Style.Triggers>
-                    </Style>
-                  </Border.Style>
-                  <TextBlock Text="{Binding Status}" FontWeight="SemiBold" FontSize="12">
-                    <TextBlock.Style>
-                      <Style TargetType="TextBlock">
-                        <Setter Property="Foreground" Value="#0B6A0B"/>
-                        <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger></Style.Triggers>
-                      </Style>
-                    </TextBlock.Style>
-                  </TextBlock>
-                </Border>
-              </DataTemplate></DataGridTemplateColumn.CellTemplate>
-            </DataGridTemplateColumn>
-            <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Owner" Binding="{Binding Owner}" Width="1.4*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Tools" Binding="{Binding ToolCount}" Width="62" SortMemberPath="ToolCountSort" IsReadOnly="True" Visibility="Collapsed"/>
-            <DataGridTextColumn Header="MCP servers" Binding="{Binding Mcp}" Width="1.3*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
-            <DataGridTextColumn Header="Shared with" Binding="{Binding SharedCount}" Width="105" IsReadOnly="True" Visibility="Collapsed"/>
-            <DataGridTextColumn Header="Channels" Binding="{Binding Channels}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
-            <DataGridTextColumn Header="Permissions held" Binding="{Binding PermNote}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
-            <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Blocked for" Binding="{Binding BlockedFor}" Width="95" SortMemberPath="BlockedForSort" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Idle days" Binding="{Binding Idle}" Width="80" SortMemberPath="IdleSort" IsReadOnly="True"/>
-            <DataGridTemplateColumn Header="Risk" Width="110" SortMemberPath="RiskSort" IsReadOnly="True">
-              <DataGridTemplateColumn.CellTemplate><DataTemplate>
-                <TextBlock Text="{Binding Risk}" FontWeight="SemiBold">
+      <!-- navigation, grouped like the Agent 365 portal -->
+      <Border Background="#FAFAFA" BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,0">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="0,10,0,10">
+            <RadioButton x:Name="NavHome" Style="{StaticResource Nav}" Tag="home"><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xE80F;"/><TextBlock Text="Home"/></StackPanel></RadioButton>
+            <Button x:Name="NavAgentsGroup" Style="{StaticResource NavGroup}" Tag="AgentsKids">
+              <DockPanel><TextBlock x:Name="AgentsChevron" DockPanel.Dock="Right" FontFamily="Segoe MDL2 Assets" FontSize="10" VerticalAlignment="Center" Text="&#xE70E;"/>
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xE99A;"/><TextBlock Text="Agents"/></StackPanel></DockPanel>
+            </Button>
+            <StackPanel x:Name="AgentsKids">
+              <RadioButton x:Name="NavAgents" Style="{StaticResource NavChild}" Tag="agents" Content="All agents" IsChecked="True"/>
+              <RadioButton x:Name="NavShadow" Style="{StaticResource NavChild}" Tag="shadow" Content="Shadow AI" ToolTip="Local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint"/>
+              <RadioButton x:Name="NavTools" Style="{StaticResource NavChild}" Tag="tools" Content="Tools" ToolTip="Which MCP servers each agent may reach, sets up and calls, and a per-agent block"/>
+            </StackPanel>
+            <RadioButton x:Name="NavUsers" Style="{StaticResource Nav}" Tag="users" ToolTip="Who uses which agent, and whether each user has an Agent 365 or E7 license"><StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xE716;"/><TextBlock Text="Users"/></StackPanel></RadioButton>
+            <Button x:Name="NavSecurityGroup" Style="{StaticResource NavGroup}" Tag="SecurityKids">
+              <DockPanel><TextBlock x:Name="SecurityChevron" DockPanel.Dock="Right" FontFamily="Segoe MDL2 Assets" FontSize="10" VerticalAlignment="Center" Text="&#xE70E;"/>
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xEA18;"/><TextBlock Text="Security"/></StackPanel></DockPanel>
+            </Button>
+            <StackPanel x:Name="SecurityKids">
+              <RadioButton x:Name="NavAlerts" Style="{StaticResource NavChild}" Tag="alerts" Content="Alerts" ToolTip="Defender XDR alerts that concern agents"/>
+              <RadioButton x:Name="NavHits" Style="{StaticResource NavChild}" Tag="hits" Content="Policy hits" ToolTip="Purview DLP rule matches and DLP or Insider Risk alerts on agents"/>
+              <RadioButton x:Name="NavCa" Style="{StaticResource NavChild}" Tag="ca" Content="Conditional Access" ToolTip="Whether a Conditional Access policy blocks each agent at High agent risk"/>
+            </StackPanel>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+
+      <Grid x:Name="PageHost" Grid.Column="1">
+
+        <!-- Home: the state of the catalog, and the security pages' findings once they have been read -->
+        <ScrollViewer x:Name="PageHome" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+          <StackPanel Margin="28,22,28,22">
+            <TextBlock Text="Home" FontSize="26" FontWeight="SemiBold" Foreground="{StaticResource Ink}"/>
+            <TextBlock Foreground="{StaticResource Muted}" Margin="0,4,0,20" TextWrapping="Wrap" Text="The state of the agents in your catalog. Select a card to open the page behind it. Security cards fill in once their page has been opened."/>
+            <TextBlock Text="Agents" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource Ink}" Margin="0,0,0,10"/>
+            <WrapPanel>
+              <Button Style="{StaticResource HomeCard}" Tag="agents"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Total agents"/><TextBlock x:Name="HomeTotal" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeTotalSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="agents:blocked"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Blocked"/><TextBlock x:Name="HomeBlocked" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeBlockedSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="agents:owner"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Shared agents without an owner"/><TextBlock x:Name="HomeNoOwner" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeNoOwnerSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="ca"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="With an Entra agent identity"/><TextBlock x:Name="HomeIdentity" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeIdentitySub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+            </WrapPanel>
+            <TextBlock Text="Security" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource Ink}" Margin="0,8,0,10"/>
+            <WrapPanel>
+              <Button Style="{StaticResource HomeCard}" Tag="alerts"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Defender alerts, 30 days"/><TextBlock x:Name="HomeAlerts" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeAlertsSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="ca"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Not protected by Conditional Access"/><TextBlock x:Name="HomeCa" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeCaSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="tools:unused"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Unused MCP permissions"/><TextBlock x:Name="HomeMcp" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeMcpSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="users:unlicensed"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Users without a license"/><TextBlock x:Name="HomeUsers" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeUsersSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+            </WrapPanel>
+          </StackPanel>
+        </ScrollViewer>
+
+        <!-- All agents: the registry -->
+        <Grid x:Name="PageAgents">
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <Grid Grid.Row="0" Margin="24,16,24,0">
+            <StackPanel VerticalAlignment="Center">
+              <TextBlock Text="All agents" FontSize="26" FontWeight="SemiBold" Foreground="{StaticResource Ink}"/>
+              <TextBlock Foreground="{StaticResource Muted}" Margin="0,4,0,0" Text="Find, inspect, contain and govern the agents in your catalog. Tick agents to act on them."/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+              <Border Style="{StaticResource Card}"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Total agents"/><TextBlock x:Name="CountTotal" Style="{StaticResource CardValue}"/></StackPanel></Border>
+              <Border Style="{StaticResource Card}"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Blocked"/><TextBlock x:Name="CountBlocked" Style="{StaticResource CardValue}" Foreground="#C42B1C"/></StackPanel></Border>
+              <Border Style="{StaticResource Card}"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Showing"/><TextBlock x:Name="CountShown" Style="{StaticResource CardValue}"/></StackPanel></Border>
+            </StackPanel>
+          </Grid>
+
+          <!-- toolbar -->
+          <Border Grid.Row="1" Padding="24,14,24,6">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+              <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBox x:Name="Search" Grid.Column="0" ToolTip="Search by name, publisher, platform or id"/>
+                <TextBlock Grid.Column="0" Text="Search agents" Foreground="#9CA3AF" IsHitTestVisible="False" Margin="12,0,0,0" VerticalAlignment="Center">
                   <TextBlock.Style>
                     <Style TargetType="TextBlock">
-                      <Setter Property="Foreground" Value="#1F2937"/>
-                      <Style.Triggers>
-                        <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger>
-                        <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
-                      </Style.Triggers>
+                      <Setter Property="Visibility" Value="Collapsed"/>
+                      <Style.Triggers><DataTrigger Binding="{Binding Text, ElementName=Search}" Value=""><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers>
                     </Style>
                   </TextBlock.Style>
                 </TextBlock>
-              </DataTemplate></DataGridTemplateColumn.CellTemplate>
-            </DataGridTemplateColumn>
-            <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
-            <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Available to" Binding="{Binding Availability}" Width="150" IsReadOnly="True" Visibility="Collapsed" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Suggested owner" Binding="{Binding Suggested}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-            <DataGridTextColumn Header="Ownership note" Binding="{Binding OwnerNote}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
-          </DataGrid.Columns>
-        </DataGrid>
-        <StackPanel x:Name="EmptyNote" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed">
-          <TextBlock x:Name="EmptyText" Foreground="{StaticResource Muted}" FontSize="14" HorizontalAlignment="Center"/>
-        </StackPanel>
-      </Grid>
-    </Border>
+                <Border Grid.Column="1" Background="#E5E7EB" CornerRadius="7" Margin="14,0,0,0" Padding="1">
+                  <StackPanel Orientation="Horizontal">
+                    <RadioButton x:Name="FltAll" Content="All" GroupName="f" IsChecked="True" Style="{StaticResource Seg}"/>
+                    <RadioButton x:Name="FltActive" Content="Active" GroupName="f" Style="{StaticResource Seg}"/>
+                    <RadioButton x:Name="FltBlocked" Content="Blocked" GroupName="f" Style="{StaticResource Seg}"/>
+                  </StackPanel>
+                </Border>
+                <Button x:Name="BtnReset" Grid.Column="2" Content="Reset filters" Style="{StaticResource Btn}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" IsEnabled="False"/>
+                <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+                  <CheckBox x:Name="DetailColsBox" Content="Tools and sharing columns" Margin="0,0,18,0" ToolTip="Adds tools, MCP servers, sharing and channels to the grid (reads Defender agent records once)."/>
+                  <CheckBox x:Name="AgentsOnlyBox" Content="Copilot agents only"/>
+                </StackPanel>
+              </Grid>
+              <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8" Padding="14,10" Margin="0,12,0,0">
+                <StackPanel>
+                <WrapPanel VerticalAlignment="Center">
+                  <TextBlock Text="FILTER BY" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                  <TextBlock Text="Stale" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="StaleBox" Width="205" SelectedIndex="0">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="No activity for 7+ days" Tag="activity:7"/>
+                    <ComboBoxItem Content="No activity for 14+ days" Tag="activity:14"/>
+                    <ComboBoxItem Content="No activity for 21+ days" Tag="activity:21"/>
+                    <ComboBoxItem Content="No activity for 29+ days" Tag="activity:29"/>
+                    <ComboBoxItem Content="Not modified for 30+ days" Tag="modified:30"/>
+                    <ComboBoxItem Content="Not modified for 60+ days" Tag="modified:60"/>
+                    <ComboBoxItem Content="Not modified for 90+ days" Tag="modified:90"/>
+                    <ComboBoxItem Content="Not modified for 180+ days" Tag="modified:180"/>
+                    <ComboBoxItem Content="Not modified for 365+ days" Tag="modified:365"/>
+                  </ComboBox>
+                  <CheckBox x:Name="NeverSeenBox" Content="include never seen" VerticalAlignment="Center" Margin="12,0,0,0" IsEnabled="False" ToolTip="Activity filters only: also match agents with no telemetry in the last 30 days"/>
+                  <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
+                  <TextBlock Text="Risk" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="RiskBox" Width="175" SelectedIndex="0">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Informational or above" Tag="Informational"/>
+                    <ComboBoxItem Content="Low or above" Tag="Low"/>
+                    <ComboBoxItem Content="Medium or above" Tag="Medium"/>
+                    <ComboBoxItem Content="High only" Tag="High"/>
+                  </ComboBox>
+                  <TextBlock Text="from" VerticalAlignment="Center" Margin="10,0,8,0"/>
+                  <ComboBox x:Name="SignalBox" Width="155" SelectedIndex="0" ToolTip="Alerts come from Security for AI. Detections are BehaviorInfo records (real-time protection, Prompt Shield) that may never raise an alert.">
+                    <ComboBoxItem Content="Alerts + detections" Tag="Both"/>
+                    <ComboBoxItem Content="Alerts only" Tag="Alerts"/>
+                    <ComboBoxItem Content="Detections only" Tag="Detections"/>
+                  </ComboBox>
+                </WrapPanel>
+                <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
+                  <TextBlock Text="" Width="84"/>
+                  <TextBlock Text="Ownership" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="OwnerBox" Width="190" SelectedIndex="0" ToolTip="Shared agents whose owner is missing, deleted or disabled, with a suggested replacement">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Needs an owner" Tag="needs"/>
+                    <ComboBoxItem Content="Missing an Entra sponsor" Tag="nosponsor"/>
+                    <ComboBoxItem Content="Missing a sponsor or owner (Entra)" Tag="noboth"/>
+                  </ComboBox>
+                  <TextBlock Text="Blocked" VerticalAlignment="Center" Margin="14,0,8,0"/>
+                  <ComboBox x:Name="BlockedBox" Width="165" SelectedIndex="0" ToolTip="How long an agent has stayed blocked, from this tool's logs and the 30-day audit trail">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Any time" Tag="0"/>
+                    <ComboBoxItem Content="7+ days" Tag="7"/>
+                    <ComboBoxItem Content="30+ days" Tag="30"/>
+                    <ComboBoxItem Content="60+ days" Tag="60"/>
+                    <ComboBoxItem Content="90+ days" Tag="90"/>
+                  </ComboBox>
+                  <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
+                  <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
+                    <StackPanel Orientation="Horizontal">
+                      <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter (default)"/>
+                      <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
+                    </StackPanel>
+                  </Border>
+                </WrapPanel>
+                <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
+                  <TextBlock Text="" Width="84"/>
+                  <TextBlock Text="Tools" VerticalAlignment="Center" Margin="0,0,8,0" Width="64" TextAlignment="Right"/>
+                  <ComboBox x:Name="ToolsBox" Width="190" SelectedIndex="0" ToolTip="Reads Defender's declared tools and MCP servers for each agent">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Uses an MCP server" Tag="mcp"/>
+                    <ComboBoxItem Content="Has declared tools" Tag="tools"/>
+                    <ComboBoxItem Content="Has no declared tools" Tag="none"/>
+                  </ComboBox>
+                  <TextBlock Text="Permissions" VerticalAlignment="Center" Margin="22,0,8,0"/>
+                  <ComboBox x:Name="PermBox" Width="250" SelectedIndex="0" ToolTip="Scans the Entra permissions of every agent that has an identity (a few minutes the first time)">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Holds any Entra permission" Tag="any"/>
+                    <ComboBoxItem Content="Holds a Microsoft Graph application permission" Tag="graphapp"/>
+                    <ComboBoxItem Content="Holds an MCP server permission" Tag="mcp"/>
+                  </ComboBox>
+                  <TextBlock Text="Access" VerticalAlignment="Center" Margin="22,0,8,0"/>
+                  <ComboBox x:Name="AccessBox" Width="190" SelectedIndex="0" ToolTip="Who each agent is available to. Narrowing it is a softer step than blocking.">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Open to everyone" Tag="allowedForAll"/>
+                    <ComboBoxItem Content="Restricted to some" Tag="allowedForSome"/>
+                    <ComboBoxItem Content="Available to nobody" Tag="allowedForNone"/>
+                  </ComboBox>
+                </WrapPanel>
+                </StackPanel>
+              </Border>
+            </Grid>
+          </Border>
 
-    <!-- action bar: inspect and export on the first row, changes on the second -->
-    <Border Grid.Row="3" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,12" Margin="0,12,0,0">
-      <Grid>
-        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-        <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
-          <TextBlock x:Name="SelectedText" FontWeight="SemiBold" VerticalAlignment="Center" MinWidth="110"/>
-          <Button x:Name="BtnSelectVisible" Content="Select visible" Style="{StaticResource BtnLink}" Margin="12,0,0,0"/>
-          <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
-        </StackPanel>
-        <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
-          <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
-          <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
-          <Button x:Name="BtnAgentUsers" Content="Agent users..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which users interacted with which agent over the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
-          <Button x:Name="BtnPolicyHits" Content="Policy hits..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Which Purview policies fired on which agents: DLP rule matches and DLP or Insider Risk alerts over the last 7, 14 or 30 days. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
-          <Button x:Name="BtnDefenderAlerts" Content="Defender alerts..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="The Defender alerts that concern agents (Security for AI and others), over the last 7, 14 or 30 days, with severity filters and a link to open each in the Defender portal. Uses the ticked agents, or every agent when none is ticked. Read-only."/>
-          <Button x:Name="BtnEndpointAi" Content="Endpoint AI..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" ToolTip="Find local AI agents and shadow AI on devices onboarded to Microsoft Defender for Endpoint, with their telemetry and risks. Read-only."/>
-          <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0"/>
-          <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Padding="12,8" IsEnabled="False"/>
-        </StackPanel>
-        <StackPanel Grid.Row="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,10,0,0">
-          <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Adds the suggested owner (or sponsor) to the ticked agents. Choose an Ownership filter first: Needs an owner, Missing an Entra sponsor, or Missing a sponsor or owner. Only rows that show a suggestion can be applied."/>
-          <Button x:Name="BtnRestrict" Content="Restrict access..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Narrow who can use the selected agents (nobody, their owner, named users and groups) or reopen them. A softer step than Block; the old scope is saved for Undo."/>
-          <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
-          <Button x:Name="BtnCompromise" Content="Entra risk &#9662;" Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Entra actions for the selected agents' identities: confirm them as compromised (risk level High, which a Conditional Access policy that blocks high agent risk then enforces) or clear that flag (Security Administrator role), check Conditional Access, or revoke the sessions of their agent user accounts.">
-            <Button.ContextMenu>
-              <ContextMenu>
-                <MenuItem Header="Confirm as compromised..." ToolTip="Entra sets the risk level to High. Undo last run dismisses it."/>
-                <MenuItem Header="Clear the compromised flag..." ToolTip="Dismiss the Entra risk of the selected agents. Entra shows them as dismissed afterwards."/>
-                <MenuItem Header="Check Conditional Access..." ToolTip="Read-only. Check whether a Conditional Access policy blocks each ticked agent at High agent risk, and which policies apply. With nothing ticked it checks every agent that has an Entra identity."/>
-                <MenuItem Header="Revoke sessions..." ToolTip="End the sessions of the ticked agents' user accounts, so a block or a Conditional Access change applies at once instead of when their tokens expire. An agent identity's own tokens cannot be revoked. Cannot be undone, and needs nothing undone."/>
-              </ContextMenu>
-            </Button.ContextMenu>
-          </Button>
-          <Button x:Name="BtnMcp" Content="MCP access..." Style="{StaticResource Btn}" Margin="8,0,0,0" ToolTip="Which MCP servers each agent may reach, sets up and calls, and a Conditional Access block for chosen agents and one server. Uses the ticked agents, or every agent when none is ticked."/>
-        </StackPanel>
-        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
-          <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
-          <Button x:Name="BtnUnblock" Content="Unblock selected" Style="{StaticResource BtnGood}" Margin="0,0,10,0" MinWidth="150" IsEnabled="False"/>
-          <Button x:Name="BtnBlock" Content="Block selected" Style="{StaticResource BtnDanger}" MinWidth="150" IsEnabled="False"/>
-        </StackPanel>
+          <!-- grid -->
+          <Border Grid.Row="2" Margin="24,8,24,0" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="8">
+            <Grid>
+              <DataGrid x:Name="Grid" AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False" CanUserResizeRows="False"
+                        HeadersVisibility="Column" GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#F0F1F3" BorderThickness="0"
+                        Background="White" SelectionMode="Single" RowHeaderWidth="0" IsReadOnly="False" SelectionUnit="FullRow">
+                <DataGrid.Columns>
+                  <DataGridTemplateColumn Width="46" SortMemberPath="Checked">
+                    <DataGridTemplateColumn.Header><CheckBox x:Name="HeaderCheck" HorizontalAlignment="Center" ToolTip="Select or clear every visible row"/></DataGridTemplateColumn.Header>
+                    <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                      <CheckBox IsChecked="{Binding Checked, UpdateSourceTrigger=PropertyChanged}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </DataTemplate></DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
+                  <DataGridTextColumn Header="Agent" Binding="{Binding Name}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTemplateColumn Header="Status" Width="100" SortMemberPath="Status" IsReadOnly="True">
+                    <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                      <Border>
+                        <Border.Style>
+                          <Style TargetType="Border" BasedOn="{StaticResource Pill}">
+                            <Setter Property="Background" Value="#DFF6DD"/>
+                            <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Background" Value="#FDE7E9"/></DataTrigger></Style.Triggers>
+                          </Style>
+                        </Border.Style>
+                        <TextBlock Text="{Binding Status}" FontWeight="SemiBold" FontSize="12">
+                          <TextBlock.Style>
+                            <Style TargetType="TextBlock">
+                              <Setter Property="Foreground" Value="#0B6A0B"/>
+                              <Style.Triggers><DataTrigger Binding="{Binding IsBlocked}" Value="True"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger></Style.Triggers>
+                            </Style>
+                          </TextBlock.Style>
+                        </TextBlock>
+                      </Border>
+                    </DataTemplate></DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
+                  <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Platform" Binding="{Binding Platform}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Publisher" Binding="{Binding Publisher}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Owner" Binding="{Binding Owner}" Width="1.4*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Tools" Binding="{Binding ToolCount}" Width="62" SortMemberPath="ToolCountSort" IsReadOnly="True" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="MCP servers" Binding="{Binding Mcp}" Width="1.3*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="Shared with" Binding="{Binding SharedCount}" Width="105" IsReadOnly="True" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="Channels" Binding="{Binding Channels}" Width="1.2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="Permissions held" Binding="{Binding PermNote}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="Modified" Binding="{Binding Modified}" Width="95" IsReadOnly="True"/>
+                  <DataGridTextColumn Header="Blocked for" Binding="{Binding BlockedFor}" Width="95" SortMemberPath="BlockedForSort" IsReadOnly="True"/>
+                  <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity}" Width="105" SortMemberPath="LastActivity" IsReadOnly="True"/>
+                  <DataGridTextColumn Header="Idle days" Binding="{Binding Idle}" Width="80" SortMemberPath="IdleSort" IsReadOnly="True"/>
+                  <DataGridTemplateColumn Header="Risk" Width="110" SortMemberPath="RiskSort" IsReadOnly="True">
+                    <DataGridTemplateColumn.CellTemplate><DataTemplate>
+                      <TextBlock Text="{Binding Risk}" FontWeight="SemiBold">
+                        <TextBlock.Style>
+                          <Style TargetType="TextBlock">
+                            <Setter Property="Foreground" Value="#1F2937"/>
+                            <Style.Triggers>
+                              <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#A4262C"/></DataTrigger>
+                              <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+                            </Style.Triggers>
+                          </Style>
+                        </TextBlock.Style>
+                      </TextBlock>
+                    </DataTemplate></DataGridTemplateColumn.CellTemplate>
+                  </DataGridTemplateColumn>
+                  <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
+                  <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
+                  <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Available to" Binding="{Binding Availability}" Width="150" IsReadOnly="True" Visibility="Collapsed" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Suggested owner" Binding="{Binding Suggested}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Ownership note" Binding="{Binding OwnerNote}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                </DataGrid.Columns>
+              </DataGrid>
+              <StackPanel x:Name="EmptyNote" HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed">
+                <TextBlock x:Name="EmptyText" Foreground="{StaticResource Muted}" FontSize="14" HorizontalAlignment="Center"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+
+          <!-- action bar: inspect and export on the first row, changes on the second -->
+          <Border Grid.Row="3" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,12" Margin="0,12,0,0">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+              <StackPanel Grid.Row="0" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock x:Name="SelectedText" FontWeight="SemiBold" VerticalAlignment="Center" MinWidth="110"/>
+                <Button x:Name="BtnSelectVisible" Content="Select visible" Style="{StaticResource BtnLink}" Margin="12,0,0,0"/>
+                <Button x:Name="BtnClearSel" Content="Clear selection" Style="{StaticResource BtnLink}" Margin="6,0,0,0"/>
+              </StackPanel>
+              <StackPanel Grid.Row="0" Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="BtnDetails" Content="Details..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Full record of the highlighted agent: sharing, tools, MCP servers, permissions, identity and usage. Double-click a row does the same."/>
+                <Button x:Name="BtnAi" Content="AI activity..." Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0" IsEnabled="False" ToolTip="Risky AI activity of the highlighted agent from the Purview audit log: jailbreak attempts, prompt injection, blocked tool calls."/>
+                <Button x:Name="BtnExport" Content="Export" Style="{StaticResource Btn}" Padding="12,8" Margin="0,0,8,0"/>
+                <Button x:Name="BtnUndo" Content="Undo last run" Style="{StaticResource Btn}" Padding="12,8" IsEnabled="False"/>
+              </StackPanel>
+              <StackPanel Grid.Row="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,10,0,0">
+                <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Adds the suggested owner (or sponsor) to the ticked agents. Choose an Ownership filter first: Needs an owner, Missing an Entra sponsor, or Missing a sponsor or owner. Only rows that show a suggestion can be applied."/>
+                <Button x:Name="BtnRestrict" Content="Restrict access..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Narrow who can use the selected agents (nobody, their owner, named users and groups) or reopen them. A softer step than Block; the old scope is saved for Undo."/>
+                <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
+                <Button x:Name="BtnCompromise" Content="Entra risk &#9662;" Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Entra actions for the selected agents' identities: confirm them as compromised (risk level High, which a Conditional Access policy that blocks high agent risk then enforces) or clear that flag (Security Administrator role), check Conditional Access, or revoke the sessions of their agent user accounts.">
+                  <Button.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="Confirm as compromised..." ToolTip="Entra sets the risk level to High. Undo last run dismisses it."/>
+                      <MenuItem Header="Clear the compromised flag..." ToolTip="Dismiss the Entra risk of the selected agents. Entra shows them as dismissed afterwards."/>
+                      <MenuItem Header="Check Conditional Access..." ToolTip="Read-only. Check whether a Conditional Access policy blocks each ticked agent at High agent risk, and which policies apply. With nothing ticked it checks every agent that has an Entra identity."/>
+                      <MenuItem Header="Revoke sessions..." ToolTip="End the sessions of the ticked agents' user accounts, so a block or a Conditional Access change applies at once instead of when their tokens expire. An agent identity's own tokens cannot be revoked. Cannot be undone, and needs nothing undone."/>
+                    </ContextMenu>
+                  </Button.ContextMenu>
+                </Button>
+              </StackPanel>
+              <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+                <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
+                <Button x:Name="BtnUnblock" Content="Unblock selected" Style="{StaticResource BtnGood}" Margin="0,0,10,0" MinWidth="150" IsEnabled="False"/>
+                <Button x:Name="BtnBlock" Content="Block selected" Style="{StaticResource BtnDanger}" MinWidth="150" IsEnabled="False"/>
+              </StackPanel>
+            </Grid>
+          </Border>
+
+        </Grid>
       </Grid>
-    </Border>
+    </Grid>
 
     <!-- status -->
-    <Border Grid.Row="4" Background="#F9FAFB" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,7">
+    <Border Grid.Row="2" Background="#F9FAFB" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0" Padding="24,7">
       <TextBlock x:Name="Status" Foreground="{StaticResource Muted}" FontSize="12" TextTrimming="CharacterEllipsis"/>
     </Border>
   </Grid>
@@ -6261,7 +6380,10 @@ $CaCheckXaml = @'
       </StackPanel>
     </Border>
     <Border Grid.Row="1" Padding="16,9" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
-      <TextBlock x:Name="CaNote" TextWrapping="Wrap" Foreground="#4B5563"/>
+      <DockPanel>
+        <Button x:Name="BtnCaLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" VerticalAlignment="Center" ToolTip="Read the Conditional Access policies and the agents' Entra risk again."/>
+        <TextBlock x:Name="CaNote" TextWrapping="Wrap" Foreground="#4B5563" VerticalAlignment="Center"/>
+      </DockPanel>
     </Border>
     <DataGrid x:Name="CaGrid" Grid.Row="2" Style="{StaticResource Grid}">
       <DataGrid.Columns>
@@ -6297,14 +6419,54 @@ $CaCheckXaml = @'
 </Window>
 '@
 
-# The results of a Conditional Access check: one row per agent, and the policies behind the selected one.
+# The Conditional Access check as a page: one row per agent, and the policies behind the selected one. -Report fills it from a
+# report already read; otherwise Update-CaCheckWindow -Load reads one.
 function New-CaCheckWindow {
     param([object]$Report, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($CaCheckXaml)
     if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
     $script:caWindow = $d
+    $d.FindName('CaGrid').Add_SelectionChanged({
+        $item = $script:caWindow.FindName('CaGrid').SelectedItem
+        $script:caWindow.FindName('CaDetailGrid').ItemsSource = @(if ($item) { Get-AgentCaDetailRows $item })
+    })
+    $d.FindName('BtnCaLoad').Add_Click({ Update-CaCheckWindow -Window $script:caWindow -Load })
+    if ($Report) { $d.Tag = $Report; Update-CaCheckWindow -Window $d }
+    $d
+}
+
+# Fill the page from the report it holds, or read one first (-Load) for the agents in $script:caState: the ticked agents that
+# have an Entra identity, or every agent that has one.
+function Update-CaCheckWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('CaNote'); $grid = $Window.FindName('CaGrid'); $btn = $Window.FindName('BtnCaLoad')
+    if ($Load) {
+        $all = @($script:caState.Packages); $only = @($script:caState.OnlyIds | Where-Object { $_ })
+        $picked = @(if ($only.Count) { $all | Where-Object { $only -contains [string]$_.id } } else { $all })
+        $targets = @($picked | Where-Object { $_.agentIdentityId })
+        if ($targets.Count -eq 0) {
+            $Window.Tag = $null; $grid.ItemsSource = @(); $Window.FindName('CaDetailGrid').ItemsSource = @()
+            $Window.FindName('CaSummary').Text = ''
+            $note.Text = if ($only.Count) { 'The ticked agents have no Entra identity, so Conditional Access for agents cannot apply to them.' } else { 'No agent in the catalog has an Entra identity.' }
+            return
+        }
+        try {
+            $btn.IsEnabled = $false
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            if (-not (Test-GraphScope 'Policy.Read.All')) { & $pump 'Granting read access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.Read.All' }
+            if (-not ((Test-GraphScope 'IdentityRiskyAgent.Read.All') -or (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All'))) { & $pump 'Granting read access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.Read.All' }
+            & $pump ("Reading Conditional Access policies and the Entra risk of {0} agent(s)..." -f $targets.Count)
+            $Window.Tag = Get-AgentCaReport -Packages $targets
+        } catch {
+            $note.Text = 'Could not check Conditional Access: ' + $_.Exception.Message
+            return
+        } finally { $btn.IsEnabled = $true }
+    }
+    $Report = $Window.Tag
+    if (-not $Report) { $grid.ItemsSource = @(); $note.Text = 'Not checked yet. Press Refresh.'; return }
     $rows = @($Report.Rows | Sort-Object @{ e = { $script:CaKindOrder[$_.Kind] } }, Agent)
-    $d.FindName('CaSummary').Text = ("{0} agent(s): {1} protected, {2} report-only, {3} with a policy that has no effect, {4} possibly protected by an attribute rule, {5} unprotected. {6} of {7} Conditional Access policies target agent identities." -f
+    $Window.FindName('CaSummary').Text = ("{0} agent(s): {1} protected, {2} report-only, {3} with a policy that has no effect, {4} possibly protected by an attribute rule, {5} unprotected. {6} of {7} Conditional Access policies target agent identities." -f
         $rows.Count, @($rows | Where-Object { $_.Kind -eq 'Protected' }).Count, @($rows | Where-Object { $_.Kind -eq 'Report-only' }).Count, @($rows | Where-Object { $_.Kind -eq 'No effect' }).Count,
         @($rows | Where-Object { $_.Kind -eq 'Possible' }).Count, @($rows | Where-Object { $_.Kind -eq 'Unprotected' }).Count, $Report.AgentPolicies, $Report.PolicyCount)
     $notes = New-Object 'System.Collections.Generic.List[string]'
@@ -6313,15 +6475,9 @@ function New-CaCheckWindow {
     if ($Report.AgentUserPolicies) { $notes.Add(("{0} policy(ies) target agent user accounts and were not evaluated." -f $Report.AgentUserPolicies)) }
     if ($Report.NoIdentity.Count) { $notes.Add(("{0} agent(s) have no Entra agent identity, so Conditional Access for agents cannot apply (for example: {1})." -f $Report.NoIdentity.Count, (($Report.NoIdentity | Select-Object -First 4) -join '; '))) }
     $notes.Add('This covers an agent signing in as itself. Policies for the on-behalf-of flow target users. An attribute rule is shown, not evaluated.')
-    $d.FindName('CaNote').Text = ($notes -join ' ')
-    $grid = $d.FindName('CaGrid')
+    $note.Text = ($notes -join ' ')
     $grid.ItemsSource = $rows
-    $grid.Add_SelectionChanged({
-        $item = $script:caWindow.FindName('CaGrid').SelectedItem
-        $script:caWindow.FindName('CaDetailGrid').ItemsSource = @(if ($item) { Get-AgentCaDetailRows $item })
-    })
     if ($rows.Count) { $grid.SelectedIndex = 0 }
-    $d
 }
 
 $AgentUsersXaml = @'
@@ -6566,6 +6722,7 @@ function New-PolicyHitsWindow {
         $script:phWindow.FindName('PhDetailGrid').ItemsSource = @(if ($item) { Get-PolicyHitDetailRows $item })
     })
     $d.FindName('BtnPhAlerts').Add_Click({
+        if ($script:shell) { Show-ShellPage 'alerts'; return }
         $days = [int]$script:phWindow.FindName('PhDaysBox').SelectedItem.Tag
         (New-AgentAlertsWindow -Owner $script:phWindow -Packages $script:phState.Packages -OnlyIds $script:phState.OnlyIds -Days $days).ShowDialog() | Out-Null
     })
@@ -6892,7 +7049,7 @@ function Invoke-McpWindowBlock {
         foreach ($r in $Window.Tag.Rows) { Set-McpBlockState -Row $r -Policies $policies }
     } catch { $null = $_ }
     $done = @($recs | Where-Object { $_.Result -eq 'Done' })
-    if ($done.Count) { $script:mcpState.LastRun = $done }
+    if ($done.Count) { $script:mcpState.LastRun = $done; if ($script:ctx) { $script:ctx.LastRun = $done; & $script:ctx.Summary } }
     $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
     $grid.Items.Refresh()
     $Window.FindName('McDetailGrid').ItemsSource = @(if ($grid.SelectedItem) { Get-McpAccessDetailRows $grid.SelectedItem })
@@ -7093,12 +7250,137 @@ function Show-ColumnFilter {
     [void]$text.Focus()
 }
 
+# ---------------------------------------------------------------------------------------------
+# Console shell: navigation on the left grouped like the Agent 365 portal, one page at a time on the right. All agents is the
+# console's own grid and Home is drawn here; every other page is the content of one of the feature windows above, moved into the
+# shell. The window object stays alive unseen, so its named elements, its Tag (the data it read) and its update functions work
+# unchanged. A page reads its data the first time it opens, and again when the agents ticked on All agents have changed.
+# ---------------------------------------------------------------------------------------------
+
+# The agents ticked on All agents (catalog ids), and every catalog package, as the pages read them.
+function Get-ShellTicked { @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id }) }
+function Get-ShellPackages { @($script:ctx.Rows | ForEach-Object { $_.Package }) }
+
+# Move a feature window's content into the shell. The window keeps its names, its data and its handlers; only its content moves.
+function Mount-ShellPage {
+    param([string]$Key, [System.Windows.Window]$Window)
+    $content = $Window.Content
+    $Window.Content = $null
+    $content.Visibility = 'Collapsed'
+    [void]$script:w.FindName('PageHost').Children.Add($content)
+    $script:shell.Pages[$Key].Element = $content
+    $script:shell.Pages[$Key].Window = $Window
+}
+
+# The pages. Create builds a page the first time it opens; Load reads its data ($Reload is false when only the ticked agents
+# changed and the page can filter what it already holds). Scoped pages follow the agents ticked on All agents.
+function Initialize-Shell {
+    $script:shell = @{ Current = 'agents'; Navigating = $false; Pages = [ordered]@{} }
+    $page = { param($Key, $Nav, $Element, $Create, $Load, $Scoped = $false, $FilterOnly = $false, $Always = $false)
+        $script:shell.Pages[$Key] = @{ Nav = $script:w.FindName($Nav); Element = $Element; Window = $null; Create = $Create; Load = $Load
+                                       Scoped = $Scoped; FilterOnly = $FilterOnly; Always = $Always; Loaded = $false; Scope = $null } }
+    & $page 'home' 'NavHome' $script:w.FindName('PageHome') $null { Update-ShellHome } -Always $true
+    & $page 'agents' 'NavAgents' $script:w.FindName('PageAgents') $null $null
+    & $page 'shadow' 'NavShadow' $null { Mount-ShellPage 'shadow' (New-EndpointAiWindow) } { Update-EndpointAiWindow -Window $script:epWindow -Load }
+    & $page 'tools' 'NavTools' $null { Mount-ShellPage 'tools' (New-McpAccessWindow -Packages @(Get-ShellPackages)) } {
+        $script:mcpState.Packages = @(Get-ShellPackages); $script:mcpState.OnlyIds = @(Get-ShellTicked); Update-McpAccessWindow -Window $script:mcWindow -Load } -Scoped $true
+    & $page 'users' 'NavUsers' $null { Mount-ShellPage 'users' (New-AgentUsersWindow -Packages @(Get-ShellPackages)) } {
+        $script:auState.Packages = @(Get-ShellPackages); $script:auState.OnlyIds = @(Get-ShellTicked); Update-AgentUsersWindow -Window $script:auWindow -Load } -Scoped $true
+    & $page 'alerts' 'NavAlerts' $null { Mount-ShellPage 'alerts' (New-AgentAlertsWindow -Packages @(Get-ShellPackages)) } {
+        param($Reload)
+        $script:aaState.Packages = @(Get-ShellPackages); $script:aaState.OnlyIds = @(Get-ShellTicked); Update-AgentAlertsWindow -Window $script:aaWindow -Load:$Reload } -Scoped $true -FilterOnly $true
+    & $page 'hits' 'NavHits' $null { Mount-ShellPage 'hits' (New-PolicyHitsWindow -Packages @(Get-ShellPackages)) } {
+        $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load } -Scoped $true
+    & $page 'ca' 'NavCa' $null { Mount-ShellPage 'ca' (New-CaCheckWindow) } {
+        $script:caState = @{ Packages = @(Get-ShellPackages); OnlyIds = @(Get-ShellTicked) }; Update-CaCheckWindow -Window $script:caWindow -Load } -Scoped $true
+
+    foreach ($p in $script:shell.Pages.Values) {
+        if ($p.Nav) { $p.Nav.Add_Checked({ param($s, $e) if (-not $script:shell.Navigating) { Show-ShellPage ([string]$s.Tag) } }) }
+    }
+    foreach ($g in 'NavAgentsGroup', 'NavSecurityGroup') {
+        $script:w.FindName($g).Add_Click({ param($s, $e)
+            $kids = $script:w.FindName([string]$s.Tag)
+            $open = $kids.Visibility -ne 'Visible'
+            $kids.Visibility = if ($open) { 'Visible' } else { 'Collapsed' }
+            $chevron = $script:w.FindName(([string]$s.Tag) -replace 'Kids$', 'Chevron')
+            $chevron.Text = [string][char]$(if ($open) { 0xE70E } else { 0xE70D })
+        })
+    }
+    $homePage = $script:w.FindName('PageHome')
+    foreach ($card in @($homePage.Content.Children | Where-Object { $_ -is [Windows.Controls.WrapPanel] } | ForEach-Object { $_.Children })) {
+        $card.Add_Click({ param($s, $e) Invoke-ShellCard ([string]$s.Tag) })
+    }
+}
+
+# Show one page: build it the first time, then read its data when it has none yet, when it always reads (Home), or when the
+# ticked agents have changed since it last read.
+function Show-ShellPage {
+    param([string]$Key)
+    $p = $script:shell.Pages[$Key]
+    if (-not $p) { return }
+    if (-not $p.Element -and $p.Create) { & $p.Create }
+    foreach ($q in $script:shell.Pages.Values) { if ($q.Element) { $q.Element.Visibility = if ($q -eq $p) { 'Visible' } else { 'Collapsed' } } }
+    if ($p.Nav -and -not $p.Nav.IsChecked) { $script:shell.Navigating = $true; $p.Nav.IsChecked = $true; $script:shell.Navigating = $false }
+    $script:shell.Current = $Key
+    if (-not $p.Load) { return }
+    $scope = (@(Get-ShellTicked) | Sort-Object) -join ','
+    if ($p.Loaded -and -not $p.Always -and -not ($p.Scoped -and $p.Scope -ne $scope)) { return }
+    $reload = -not $p.Loaded -or -not $p.FilterOnly
+    $script:w.Cursor = [Windows.Input.Cursors]::Wait
+    try { & $p.Load $reload } finally { $script:w.Cursor = $null }
+    $p.Loaded = $true; $p.Scope = $scope
+}
+
+# After the catalog is read again, every page that read data reads it again when it next opens.
+function Reset-ShellPages { if ($script:shell) { foreach ($p in $script:shell.Pages.Values) { if ($p.Load -and -not $p.Always) { $p.Loaded = $false } } } }
+
+# A Home card opens its page, set up for what the card counts.
+function Invoke-ShellCard {
+    param([string]$Target)
+    Show-ShellPage ($Target -split ':')[0]
+    switch ($Target) {
+        'agents'           { $script:ui.FltAll.IsChecked = $true; & $script:ctx.Refilter }
+        'agents:blocked'   { $script:ui.FltBlocked.IsChecked = $true; & $script:ctx.Refilter }
+        'agents:owner'     { $script:ui.OwnerBox.SelectedIndex = 1 }
+        'tools:unused'     { $script:mcWindow.FindName('McShowBox').SelectedIndex = 1 }
+        'users:unlicensed' { $script:auWindow.FindName('AuUnlicensed').IsChecked = $true; Update-AgentUsersWindow -Window $script:auWindow }
+    }
+}
+
+# Home: counts from the catalog, and from each security page once it has read its data (for the agents it covered).
+function Update-ShellHome {
+    $set = { param($Name, $Value, $Sub) $script:w.FindName($Name).Text = [string]$Value; $script:w.FindName("${Name}Sub").Text = $Sub }
+    $rows = @($script:ctx.Rows)
+    $pk = @($rows | ForEach-Object { $_.Package })
+    & $set 'HomeTotal' $rows.Count ('{0} of them are Copilot agents.' -f @($pk | Where-Object { @($_.supportedHosts) -contains 'Copilot' }).Count)
+    & $set 'HomeBlocked' @($rows | Where-Object { $_.IsBlocked }).Count 'Blocked in the catalog; nobody can use them.'
+    & $set 'HomeNoOwner' @($pk | Where-Object { $_.type -eq 'shared' -and -not $_.ownerId }).Count 'Shared by a creator, with no owner recorded.'
+    & $set 'HomeIdentity' @($pk | Where-Object { $_.agentIdentityId }).Count 'Conditional Access for agents can cover these.'
+    $scopeOf = { param($State) if ($State -and @($State.OnlyIds).Count) { " For the $(@($State.OnlyIds).Count) ticked agent(s)." } else { '' } }
+    if ($script:aaWindow -and $null -ne $script:aaWindow.Tag) {
+        $a = @(Select-AgentAlertRows -Rows $script:aaWindow.Tag -Days 30 -OnlyIds $script:aaState.OnlyIds)
+        & $set 'HomeAlerts' $a.Count (('{0} high, on {1} agent(s).' -f @($a | Where-Object { $_.Severity -eq 'High' }).Count, @($a | ForEach-Object { if ($_.AgentId) { $_.AgentId } else { $_.Agent } } | Get-Distinct).Count) + (& $scopeOf $script:aaState))
+    } else { & $set 'HomeAlerts' '-' 'Not read yet. Select to open Alerts.' }
+    if ($script:caWindow -and $script:caWindow.Tag) {
+        $c = @($script:caWindow.Tag.Rows)
+        & $set 'HomeCa' @($c | Where-Object { $_.Kind -ne 'Protected' }).Count (('{0} report-only, {1} unprotected, of {2} agent(s) with an identity.' -f @($c | Where-Object { $_.Kind -eq 'Report-only' }).Count, @($c | Where-Object { $_.Kind -eq 'Unprotected' }).Count, $c.Count) + (& $scopeOf $script:caState))
+    } else { & $set 'HomeCa' '-' 'Not checked yet. Select to open Conditional Access.' }
+    if ($script:mcWindow -and $script:mcWindow.Tag) {
+        $s = Get-McpAccessSummary -Rows @($script:mcWindow.Tag.Rows) -Days 30
+        & $set 'HomeMcp' $s.Unused (('Of {0} agent and server permission(s), no call in 30 days.' -f $s.Granted) + (& $scopeOf $script:mcpState))
+    } else { & $set 'HomeMcp' '-' 'Not read yet. Select to open Tools.' }
+    if ($script:auWindow -and $script:auWindow.Tag) {
+        $s = Get-AgentUserSummary @(Select-AgentUserRows -Rows $script:auWindow.Tag.Rows -Days 30)
+        & $set 'HomeUsers' $s.Unlicensed (('Of {0} user(s) who used an agent in 30 days.' -f $s.Users) + (& $scopeOf $script:auState))
+    } else { & $set 'HomeUsers' '-' 'Not read yet. Select to open Users.' }
+}
+
 function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'BtnMcp', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnDefenderAlerts', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'ScopeText', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -7163,6 +7445,7 @@ function New-ConsoleWindow {
         $script:ui.CountBlocked.Text = $blocked
         $script:ui.CountShown.Text = $shown
         $script:ui.SelectedText.Text = if ($selected) { "$selected selected" } else { 'None selected' }
+        $script:ui.ScopeText.Text = if ($selected) { "Pages cover the $selected ticked agent(s)" } else { 'Pages cover all agents' }
         $script:ui.BtnBlock.IsEnabled = $canBlock
         $script:ui.BtnUnblock.IsEnabled = $canUnblock
         $script:ui.BtnUndo.IsEnabled = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' }).Count -gt 0
@@ -7274,6 +7557,8 @@ function New-ConsoleWindow {
             }
             & $script:ctx.FillInfo
             & $script:ctx.Refilter
+            Reset-ShellPages
+            if ($script:shell -and $script:shell.Current -eq 'home') { Update-ShellHome }
             & $script:ctx.Idle ("Loaded {0} packages at {1}." -f $pkgs.Count, (Get-Date).ToString('HH:mm:ss'))
         } catch { & $script:ctx.Idle ('Load failed: ' + $_.Exception.Message); [void][Windows.MessageBox]::Show($_.Exception.Message, 'Could not load the catalog', 'OK', 'Error') }
     }
@@ -7615,24 +7900,6 @@ function New-ConsoleWindow {
         $win.ShowDialog() | Out-Null
     }
     $script:ui.BtnAi.Add_Click({ & $script:ctx.ShowDetails 'AI' })
-    $script:ui.BtnEndpointAi.Add_Click({ (New-EndpointAiWindow -Owner $script:w).ShowDialog() | Out-Null })
-    $script:ui.BtnAgentUsers.Add_Click({
-        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
-        (New-AgentUsersWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
-    })
-    $script:ui.BtnPolicyHits.Add_Click({
-        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
-        (New-PolicyHitsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
-    })
-    $script:ui.BtnDefenderAlerts.Add_Click({
-        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
-        (New-AgentAlertsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked -Days 30).ShowDialog() | Out-Null
-    })
-    $script:ui.BtnMcp.Add_Click({
-        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
-        (New-McpAccessWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
-        if (@($script:mcpState.LastRun).Count) { $script:ctx.LastRun = @($script:mcpState.LastRun); & $script:ctx.Summary }
-    })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
@@ -7745,21 +8012,7 @@ function New-ConsoleWindow {
         }
     }
 
-    $script:ctx.CheckConditionalAccess = {
-        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked })
-        $rows = @($ticked | Where-Object { $_.Package.agentIdentityId })
-        $scope = 'the ticked agent(s)'
-        if ($ticked.Count -eq 0) { $rows = @($script:ctx.Rows | Where-Object { $_.Package.agentIdentityId }); $scope = 'every agent with an Entra identity' }
-        if ($rows.Count -eq 0) { & $script:ctx.Idle $(if ($ticked.Count) { 'The ticked agents have no Entra identity, so Conditional Access for agents cannot apply to them.' } else { 'No agent in the catalog has an Entra identity.' }); return }
-        try {
-            if (-not (Test-GraphScope 'Policy.Read.All')) { & $script:ctx.Busy 'Granting read access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.Read.All' }
-            if (-not ((Test-GraphScope 'IdentityRiskyAgent.Read.All') -or (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All'))) { & $script:ctx.Busy 'Granting read access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.Read.All' }
-            & $script:ctx.Busy ("Reading Conditional Access policies and the Entra risk of {0} agent(s) ({1})..." -f $rows.Count, $scope)
-            $report = Get-AgentCaReport -Packages @($rows | ForEach-Object { $_.Package })
-        } catch { & $script:ctx.Idle 'Conditional Access check failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Conditional Access check', 'OK', 'Error'); return }
-        & $script:ctx.Idle ("Conditional Access: {0} agent(s) checked, {1} protected." -f @($report.Rows).Count, @($report.Rows | Where-Object { $_.Kind -eq 'Protected' }).Count)
-        (New-CaCheckWindow -Report $report -Owner $script:w).ShowDialog() | Out-Null
-    }
+    $script:ctx.CheckConditionalAccess = { Show-ShellPage 'ca' }
     $script:ctx.RevokeSessions = {
         $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and ($_.Package.agentIdentityId -or @($_.Package.elementTypes) -contains 'AgenticUserTemplates') })
         if ($rows.Count -eq 0) { & $script:ctx.Idle 'The ticked agents have no Entra agent identity, so they have no agent user account to revoke.'; return }
@@ -7879,6 +8132,8 @@ function New-ConsoleWindow {
         else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
     })
+
+    Initialize-Shell
 
     $script:ctx.Account = { $c = Get-MgContext; $script:ui.Account.Text = if ($c) { "$($c.Account)   |   tenant $($c.TenantId)" } else { '' } }
     & $script:ctx.Account
