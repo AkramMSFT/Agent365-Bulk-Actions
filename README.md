@@ -61,7 +61,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Conditional Access | Check whether a Conditional Access policy blocks each risky agent, or every agent, at High agent risk, and which policies apply | `-CheckConditionalAccess` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
 | Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
-| Console | A desktop window with filters, a details window and buttons for all of the above | `-Gui` |
+| Console | A desktop app laid out like the Agent 365 portal: Home, All agents, Shadow AI, Tools, Users, and Security pages for alerts with response actions, built-in hunting queries, Purview audit, policy hits and Conditional Access | `-Gui` |
 
 ## Requirements
 
@@ -334,7 +334,7 @@ Agents are not only in the cloud. People install coding agents, desktop assistan
 .\Agent365-Bulk-Actions.ps1 -EndpointAi -Sanctioned "GitHub","Microsoft" -OutFile .\endpoint-ai.csv
 ```
 
-In the console, **Endpoint AI...** (top row) opens the same view: a grid of tools, with the evidence for the selected one underneath.
+In the console, **Agents > Shadow AI** shows the same view: a grid of tools, with the evidence for the selected one underneath.
 
 **What it reads.**
 
@@ -381,7 +381,7 @@ Things to know:
 .\Agent365-Bulk-Actions.ps1 -Undo .\block.csv                                           # the same, from the log
 ```
 
-In the console, select a tool in the Endpoint AI window and press **Block on this device...** (or **Remove block**). A **Blocked** column shows what is blocked.
+In the console, select a tool on the Shadow AI page and press **Block on this device...** (or **Remove block**). A **Blocked** column shows what is blocked.
 
 - **What it does.** It creates a Microsoft Defender custom detection rule named `Agent365 Bulk Actions: block <tool> on <device>`. The rule matches only that device and only the program files the tool was seen running from, and its action is *stop and quarantine file*. A version folder in the path (for example `Claude_1.52.3.0`) matches any version, so an update is covered. Other devices are not affected.
 - **Why not Microsoft's own block.** The Shadow AI page in the Microsoft 365 admin center blocks only OpenClaw, Node.js-based agents (blocking one blocks them all, and Node.js with them) and VS Code extensions, through an Intune policy on managed Windows devices. Ollama, Claude, GitHub Copilot CLI and ChatGPT Desktop are listed as not blockable there.
@@ -446,7 +446,7 @@ Read-only. For each agent it answers one question: would Microsoft Entra Conditi
 - **MCP blocks are not protection.** A policy that names specific resources, such as one made by `-BlockMcp`, blocks the agent there only, so it is listed but not counted as protection at High risk.
 - **What is not evaluated.** Policies for the on-behalf-of flow (they target users), policies for agent user accounts, and attribute rules. Resources that accept an API key instead of a token are outside Conditional Access.
 - **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
-- **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below. With nothing ticked it checks every agent that has an Entra identity.
+- **In the console**, **Security > Conditional Access** shows the same result for the ticked agents, or every agent that has an Entra identity when none is ticked, with the policies behind the selected agent below. **Entra risk > Check Conditional Access...** opens it too.
 
 ### Agent users and licenses
 
@@ -464,7 +464,7 @@ Read-only. It answers who interacts with which agent in the last 7, 14 or 30 day
 - **License.** Read from each user's license details, which include licenses assigned through groups. A user counts as licensed when they hold the `AGENT_365` plan (the standalone Agent 365 SKUs, or a bundle that contains the plan) or a SKU whose name contains E7, unless the Agent 365 plan is turned off for that user. The column says which: `Agent 365`, `E7`, `Agent 365 (in <SKU>)`, `Agent 365 plan turned off` or `None`.
 - **Accounts that are not users.** An id that is not a directory user (an agent identity, or an account since deleted) is listed by the name on the event, marked *Not applicable*, and never counted as unlicensed.
 - **Requirements.** `ThreatHunting.Read.All`, `User.Read.All` and `CopilotPackages.Read.All`, all already part of `-SignIn`. Reading license details also needs an Entra role such as License Administrator, User Administrator or Global Reader.
-- **In the console**, **Agent users...** opens the same data in a window with a 7, 14 or 30 day selector, a *No Agent 365 or E7 license only* filter, a search box and export. It covers the ticked agents, or every agent when none is ticked.
+- **In the console**, the **Users** page shows the same data, with a 7, 14 or 30 day selector, a *No Agent 365 or E7 license only* filter, a search box and export. It covers the ticked agents, or every agent when none is ticked.
 
 ### Purview policy hits on agents
 
@@ -486,11 +486,11 @@ Read-only. It shows which Purview policies **fired** on which agents. It is evid
 - **Output.** A summary line, a *By agent* table (hits by source, policies, last hit), a *By policy* table, and with `-IncludeUnattributed` the hits that name only a person. `-OutFile` writes one row per policy, rule, agent and account with the counts for 7, 14 and 30 days.
 - **Not covered.** Communication Compliance has no alert or event source here. Insider Risk risk levels per agent are shown in the Purview portal's DSPM AI observability page, which has no API this tool uses. Advanced Hunting keeps about 30 days.
 - **Requirements.** `ThreatHunting.Read.All`, `SecurityAlert.Read.All`, `User.Read.All`, `CopilotPackages.Read.All`, `AgentIdentity.Read.All` and `Application.Read.All`, all part of `-SignIn`.
-- **In the console**, **Policy hits...** opens the same data in a window with a 7, 14 or 30 day selector, a switch for hits not tied to an agent, a search box and export. It covers the ticked agents, or every agent when none is ticked; when you tick agents it says which of them had no hits. Select a row for the detail pane: how the hit was tied to the agent, what the policy did, the item with its path, the counts for 7, 14 and 30 days and where to look in Purview. **Defender alerts...** in that window opens the list of Defender alerts that concern agents (below) for the same agents and period.
+- **In the console**, **Security > Policy hits** shows the same data, with a 7, 14 or 30 day selector, a switch for hits not tied to an agent, a search box and export. It covers the ticked agents, or every agent when none is ticked; when you tick agents it says which of them had no hits. Select a row for the detail pane: how the hit was tied to the agent, what the policy did, the item with its path, the counts for 7, 14 and 30 days and where to look in Purview. **Defender alerts...** on that page opens the Alerts page (below).
 
 #### Defender alerts on agents
 
-The **Defender alerts...** button on the main console (and the one in the Policy hits window) lists the Defender alerts that concern agents, one row per alert, for the ticked agents or all agents and a 7, 14 or 30 day period: when it was raised, the agent, the alert, its severity and category, the Defender source, and how it was tied. Pick a severity and a period, search, export, or select an alert for the detail pane and press **Open in Defender** to open it in the Microsoft Defender portal.
+**Security > Alerts** in the console lists the Defender alerts that concern agents, one row per alert, for the ticked agents or all agents and a 7, 14 or 30 day period: when it was raised, the agent, the alert, its severity and category, the Defender source, and how it was tied. Pick a severity and a period, search, export, or select an alert for the detail pane and press **Open in Defender** to open it in the Microsoft Defender portal. **Respond** acts on the agent the alert names; see [Graphical console](#graphical-console).
 
 - **What is listed.** An alert is listed when it carries the agent as an entity (Security for AI alerts, for example) or names the Azure AI resource a Foundry agent runs on. An alert naming an agent that Defender's inventory does not list is kept and named as the alert names it.
 - **What is not.** Defender for AI Services alerts about model deployments (jailbreak attempts against a model, LLM reconnaissance) name no agent, so they are not listed; they are in the Defender portal under Incidents and alerts.
@@ -529,7 +529,7 @@ Agent 365's Tools registry (**Agents > Tools** in the Microsoft 365 admin center
 - **Apply it at once.** Add `-RevokeSessions` to end the sessions of the blocked agents' user accounts straight after an enforced block; the console offers the same after **Block...**. See [Revoke an agent's sessions](#revoke-an-agents-sessions).
 - **Undo.** `-UnblockMcp` removes the block. `-Undo <log>` and **Undo last run** put each agent and server back the way it was: blocked, report-only or not blocked.
 - **Requirements.** To read: `DelegatedPermissionGrant.Read.All`, `Application.Read.All`, `Policy.Read.All`, `AgentIdentity.Read.All`, `User.Read.All`, `ThreatHunting.Read.All` and `CopilotPackages.Read.All`. To block: `Policy.ReadWrite.ConditionalAccess` and the Conditional Access Administrator role. All are part of `-SignIn`. Conditional Access for agents needs Microsoft 365 E7, or Agent 365 with at least Microsoft Entra ID P1. The policy calls are beta.
-- **In the console**, **MCP access...** opens the same view in a window for the ticked agents, or every agent when none is ticked, with a period, a filter (everything, permission but not used, used, blocked or report-only), a search box, export and a detail pane. Select one or more rows and press **Block...**, **Block in report-only...** or **Remove block**; a row that cannot be blocked says why.
+- **In the console**, **Agents > Tools** shows the same view for the ticked agents, or every agent when none is ticked, with a period, a filter (everything, permission but not used, used, blocked or report-only), a search box, export and a detail pane. Select one or more rows and press **Block...**, **Block in report-only...** or **Remove block**; a row that cannot be blocked says why.
 
 ### Revoke an agent's sessions
 
@@ -546,7 +546,7 @@ A block or a Conditional Access change applies when the agent next asks for a to
 - **Which accounts.** The agent user accounts of the agent's identity, or, for a catalog entry that stands for a whole blueprint, of every identity made from it. Only the agents the action changed are revoked: an agent already blocked, skipped or failed is left alone.
 - **Undo.** Nothing to undo: the revocation only forces a new sign-in. `-Undo` on the action's log reverses the block or the confirmation as usual.
 - **Requirements.** `User.RevokeSessions.All` (part of `-SignIn`) and an Entra role that can manage the accounts. `-RevokeSessions` works with `-Block`, `-BlockMcp` (enforced blocks only) and `-ConfirmCompromised`.
-- **In the console**, **Entra risk > Revoke sessions...** ends the sessions of the ticked agents' user accounts on its own, and the MCP access window offers it after an enforced **Block...**.
+- **In the console**, **Entra risk > Revoke sessions...** ends the sessions of the ticked agents' user accounts on its own, the Tools page offers it after an enforced **Block...**, and **Respond > Revoke sessions...** on Security > Alerts does it for the agent an alert names.
 
 ### Policy file
 
@@ -600,7 +600,24 @@ The report lists agents that are new or removed, newly blocked or unblocked, and
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Agent users...**, **Policy hits...**, **Defender alerts...**, **Endpoint AI...**, **Export** and **Undo last run** on top (the window cannot be narrower than 1280 pixels, so this row always fits); **Apply suggested**, **Restrict access...**, **Assign owner...**, **Entra risk**, **MCP access...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
+A Windows desktop app over the same catalog, laid out like the Agent 365 portal: navigation on the left and one page at a time on the right. It opens on **All agents** with no filter applied. The top bar shows the signed-in account, which agents the other pages cover, and **Refresh catalog**.
+
+| Page | What it shows | What you can do there |
+| --- | --- | --- |
+| Home | Catalog counts (total, blocked, shared agents without an owner, agents with an Entra identity) and, once their pages have been opened, the security findings: Defender alerts in 30 days, agents not protected by Conditional Access, unused MCP permissions and users without a license | Select a card to open the page behind it, already filtered |
+| Agents > All agents | The registry: every agent, with count cards, search, filters and a funnel on every column | Everything in the action bar under the table (below) |
+| Agents > Shadow AI | Local AI agents and shadow AI on Defender-onboarded devices, with the evidence for the selected one | **Block on this device...** and **Remove block** for the selected tool |
+| Agents > Tools | Which MCP servers each agent may reach, sets up and calls | **Block...**, **Block in report-only...** and **Remove block** for the selected rows; revoke sessions after a block |
+| Users | Who used which agent in the last 7, 14 or 30 days, and whether each user has an Agent 365 or E7 license | Filter to users without a license, search, export |
+| Security > Alerts | Defender XDR alerts that concern agents, with severity, category and source | **Respond** on the agent an alert names; **Open in Defender** |
+| Security > Hunting | 18 built-in Advanced Hunting queries from the Agent365-Hunting library, grouped by area | Run one, change it first if you like, export the results, or copy it and open Advanced hunting in Defender |
+| Security > Purview audit | AI activity per agent from the Purview audit log, and the events of the selected agent | Search the last 1, 7, 14 or 30 days, show risky events only, export |
+| Security > Policy hits | DLP rule matches and DLP or Insider Risk alerts on agents | Open the Alerts page, export |
+| Security > Conditional Access | Whether a Conditional Access policy blocks each agent at High agent risk, and the policies behind it | **Refresh** |
+
+**Which agents a page covers.** Tick agents on All agents and the other pages cover only those; with nothing ticked they cover every agent, and the top bar says which. A page reads its data the first time it opens and again when the ticked agents have changed; its **Refresh** button reads it again on demand. **Refresh catalog** reads the catalog again, and each page then reads its data again when you next open it.
+
+**All agents.** The action bar under the table has two rows: selection, **Details...**, **AI activity...**, **Export** and **Undo last run** on top; **Apply suggested**, **Restrict access...**, **Assign owner...**, **Entra risk**, **Verify identity state**, **Unblock selected** and **Block selected** below.
 
 | To do this | Use |
 | --- | --- |
@@ -608,19 +625,19 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | Filter by analysis | *Stale*, *Risk* (from alerts, detections or both), *Ownership*, *Blocked*, *Tools*, *Permissions* and *Access* dropdowns. Each defaults to **None**. The matching columns fill in. *Match All* needs every active Stale and Risk filter; *Any* accepts either. |
 | Filter any column | Every column header has a small funnel beside its name. It opens a box with a text search (matches part of a value, in any case) and the values the column holds, with how many agents have each; tick some to show only those. Text and ticked values work together. A filtered column's funnel turns blue and filled, the filters of different columns add up, and they combine with the filters above. **Reset filters** clears them all, and a filter ends when its column leaves the screen. Click the column name, not the funnel, to sort. |
 | Block or unblock | Tick rows (or **Select visible**), then **Block selected** or **Unblock selected**. A confirmation lists the agents with their active users and last use. **Verify identity state** adds a check that the Entra identity ends up disabled (or enabled again after an unblock). |
-| Fix ownership | *Ownership > Needs an owner* lists shared agents with no usable owner and a suggestion; tick the rows and press **Apply suggested** (always on the action bar, enabled once a ticked row has a suggestion). **Assign owner...** opens a searchable Entra directory picker. |
+| Fix ownership | *Ownership > Needs an owner* lists shared agents with no usable owner and a suggestion; tick the rows and press **Apply suggested** (enabled once a ticked row has a suggestion). **Assign owner...** opens a searchable Entra directory picker. |
 | Add accountability | *Ownership > Missing an Entra sponsor* (or *sponsor or owner*) lists identities with a gap; **Apply suggested** adds the proposed person after a confirmation. |
 | Restrict access | Tick rows and press **Restrict access...** to choose nobody, the owner only, named users and groups (searchable picker, Users or Groups) or everyone. Tick **Also apply this choice to deployment** to make who the agent is installed for follow the same choice (nobody, the same users and groups, or everyone); there is no separate deployment list. The *Access* filter lists agents open to everyone, restricted or closed. |
-| Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
-| Find local AI agents | **Endpoint AI...** opens a window of the AI tools found on Defender-onboarded devices, with their risk and, for the selected one, the evidence behind it. It loads when it opens and has a refresh button, a period selector, a risky-only filter and export. **Block on this device...** and **Remove block** act on the selected tool. |
-| Review AI activity | **AI activity...** opens the details window on that tab. |
-| See who uses an agent | **Agent users...** lists the users who interacted with each agent over the last 7, 14 or 30 days, with whether each has an Agent 365 or E7 license. It covers the ticked agents, or every agent when none is ticked. |
-| See which policies fired | **Policy hits...** lists the DLP rule matches and the DLP and Insider Risk alerts that concern each agent over the last 7, 14 or 30 days. It covers the ticked agents, or every agent when none is ticked. |
-| See Defender alerts on agents | **Defender alerts...** lists the Defender alerts that concern the ticked agents, or every agent when none is ticked, over the last 7, 14 or 30 days, with severity filters, a detail pane and **Open in Defender**. |
-| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. **Revoke sessions...** ends the sessions of the ticked agents' user accounts, so a block applies at once. |
-| Govern MCP servers | **MCP access...** shows which MCP servers each ticked agent (or every agent when none is ticked) may reach, sets up and calls, with the Conditional Access block of each. Select rows and press **Block...**, **Block in report-only...** or **Remove block**. |
-| Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition, compromised flag (it dismisses the risk) or MCP block change. |
+| Inspect an agent | **Details...** (or double-click a row): Overview, Sharing, Tools and MCP, Data, Permissions, Identity, Usage, Risk and AI activity tabs, with **Export JSON**. **AI activity...** opens it on that tab. The **Tools and sharing columns** checkbox adds tool count, MCP servers, shared-with count and channels. |
+| Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** opens the Conditional Access page for the ticked agents. **Revoke sessions...** ends the sessions of the ticked agents' user accounts, so a block applies at once. |
+| Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition, compromised flag (it dismisses the risk) or MCP block change, including one made on the Tools page or from an alert. |
 | Export | **Export** saves the grid as CSV or JSON. |
+
+**Respond from an alert.** On Security > Alerts, select an alert and open **Respond**: **Block the agent...**, **Confirm as compromised...**, **Revoke sessions...**, **Block an MCP server for it...** (opens the Tools page on that agent) or **Show it in All agents**. The actions use the same confirmations and logs as on All agents, and **Undo last run** reverses a block or a compromised flag made this way. They need the alert to name an agent in the catalog.
+
+**Hunting.** The built-in queries come from the Agent365-Hunting library and were validated against Defender Advanced Hunting. They cover inventory and governance gaps, telemetry health, agents at risk, runtime protection, permissions and posture, sign-ins and risky users, MCP servers and tools, sensitive data with external reach, and blocked agentic network traffic. Each reads about the last 30 days unless its first lines say otherwise. Select one to see what it does and its text; change the text if you like (Reset puts the built-in text back) and press **Run**. The results show every column the query returns, with objects and lists as JSON; **Export** saves them as CSV or JSON, and **Copy and open Defender** copies the query and opens Advanced hunting in the Defender portal. A query that reads data your tenant does not collect (Global Secure Access traffic, for example) returns nothing. Running a query needs `ThreatHunting.Read.All`.
+
+**Purview audit.** The same AI activity as `-AiActivity`, for every agent at once: pick a period and press **Read audit log** (a search takes a few minutes), then select an agent for its events, newest first. **Risky only** counts only events with a risk signal. The search covers the whole tenant and is shared with the AI activity tab of the details window. It needs `AuditLogsQuery.Read.All` and a Purview audit role.
 
 Each write action saves a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
 

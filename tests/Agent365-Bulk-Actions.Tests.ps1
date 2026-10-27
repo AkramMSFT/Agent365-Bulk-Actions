@@ -3163,3 +3163,43 @@ Describe 'Revoke sessions' {
         $script:OutFile = $null
     }
 }
+
+Describe 'Security pages' {
+    It 'ships a curated set of hunting queries, each with a category, a name, a description and a query' {
+        $q = @($script:HuntingQueries)
+        $q.Count | Should -Be 18
+        @($q | Where-Object { -not $_.Category -or -not $_.Name -or -not $_.Description -or -not $_.Query }).Count | Should -Be 0
+        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 18
+        @($q | ForEach-Object { $_.Category } | Get-Distinct) | Should -Be @('Inventory', 'Telemetry', 'Alerts', 'Runtime protection', 'Posture', 'Access', 'Tools and MCP', 'Data security', 'Network')
+        @($q | Where-Object { $_.Query -match '[^\x00-\x7F]' }).Count | Should -Be 0
+    }
+    It 'turns hunting results into a table in the column order the service reports, with objects as JSON' {
+        $rows = @(@{ Agent = 'Alpha'; Calls = 3; Tools = @('a', 'b'); Last = $null }, @{ Agent = 'Beta'; Calls = 0; Tools = @{ n = 1 }; Last = '2026-10-27T10:00:00Z' })
+        $t = ConvertTo-HuntingTable -Columns @('Agent', 'Calls', 'Tools', 'Last') -Rows $rows
+        $t.GetType().FullName | Should -Be 'System.Data.DataTable'
+        @($t.Columns | ForEach-Object { $_.ColumnName }) | Should -Be @('Agent', 'Calls', 'Tools', 'Last')
+        $t.Rows.Count | Should -Be 2
+        $t.Rows[0]['Calls'] | Should -Be '3'; $t.Rows[0]['Tools'] | Should -Be '["a","b"]'; $t.Rows[0]['Last'] | Should -Be ''
+        $t.Rows[1]['Tools'] | Should -Be '{"n":1}'
+        $o = ConvertTo-HuntingTable -Columns @() -Rows @([pscustomobject]@{ A = 1; B = 'x' })
+        @($o.Columns | ForEach-Object { $_.ColumnName }) | Should -Be @('A', 'B')
+        (ConvertTo-HuntingTable -Columns @('A') -Rows @()).Rows.Count | Should -Be 0
+    }
+    It 'runs a query and keeps the columns the service reports' {
+        Mock Invoke-Graph { @{ schema = @(@{ name = 'Server'; type = 'String' }, @{ name = 'Agents'; type = 'Int64' }); results = @(@{ Server = 'mail'; Agents = 2 }) } }
+        $r = Invoke-HuntingRun -Query 'AgentsInfo | take 1'
+        $r.Columns | Should -Be @('Server', 'Agents')
+        $r.Rows.Count | Should -Be 1
+        $r.Table.Rows[0]['Agents'] | Should -Be '2'
+        Should -Invoke Invoke-Graph -Times 1 -ParameterFilter { $Uri -like '*/security/runHuntingQuery' -and ($Body | ConvertFrom-Json).Query -eq 'AgentsInfo | take 1' }
+    }
+    It 'picks the audit activity of a period, for chosen agents, risky only when asked' {
+        $now = Get-Date
+        $a = @([pscustomobject]@{ TitleId = 'T_A'; Time = $now.AddDays(-1); Risk = 'High' }, [pscustomobject]@{ TitleId = 'T_A'; Time = $now.AddDays(-10); Risk = 'None' },
+               [pscustomobject]@{ TitleId = 'T_B'; Time = $now.AddDays(-2); Risk = 'None' }, [pscustomobject]@{ TitleId = ''; Time = $now; Risk = 'High' })
+        @(Select-PurviewAuditActivities -Activities $a -Days 7).Count | Should -Be 2
+        @(Select-PurviewAuditActivities -Activities $a -Days 30).Count | Should -Be 3
+        @(Select-PurviewAuditActivities -Activities $a -Days 30 -OnlyIds @('t_a')).Count | Should -Be 2
+        @(Select-PurviewAuditActivities -Activities $a -Days 30 -RiskyOnly).Count | Should -Be 1
+    }
+}

@@ -5281,7 +5281,9 @@ $GuiXaml = @'
                 <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource NavIcon}" Text="&#xEA18;"/><TextBlock Text="Security"/></StackPanel></DockPanel>
             </Button>
             <StackPanel x:Name="SecurityKids">
-              <RadioButton x:Name="NavAlerts" Style="{StaticResource NavChild}" Tag="alerts" Content="Alerts" ToolTip="Defender XDR alerts that concern agents"/>
+              <RadioButton x:Name="NavAlerts" Style="{StaticResource NavChild}" Tag="alerts" Content="Alerts" ToolTip="Defender XDR alerts that concern agents, with response actions"/>
+              <RadioButton x:Name="NavHunting" Style="{StaticResource NavChild}" Tag="hunting" Content="Hunting" ToolTip="Built-in Advanced Hunting queries about agents, ready to run and to change"/>
+              <RadioButton x:Name="NavPurview" Style="{StaticResource NavChild}" Tag="purview" Content="Purview audit" ToolTip="AI activity per agent from the Purview audit log"/>
               <RadioButton x:Name="NavHits" Style="{StaticResource NavChild}" Tag="hits" Content="Policy hits" ToolTip="Purview DLP rule matches and DLP or Insider Risk alerts on agents"/>
               <RadioButton x:Name="NavCa" Style="{StaticResource NavChild}" Tag="ca" Content="Conditional Access" ToolTip="Whether a Conditional Access policy blocks each agent at High agent risk"/>
             </StackPanel>
@@ -6767,6 +6769,17 @@ $AgentAlertsXaml = @'
       <DockPanel>
         <Button x:Name="BtnAaExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON."/>
         <Button x:Name="BtnAaOpen" Content="Open in Defender" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" IsEnabled="False" ToolTip="Open the selected alert in the Microsoft Defender portal."/>
+        <Button x:Name="BtnAaRespond" Content="Respond &#9662;" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" IsEnabled="False" ToolTip="Act on the agent the selected alert names: block it, confirm it as compromised, revoke its sessions, block an MCP server for it, or show it in All agents.">
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem Header="Block the agent..."/>
+              <MenuItem Header="Confirm as compromised..."/>
+              <MenuItem Header="Revoke sessions..."/>
+              <MenuItem Header="Block an MCP server for it..."/>
+              <MenuItem Header="Show it in All agents"/>
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
         <Button x:Name="BtnAaLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the alerts again."/>
         <TextBox x:Name="AaSearch" DockPanel.Dock="Right" Width="180" Height="30" Margin="12,0,0,0" VerticalContentAlignment="Center" ToolTip="Show only alerts whose agent, title, category or source contains this text."/>
         <ComboBox x:Name="AaSevBox" DockPanel.Dock="Right" SelectedIndex="0" Width="150" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Show alerts at or above this severity.">
@@ -6845,6 +6858,7 @@ function Update-AgentAlertsWindow {
     if ($shown.Count) { $grid.SelectedIndex = 0 }
     $detail.ItemsSource = @(if ($grid.SelectedItem) { Get-AgentAlertDetailRows $grid.SelectedItem })
     $Window.FindName('BtnAaOpen').IsEnabled = [bool]($grid.SelectedItem -and $grid.SelectedItem.Link)
+    $Window.FindName('BtnAaRespond').IsEnabled = [bool]($grid.SelectedItem -and $grid.SelectedItem.AgentId -and $script:ctx)
 }
 
 function New-AgentAlertsWindow {
@@ -6863,7 +6877,15 @@ function New-AgentAlertsWindow {
         $item = $script:aaWindow.FindName('AaGrid').SelectedItem
         $script:aaWindow.FindName('AaDetailGrid').ItemsSource = @(if ($item) { Get-AgentAlertDetailRows $item })
         $script:aaWindow.FindName('BtnAaOpen').IsEnabled = [bool]($item -and $item.Link)
+        $script:aaWindow.FindName('BtnAaRespond').IsEnabled = [bool]($item -and $item.AgentId -and $script:ctx)
     })
+    $respond = $d.FindName('BtnAaRespond')
+    $respond.Add_Click({ $b = $script:aaWindow.FindName('BtnAaRespond'); $b.ContextMenu.PlacementTarget = $b; $b.ContextMenu.Placement = 'Bottom'; $b.ContextMenu.IsOpen = $true })
+    $respond.ContextMenu.Items[0].Add_Click({ Invoke-AlertResponse block })
+    $respond.ContextMenu.Items[1].Add_Click({ Invoke-AlertResponse compromise })
+    $respond.ContextMenu.Items[2].Add_Click({ Invoke-AlertResponse revoke })
+    $respond.ContextMenu.Items[3].Add_Click({ Invoke-AlertResponse mcp })
+    $respond.ContextMenu.Items[4].Add_Click({ Invoke-AlertResponse show })
     $d.FindName('BtnAaOpen').Add_Click({
         $item = $script:aaWindow.FindName('AaGrid').SelectedItem
         if ($item -and $item.Link) { Start-Process $item.Link }
@@ -7251,6 +7273,1537 @@ function Show-ColumnFilter {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Built-in hunting queries for the Hunting page: a curated set from the Agent365-Hunting library, validated against Defender
+# Advanced Hunting. Each one reads the last 30 days unless its first lines say otherwise; the page lets you edit one before it runs.
+# ---------------------------------------------------------------------------------------------
+$script:HuntingQueries = @(
+    [pscustomobject]@{ Category = 'Inventory'; Name = 'Agents missing governance attributes'
+                       Description = 'Agents missing governance attributes: Entra agent ID, blueprint, owner, creator (sponsor proxy), or observability ID'
+                       Query = @'
+// Advanced Hunting exposes no sponsor field; the registry creator is the closest accountable person
+let window = 30d;
+AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo
+| extend MissingEntraAgentId = isempty(EntraAgentID),
+         MissingBlueprint = isempty(EntraBlueprintID),
+         MissingOwner = isempty(Owners) or tostring(Owners) == "[]",
+         MissingCreator = isempty(tostring(r.creatorId)) and isempty(tostring(r.createdBy)),
+         MissingObservability = isempty(ObservabilityID)
+// Platforms where an Entra agent identity is part of the registration; catalog and local agents run under the user's identity
+| extend IdentityExpected = Platform in ("Copilot Studio", "Microsoft Foundry"), TenantBuilt = tostring(r.scope) == "tenant"
+| extend Gaps = pack_array(
+    iff(MissingEntraAgentId, "Entra agent ID", ""),
+    iff(MissingBlueprint, "Blueprint", ""),
+    iff(MissingOwner, "Owner", ""),
+    iff(MissingCreator, "Creator", ""),
+    iff(MissingObservability, "Observability ID", ""))
+| mv-apply Gap = Gaps on (where isnotempty(Gap) | summarize Gaps = make_list(Gap))
+| extend GapCount = array_length(Gaps),
+         NoAccountablePerson = MissingOwner and MissingCreator,
+         Severity = case(
+            IdentityExpected and (MissingEntraAgentId or MissingObservability), "High",
+            MissingOwner and MissingCreator and (IdentityExpected or TenantBuilt), "High",
+            MissingOwner and MissingCreator, "Low",
+            MissingOwner or MissingCreator or MissingObservability, "Medium",
+            "Low")
+| where GapCount > 0
+| project Severity, GapCount, Gaps, Agent = Name, Platform, PublishedStatus, LifecycleStatus, IdentityExpected, TenantBuilt, NoAccountablePerson,
+          MissingEntraAgentId, MissingBlueprint, MissingOwner, MissingCreator, MissingObservability,
+          Publisher = tostring(r.developerName), AppType = tostring(r.appType), Scope = tostring(r.scope),
+          Owners, CreatorId = tostring(r.creatorId), EntraAgentID, EntraBlueprintID, ObservabilityID,
+          Created = coalesce(todatetime(CreatedDateTime), todatetime(r.createdDate)), LastUpdated = coalesce(todatetime(LastUpdatedDateTime), todatetime(r.lastUpdatedDate)),
+          AgentId
+| order by Severity asc, GapCount desc, Platform asc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Inventory'; Name = 'Orphaned agents'
+                       Description = 'Agents whose accountable people are gone: owners and creator that are disabled, deleted, or not found in the directory, with the usage and permissions the agent still has'
+                       Query = @'
+// An owner that is a group or a service principal is not in IdentityInfo and also reports as not found
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let identities = IdentityInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| project PersonId = AccountObjectId, PersonUpn = AccountUpn, PersonName = AccountDisplayName, PersonDepartment = Department, PersonEnabled = IsAccountEnabled,
+          PersonManager = tostring(column_ifexists("Manager", ""));
+// Owners and the creator are the accountable people; Advanced Hunting exposes no sponsor field
+let people = agents
+| extend OwnerIds = iff(isempty(Owners) or tostring(Owners) == "[]", dynamic([]), Owners), CreatorId = tostring(r.creatorId)
+| extend Entries = array_concat(OwnerIds, iff(isnotempty(CreatorId), pack_array(CreatorId), dynamic([])))
+| mv-expand PersonId = Entries to typeof(string)
+| where isnotempty(PersonId)
+| extend Role = case(set_has_element(OwnerIds, PersonId) and PersonId == CreatorId, "Owner and creator", set_has_element(OwnerIds, PersonId), "Owner", "Creator")
+| distinct AgentId, PersonId, Role
+| join kind=leftouter identities on PersonId
+| extend PersonState = case(isempty(PersonUpn) and isempty(PersonName), "Not found in directory", PersonEnabled == false, "Disabled", "Active")
+| summarize People = make_list(strcat(Role, ": ", coalesce(PersonUpn, PersonName, PersonId), " [", PersonState, "]"), 15),
+            ActivePeople = countif(PersonState == "Active"), DisabledPeople = countif(PersonState == "Disabled"), MissingPeople = countif(PersonState == "Not found in directory"),
+            ActiveOwners = countif(PersonState == "Active" and Role startswith "Owner"), TotalOwners = countif(Role startswith "Owner"),
+            Escalation = make_set_if(PersonManager, isnotempty(PersonManager) and PersonState != "Active", 5), Departments = make_set_if(PersonDepartment, isnotempty(PersonDepartment), 5)
+    by AgentId;
+let usage = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction", "ExecuteToolBySDK")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId))
+| extend Keys = pack_array(K, P)
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key) and isnotempty(EventId)
+| join kind=inner agentKeys on Key
+| summarize arg_max(Timestamp, AccountObjectId, ActionType) by AgentId, EventId
+| summarize Events30d = count(), Users30d = dcountif(AccountObjectId, isnotempty(AccountObjectId)), LastActivity = max(Timestamp) by AgentId;
+let privileges = OAuthAppInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by OAuthAppId
+| join kind=inner (
+    agents
+    | extend AppIds = pack_array(tostring(EntraAgentID), tostring(EntraBlueprintID))
+    | mv-expand AppId = AppIds to typeof(string)
+    | where isnotempty(AppId)
+    | distinct AgentId, AppId
+  ) on $left.OAuthAppId == $right.AppId
+| summarize AppPrivilegeLevels = make_set(PrivilegeLevel) by AgentId;
+agents
+| join kind=leftouter people on AgentId
+| join kind=leftouter usage on AgentId
+| join kind=leftouter privileges on AgentId
+| extend ActivePeople = coalesce(ActivePeople, 0), DisabledPeople = coalesce(DisabledPeople, 0), MissingPeople = coalesce(MissingPeople, 0),
+         ActiveOwners = coalesce(ActiveOwners, 0), TotalOwners = coalesce(TotalOwners, 0), Events30d = coalesce(Events30d, 0)
+| extend Finding = case(DisabledPeople + MissingPeople > 0 and ActivePeople == 0, "All accountable people disabled or gone",
+                        TotalOwners > 0 and ActiveOwners == 0, "No active owner, creator still active",
+                        DisabledPeople + MissingPeople > 0, "Some accountable people disabled or gone",
+                        "")
+| where isnotempty(Finding)
+| extend Severity = case(Finding startswith "All" and (Events30d > 0 or tostring(AppPrivilegeLevels) has "High"), "High",
+                         Finding startswith "All" or Finding startswith "No active", "Medium",
+                         "Low")
+| project Severity, Finding, Agent = Name, Platform, PublishedStatus, LifecycleStatus, People, ActivePeople, DisabledPeople, MissingPeople, Escalation, Departments,
+          Events30d, Users30d = coalesce(Users30d, 0), LastActivity, AppPrivilegeLevels, CreatedDateTime, LastUpdatedDateTime, AgentId, EntraAgentID
+| order by case(Severity == "High", 1, Severity == "Medium", 2, 3) asc, Events30d desc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Inventory'; Name = 'Unregistered AI runtimes on endpoints'
+                       Description = 'AI runtimes running on endpoints that are not in the Agent 365 registry: process, users, connections to model providers, protection events, and host posture (Device-prefixed columns describe the host, not the runtime)'
+                       Query = @'
+let window = 30d;
+let knownRuntimes = dynamic(["ollama.exe", "ollama", "ollama app.exe", "lm studio.exe", "lmstudio.exe", "gpt4all.exe", "jan.exe", "llama-server.exe", "llamafile.exe", "koboldcpp.exe",
+                             "claude.exe", "cowork-svc.exe", "codex.exe", "cursor.exe", "copilot.exe", "github-copilot-cli.exe", "anythingllm.exe", "msty.exe", "open-webui.exe", "aider.exe", "continue.exe", "windsurf.exe", "gemini.exe"]);
+let commandMarkers = dynamic(["ollama serve", "ollama run", "lmstudio", "llama.cpp", "llama-server", "langchain", "autogen", "crewai", "semantic-kernel", "semantic_kernel", "openai-agents", "agents-sdk", "copilot-cli", "claude-code", "codex-cli", "mcp-server", "modelcontextprotocol", "vllm", "text-generation-webui", "localai"]);
+let providerHosts = dynamic(["api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com", "api.mistral.ai", "api.cohere.ai", "openrouter.ai", "api.groq.com", "huggingface.co", "api.deepseek.com", "api.together.xyz", "api.perplexity.ai", "api.x.ai", "openai.azure.com", "cognitiveservices.azure.com", "services.ai.azure.com"]);
+// Registered local agents: device and process pairs already discovered
+let registered = AgentsInfo
+| where Timestamp > ago(window) and Platform == "LocalAgents"
+| summarize arg_max(Timestamp, *) by AgentId
+| extend m = RawAgentInfo.localAgentMetadata
+| project DeviceId = tostring(m.machineId), Process = tolower(tostring(m.relatedProcess)), RegisteredAgent = Name, RegisteredStatus = iff(isempty(LifecycleStatus), "Current", LifecycleStatus)
+| summarize RegisteredAgents = make_set(strcat(RegisteredAgent, " (", RegisteredStatus, ")")) by DeviceId, Process
+// Companion processes of a registered runtime count as registered on the same device
+| join kind=leftouter (datatable(Process:string, Companion:string)["claude.exe", "cowork-svc.exe"]) on Process
+| extend Process = pack_array(Process, Companion)
+| mv-expand Process to typeof(string)
+| where isnotempty(Process)
+| project DeviceId, Process, RegisteredAgents;
+// Runtime processes seen on endpoints
+let runtimeProcs = DeviceProcessEvents
+| where Timestamp > ago(window)
+| where FileName in~ (knownRuntimes) or ProcessCommandLine has_any (commandMarkers)
+| extend Process = tolower(FileName)
+| summarize Executions = count(), ProcessFirstSeen = min(Timestamp), ProcessLastSeen = max(Timestamp),
+            Users = make_set(strcat(AccountDomain, "\\", AccountName)), ProductNames = make_set_if(ProcessVersionInfoProductName, isnotempty(ProcessVersionInfoProductName)),
+            ProductVersions = make_set_if(ProcessVersionInfoProductVersion, isnotempty(ProcessVersionInfoProductVersion)), Publishers = make_set_if(ProcessVersionInfoCompanyName, isnotempty(ProcessVersionInfoCompanyName)),
+            ParentProcesses = make_set(InitiatingProcessFileName), Hashes = make_set(SHA256, 5), FolderPaths = make_set(FolderPath, 5), CommandLineSamples = make_set(substring(ProcessCommandLine, 0, 160), 5)
+    by DeviceId, DeviceName, Process;
+// Processes talking to model provider endpoints, whether or not they are known runtimes
+let providerTalkers = DeviceNetworkEvents
+| where Timestamp > ago(window)
+| where RemoteUrl has_any (providerHosts)
+| extend Process = tolower(InitiatingProcessFileName)
+| summarize ProviderConnections = count(), ProviderHosts = make_set(tostring(parse_url(strcat("https://", RemoteUrl)).Host)), ProviderFirstSeen = min(Timestamp), ProviderLastSeen = max(Timestamp),
+            ProviderUsers = make_set(strcat(InitiatingProcessAccountDomain, "\\", InitiatingProcessAccountName))
+    by DeviceId, DeviceName, Process;
+let candidates = runtimeProcs
+| join kind=fullouter providerTalkers on DeviceId, Process
+| extend DeviceId = coalesce(DeviceId, DeviceId1), DeviceName = coalesce(DeviceName, DeviceName1), Process = coalesce(Process, Process1)
+| project-away DeviceId1, DeviceName1, Process1;
+// All connections and listening ports of the candidate processes
+let net = DeviceNetworkEvents
+| where Timestamp > ago(window)
+| extend Process = tolower(InitiatingProcessFileName)
+| join kind=inner (candidates | distinct DeviceId, Process) on DeviceId, Process
+| summarize Connections = countif(ActionType != "ListeningConnectionCreated"), RemoteHosts = make_set_if(coalesce(RemoteUrl, RemoteIP), ActionType != "ListeningConnectionCreated" and isnotempty(coalesce(RemoteUrl, RemoteIP)), 20),
+            RemotePorts = make_set_if(RemotePort, ActionType != "ListeningConnectionCreated", 10), ListeningPorts = make_set_if(LocalPort, ActionType == "ListeningConnectionCreated")
+    by DeviceId, Process;
+// Defender for Endpoint protection events involving the candidate processes
+let protection = DeviceEvents
+| where Timestamp > ago(window)
+| extend Process = tolower(InitiatingProcessFileName)
+| join kind=inner (candidates | distinct DeviceId, Process) on DeviceId, Process
+| summarize ProtectionEvents = count(), ProtectionEventTypes = make_set(ActionType), AvDetections = countif(ActionType == "AntivirusDetection"),
+            ExploitGuardBlocks = countif(ActionType startswith "ExploitGuard"), AsrEvents = countif(ActionType startswith "AsrRule"), LastProtectionEvent = max(Timestamp)
+    by DeviceId, Process;
+let deviceInfo = DeviceInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by DeviceId
+| project DeviceId, DeviceOSPlatform = OSPlatform, DeviceOSVersion = OSVersionInfo, DeviceExposureLevel = ExposureLevel, DeviceAssetValue = column_ifexists("AssetValue", ""), DeviceMachineGroup = MachineGroup, DeviceJoinType = JoinType, DeviceOnboardingStatus = OnboardingStatus;
+candidates
+| join kind=leftouter registered on DeviceId, Process
+| join kind=leftouter net on DeviceId, Process
+| join kind=leftouter protection on DeviceId, Process
+| join kind=leftouter deviceInfo on DeviceId
+| extend Status = iff(array_length(RegisteredAgents) > 0, "Registered", "Unregistered"),
+         Signal = case(Executions > 0 and ProviderConnections > 0, "Known runtime with provider traffic", Executions > 0, "Known runtime", "Provider traffic only")
+| project Status, Signal, DeviceName, Process, RegisteredAgents,
+          Executions = coalesce(Executions, 0), ProcessFirstSeen, ProcessLastSeen, Users, ProductNames, ProductVersions, Publishers, ParentProcesses, FolderPaths, CommandLineSamples, Hashes,
+          ProviderConnections = coalesce(ProviderConnections, 0), ProviderHosts, ProviderUsers, ProviderFirstSeen, ProviderLastSeen,
+          Connections = coalesce(Connections, 0), RemoteHosts, RemotePorts, ListeningPorts,
+          ProtectionEvents = coalesce(ProtectionEvents, 0), ProtectionEventTypes, AvDetections = coalesce(AvDetections, 0), ExploitGuardBlocks = coalesce(ExploitGuardBlocks, 0), AsrEvents = coalesce(AsrEvents, 0), LastProtectionEvent,
+          DeviceOSPlatform, DeviceOSVersion, DeviceExposureLevel, DeviceAssetValue, DeviceMachineGroup, DeviceJoinType, DeviceOnboardingStatus, DeviceId
+| order by Status desc, Signal asc, DeviceName asc, Executions desc
+'@ },
+    [pscustomobject]@{ Category = 'Telemetry'; Name = 'Telemetry health'
+                       Description = 'Telemetry health in both directions: registered agents that emit no activity records, and agent ids that emit activity records but resolve to no registered agent'
+                       Query = @'
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprints = agents
+| where isnotempty(EntraBlueprintID)
+| summarize BlueprintAgents = dcount(AgentId), BlueprintAgentNames = make_set(Name, 5) by Key = tostring(EntraBlueprintID);
+let activity = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "ExecuteToolBySDK", "InferenceCall", "CopilotInteraction", "ConnectedAIAppInteraction")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId)),
+         LoggedName = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentName), tostring(RawEventData.AgentName))
+| where isnotempty(EventId) and (isnotempty(K) or isnotempty(P) or isnotempty(B))
+| project Timestamp, ActionType, EventId, K, P, B, LoggedName, Application, AccountObjectId;
+let matched = union
+    (activity | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (activity | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key)
+| summarize arg_max(Timestamp, ActionType) by AgentId, EventId;
+let emitting = matched
+| summarize Events = count(), RecordTypes = make_set(ActionType), LastEvent = max(Timestamp) by AgentId;
+// Direction 1: registered, expected to log, and silent
+let silent = agents
+| join kind=leftanti emitting on AgentId
+| where Platform != "LocalAgents"
+| extend HasObservabilityId = isnotempty(ObservabilityID), HasEntraAgentId = isnotempty(EntraAgentID)
+| extend Finding = case(PublishedStatus =~ "Published" and HasObservabilityId, "Has observability id, no activity records (unused or not logging)",
+                        PublishedStatus =~ "Published" and HasEntraAgentId, "Has Entra agent id, no activity records (unused or not logging)",
+                        PublishedStatus =~ "Published", "Published without any identifier that activity records use",
+                        "")
+| where isnotempty(Finding)
+| project Direction = "Registered but silent", Finding, Agent = Name, Platform, PublishedStatus, LifecycleStatus, Events = 0, RecordTypes = dynamic([]), Users = 0,
+          FirstEvent = datetime(null), LastEvent = datetime(null), LoggedId = "", BlueprintId = tostring(EntraBlueprintID), BlueprintAgents = 0, BlueprintAgentNames = dynamic([]),
+          Applications = dynamic([]), RegistryAgentId = AgentId, EntraAgentID = tostring(EntraAgentID), ObservabilityID = tostring(ObservabilityID), LastUpdated = todatetime(LastUpdatedDateTime);
+// Direction 2: logging, and not resolvable to one registered agent
+let unregistered = activity
+| join kind=leftanti matched on EventId
+| summarize Events = dcount(EventId), RecordTypes = make_set(ActionType), Users = dcountif(AccountObjectId, isnotempty(AccountObjectId)),
+            FirstEvent = min(Timestamp), LastEvent = max(Timestamp), LoggedNames = make_set_if(LoggedName, isnotempty(LoggedName), 3), Applications = make_set_if(Application, isnotempty(Application), 3)
+    by LoggedId = coalesce(K, P), BlueprintId = B
+| join kind=leftouter blueprints on $left.BlueprintId == $right.Key
+| extend BlueprintAgents = coalesce(BlueprintAgents, 0)
+| extend Finding = case(BlueprintAgents == 1, "Id not registered, blueprint maps to one agent",
+                        BlueprintAgents > 1, "Id not registered, blueprint shared by several agents",
+                        isnotempty(BlueprintId), "Id and blueprint not registered",
+                        "Id not registered, no blueprint on the record")
+| project Direction = "Logging but not registered", Finding, Agent = tostring(LoggedNames[0]), Platform = "", PublishedStatus = "", LifecycleStatus = "", Events, RecordTypes, Users,
+          FirstEvent, LastEvent, LoggedId, BlueprintId, BlueprintAgents, BlueprintAgentNames = coalesce(BlueprintAgentNames, dynamic([])),
+          Applications, RegistryAgentId = "", EntraAgentID = "", ObservabilityID = "", LastUpdated = datetime(null);
+union silent, unregistered
+| order by Direction asc, Events desc, Finding asc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Telemetry'; Name = 'Agent access trend daily'
+                       Description = 'Daily trend of agent access by users: interactions, distinct agents used, and distinct users per day over 30 days'
+                       Query = @'
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(RawAgentInfo.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+// Blueprint fallback for records that carry only a blueprint id; used only when no direct key matches and the blueprint maps to a single agent
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let interactions = CloudAppEvents
+| where Timestamp > ago(window)
+| where ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction")
+| where isnotempty(AccountObjectId)
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId))
+| where isnotempty(EventId)
+| project Timestamp, AccountObjectId, EventId, K, P, B;
+let interactionsDirect = union
+    (interactions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (interactions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+union
+    interactionsDirect,
+    (interactions | join kind=leftanti interactionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(Timestamp, AccountObjectId, AgentId) by EventId
+| make-series Interactions = count(), ActiveAgents = dcount(AgentId), ActiveUsers = dcount(AccountObjectId)
+    on Timestamp from startofday(ago(window)) to startofday(now()) step 1d
+| mv-expand Day = Timestamp to typeof(datetime), Interactions to typeof(long), ActiveAgents to typeof(long), ActiveUsers to typeof(long)
+| project Day, Interactions, ActiveAgents, ActiveUsers
+| order by Day asc
+'@ },
+    [pscustomobject]@{ Category = 'Alerts'; Name = 'Agents at risk'
+                       Description = 'Agents at risk: alerts with their source and entities, real-time protection outcomes, exposure indicators, risky-user access, and privilege context, one row per agent'
+                       Query = @'
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let agentApps = agents
+| extend AppIds = pack_array(tostring(EntraAgentID), tostring(EntraBlueprintID))
+| mv-expand AppId = AppIds to typeof(string)
+| where isnotempty(AppId)
+| distinct AgentId, AppId;
+// Azure AI resource behind Foundry agents, for model-level alerts that name the resource rather than the agent
+let agentResources = agents
+| where tostring(SourceAgentId) startswith "/subscriptions/"
+| extend ResourceID = tolower(extract(@"(?i)^(/subscriptions/[^/]+/resourcegroups/[^/]+/providers/microsoft\.cognitiveservices/accounts/[^/]+)", 1, tostring(SourceAgentId)))
+| where isnotempty(ResourceID)
+| distinct AgentId, ResourceID;
+// 1. Alerts attributed to the agent, through the agent entity or the Azure resource
+let evidence = AlertEvidence | where Timestamp > ago(window);
+let alertsByAgentEntity = evidence
+| where EntityType == "AIAgent"
+| extend K = tostring(parse_json(AdditionalFields).AgentId)
+| join kind=inner agentKeys on $left.K == $right.Key
+| distinct AgentId, AlertId
+| extend Via = "Agent entity";
+let alertsByResource = evidence
+| where EntityType == "CloudResource" and isnotempty(ResourceID)
+| extend ResourceID = tolower(ResourceID)
+| join kind=inner agentResources on ResourceID
+| distinct AgentId, AlertId
+| extend Via = "Azure AI resource";
+let agentAlerts = union alertsByAgentEntity, alertsByResource
+| summarize Via = min(Via) by AgentId, AlertId;
+let alertSummary = agentAlerts
+| join kind=inner (AlertInfo | where Timestamp > ago(window)) on AlertId
+| extend SeverityRank = case(Severity == "High", 3, Severity == "Medium", 2, Severity == "Low", 1, 0)
+| summarize Alerts = dcount(AlertId), HighestAlertSeverityRank = max(SeverityRank),
+            AlertTitles = make_set(strcat(Severity, ": ", Title)),
+            AlertSources = make_set(strcat(ServiceSource, " / ", DetectionSource)),
+            AlertCategories = make_set(Category),
+            AttackTechniques = make_set_if(AttackTechniques, isnotempty(AttackTechniques) and AttackTechniques != "[]"),
+            AttributedVia = make_set(Via),
+            FirstAlert = min(Timestamp), LastAlert = max(Timestamp)
+    by AgentId
+| extend HighestAlertSeverity = case(HighestAlertSeverityRank == 3, "High", HighestAlertSeverityRank == 2, "Medium", HighestAlertSeverityRank == 1, "Low", "Informational");
+let alertEntities = agentAlerts
+| join kind=inner evidence on AlertId
+| summarize AlertUsers = make_set_if(AccountUpn, isnotempty(AccountUpn)),
+            AlertUrls = make_set_if(RemoteUrl, isnotempty(RemoteUrl)),
+            AlertIPs = make_set_if(RemoteIP, isnotempty(RemoteIP)),
+            AlertApps = make_set_if(coalesce(Application, OAuthApplicationId), isnotempty(coalesce(Application, OAuthApplicationId))),
+            AlertFiles = make_set_if(FileName, isnotempty(FileName)),
+            AlertResources = make_set_if(CloudResource, isnotempty(CloudResource))
+    by AgentId;
+// 2. Real-time protection audits and blocks
+let rtp = BehaviorEntities
+| where Timestamp > ago(window) and EntityType == "AIAgent" and ActionType startswith "BehaviorAgentRTP"
+| extend K = tostring(parse_json(AdditionalFields).AgentId)
+| join kind=inner agentKeys on $left.K == $right.Key
+| join kind=inner (BehaviorInfo | where Timestamp > ago(window) | project BehaviorId, Categories, AccountUpn) on BehaviorId
+| summarize RtpAudits = dcountif(BehaviorId, ActionType == "BehaviorAgentRTPAudit"), RtpBlocks = dcountif(BehaviorId, ActionType == "BehaviorAgentRTPBlock"),
+            RtpCategories = make_set(tostring(Categories)), RtpUsers = make_set_if(AccountUpn, isnotempty(AccountUpn)), LastRtp = max(Timestamp)
+    by AgentId;
+// 3. Exposure graph indicators
+let idMap = agents
+| extend Keys = pack_array(AgentId, tostring(EntraAgentID))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let posture = ExposureGraphNodes
+| where NodeLabel in ("ai-agent", "copilot-studio-ai-agent")
+| extend p = NodeProperties.rawData
+| extend Keys = pack_array(tostring(p.aiAgentMetadata.id), tostring(p.aiAgentMetadata.entraAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| join kind=inner idMap on Key
+| summarize ActiveThreat = max(isnotnull(p.activeThreatIndicator)),
+            BlastRadius = max(tostring(p.blastRadiusIndicator.blastRadiusLevel)),
+            NoGuardrails = max(isnotnull(p.noGuardrailsIndicator)),
+            WeakInstructions = max(isnotnull(p.weakInstructionsIndicator)),
+            NoAuthentication = max(isnotnull(p.noAuthenticationIndicator)),
+            PrivilegedBusinessAccess = max(isnotnull(p.privilegedBusinessSystemAccessIndicator)),
+            PrivilegedDevAccess = max(isnotnull(p.privilegedSoftwareDevelopmentAccessIndicator)),
+            HighAutonomy = max(isnotnull(p.agentWithHighAutonomyIndicator))
+    by AgentId;
+// 4. Access by risky users, and overall usage
+let riskyUsers = IdentityInfo
+| where Timestamp > ago(window) and Type == "User"
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| where RiskLevel in~ ("Low", "Medium", "High") or RiskStatus in~ ("AtRisk", "ConfirmedCompromised")
+| project AccountObjectId, AccountUpn, RiskLevel, RiskStatus;
+let interactions = CloudAppEvents
+| where Timestamp > ago(window)
+| where ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId))
+| where isnotempty(EventId)
+| project Timestamp, AccountObjectId, EventId, K, P, B;
+let interactionsDirect = union
+    (interactions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (interactions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let usage = union
+    interactionsDirect,
+    (interactions | join kind=leftanti interactionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(Timestamp, AccountObjectId) by AgentId, EventId
+| join kind=leftouter riskyUsers on AccountObjectId
+| summarize Interactions30d = count(), Users30d = dcountif(AccountObjectId, isnotempty(AccountObjectId)), LastInteraction = max(Timestamp),
+            RiskyUserCount = dcountif(AccountObjectId, isnotempty(RiskLevel)),
+            RiskyUsers = make_set_if(strcat(AccountUpn, " (", RiskLevel, "/", RiskStatus, ")"), isnotempty(RiskLevel))
+    by AgentId;
+// 5. Privilege context
+let privilege = OAuthAppInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by OAuthAppId
+| join kind=inner agentApps on $left.OAuthAppId == $right.AppId
+| summarize AppPrivilegeLevels = make_set(PrivilegeLevel), HighPrivilegeApp = max(PrivilegeLevel == "High"), AppRiskScore = max(RiskScore) by AgentId;
+agents
+| join kind=leftouter alertSummary on AgentId
+| join kind=leftouter alertEntities on AgentId
+| join kind=leftouter rtp on AgentId
+| join kind=leftouter posture on AgentId
+| join kind=leftouter usage on AgentId
+| join kind=leftouter privilege on AgentId
+| extend Alerts = coalesce(Alerts, 0), RtpAudits = coalesce(RtpAudits, 0), RtpBlocks = coalesce(RtpBlocks, 0), RiskyUserCount = coalesce(RiskyUserCount, 0),
+         Interactions30d = coalesce(Interactions30d, 0), Users30d = coalesce(Users30d, 0)
+| extend Reasons = pack_array(
+    iff(Alerts > 0, strcat(Alerts, " alert(s), highest ", HighestAlertSeverity), ""),
+    iff(RtpBlocks > 0, strcat(RtpBlocks, " interaction(s) blocked by real-time protection"), ""),
+    iff(RtpAudits > 0, strcat(RtpAudits, " interaction(s) flagged in audit mode"), ""),
+    iff(coalesce(ActiveThreat, false), "Active threat indicator in exposure graph", ""),
+    iff(BlastRadius == "High", "High blast radius", ""),
+    iff(coalesce(NoGuardrails, false), "No guardrails declared", ""),
+    iff(coalesce(WeakInstructions, false), "Weak instructions", ""),
+    iff(coalesce(NoAuthentication, false), "Tools reachable without authentication", ""),
+    iff(RiskyUserCount > 0, strcat(RiskyUserCount, " risky user(s) interacted with the agent"), ""),
+    iff(coalesce(HighPrivilegeApp, false), "App privilege level High", ""),
+    iff(coalesce(PrivilegedBusinessAccess, false), "Privileged business system access", ""))
+| mv-apply Reason = Reasons on (where isnotempty(Reason) | summarize Reasons = make_list(Reason))
+| extend RiskScore = array_length(Reasons)
+             + iff(HighestAlertSeverity == "High", 3, iff(HighestAlertSeverity == "Medium", 2, 0))
+             + iff(RtpBlocks > 0, 2, 0)
+             + iff(coalesce(ActiveThreat, false), 2, 0)
+             + iff(RiskyUserCount > 0, 1, 0)
+| extend Severity = case(
+    HighestAlertSeverity == "High" or RtpBlocks > 0 or coalesce(ActiveThreat, false), "High",
+    Alerts > 0 or RtpAudits > 0 or RiskyUserCount > 0 or BlastRadius == "High", "Medium",
+    RiskScore > 0, "Low",
+    "None")
+| where Severity != "None"
+| project Severity, RiskScore, Reasons, Agent = Name, Platform, PublishedStatus, LifecycleStatus, Publisher = tostring(r.developerName), Owners,
+          Alerts, HighestAlertSeverity, AlertTitles, AlertSources, AlertCategories, AttackTechniques, AttributedVia, FirstAlert, LastAlert,
+          AlertUsers, AlertUrls, AlertIPs, AlertApps, AlertFiles, AlertResources,
+          RtpAudits, RtpBlocks, RtpCategories, RtpUsers, LastRtp,
+          ActiveThreat, BlastRadius, NoGuardrails, WeakInstructions, NoAuthentication, PrivilegedBusinessAccess, PrivilegedDevAccess, HighAutonomy,
+          RiskyUserCount, RiskyUsers, Interactions30d, Users30d, LastInteraction,
+          AppRiskScore, AppPrivilegeLevels, HighPrivilegeApp, DeclaredTools, McpServers, Guardrails,
+          AgentId, EntraAgentID, EntraBlueprintID, SourceAgentId
+| order by Severity asc, RiskScore desc, Alerts desc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Alerts'; Name = 'Alerts by title'
+                       Description = 'Alert volume per title and detection source for agent-related alerts'
+                       Query = @'
+AlertInfo
+| where Timestamp > ago(90d)
+| where DetectionSource in ("Security for AI", "Microsoft Defender for AI Services")
+   or ServiceSource == "Microsoft Data Loss Prevention"
+| summarize Alerts = count(), First = min(Timestamp), Last = max(Timestamp) by ServiceSource, DetectionSource, Category, Title
+| order by Alerts desc
+'@ },
+    [pscustomobject]@{ Category = 'Runtime protection'; Name = 'Runtime protection: audit and block'
+                       Description = 'Real-time protection outcomes per agent, split into audit and block'
+                       Query = @'
+BehaviorInfo
+| where Timestamp > ago(30d) and ActionType startswith "BehaviorAgentRTP"
+| join kind=inner (
+    BehaviorEntities
+    | where EntityType == "AIAgent"
+    | extend f = parse_json(AdditionalFields)
+    | project BehaviorId, AgentId = tostring(f.AgentId), AgentName = tostring(f.AgentName), HostingPlatform = tostring(f.HostingPlatformType)
+  ) on BehaviorId
+| summarize Audits = countif(ActionType == "BehaviorAgentRTPAudit"), Blocks = countif(ActionType == "BehaviorAgentRTPBlock"),
+            Categories = make_set(tostring(Categories)), Users = dcount(AccountUpn), Last = max(Timestamp)
+    by AgentId, AgentName, HostingPlatform
+| order by Blocks desc, Audits desc
+'@ },
+    [pscustomobject]@{ Category = 'Runtime protection'; Name = 'Runtime protection: followed by agent actions'
+                       Description = 'Runtime protection detections followed by actions from the same agent: tool calls and invocations that still ran in the minutes after a block or audit event, with the user match'
+                       Query = @'
+let window = 30d;
+let lookahead = 30m;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(AgentId, tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+// Runtime protection records carry no conversation id; the agent, user, and URL are entities of the behavior
+let detections = BehaviorInfo
+| where Timestamp > ago(window) and ActionType startswith "BehaviorAgentRTP"
+| project BehaviorId, DetectionTime = Timestamp, Detection = ActionType, Description, Categories = tostring(Categories), AttackTechniques = tostring(AttackTechniques)
+| join kind=inner (
+    BehaviorEntities
+    | where Timestamp > ago(window) and ActionType startswith "BehaviorAgentRTP"
+    | extend f = parse_json(AdditionalFields)
+    | summarize AgentKey = take_anyif(tostring(f.AgentId), EntityType == "AIAgent"),
+                DetectedAgent = take_anyif(tostring(f.AgentName), EntityType == "AIAgent"),
+                AgentPlatform = take_anyif(tostring(f.HostingPlatformType), EntityType == "AIAgent"),
+                DetectionUserId = take_anyif(tostring(f.AadUserId), EntityType == "User"),
+                DetectionUser = take_anyif(coalesce(AccountUpn, tostring(f.Upn)), EntityType == "User"),
+                DetectionUrls = make_set_if(tostring(f.Url), EntityType == "Url", 5),
+                DetectionIPs = make_set_if(tostring(f.Address), EntityType == "Ip", 5)
+        by BehaviorId
+  ) on BehaviorId
+| where isnotempty(AgentKey)
+| join kind=leftouter agentKeys on $left.AgentKey == $right.Key
+| extend AgentId = coalesce(AgentId, AgentKey)
+| project-away Key, BehaviorId1;
+// The user is only on the invocation record; tool executions inherit it through the conversation
+let conversations = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "CopilotInteraction")
+| extend Conversation = tostring(RawEventData.ConversationId), UserUpn = tostring(RawEventData.UserId)
+| where isnotempty(Conversation) and isnotempty(AccountObjectId)
+| summarize arg_min(Timestamp, AccountObjectId, UserUpn) by Conversation
+| project Conversation, ActionUserId = AccountObjectId, ActionUser = UserUpn;
+let actions = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("ExecuteToolBySDK", "InvokeAgent")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId)),
+         Tool = tostring(RawEventData.ToolName), McpServer = tostring(RawEventData.ToolServerName),
+         Conversation = tostring(RawEventData.ConversationId), Error = tostring(RawEventData.ErrorMessage)
+| where isnotempty(EventId)
+| project ActionTime = Timestamp, ActionType, EventId, K, P, B, Tool, McpServer, Conversation, Error;
+let actionsDirect = union
+    (actions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (actions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let actionsByAgent = union
+    actionsDirect,
+    (actions | join kind=leftanti actionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key),
+    (actions | join kind=leftanti actionsDirect on EventId | where isnotempty(K) | extend AgentId = K)
+| summarize arg_max(ActionTime, *) by AgentId, EventId
+| join kind=leftouter conversations on Conversation
+| project AgentId, ActionTime, ActionType, Tool, McpServer, Conversation, Error, ActionUserId, ActionUser;
+detections
+| join kind=inner actionsByAgent on AgentId
+| where ActionTime between (DetectionTime .. DetectionTime + lookahead)
+| extend SameUser = isnotempty(DetectionUserId) and DetectionUserId == ActionUserId
+| summarize ActionsAfter = count(), ToolCallsAfter = countif(ActionType == "ExecuteToolBySDK"), InvocationsAfter = countif(ActionType == "InvokeAgent"),
+            ActionsBySameUser = countif(SameUser), SameUserUpn = take_anyif(ActionUser, SameUser), FailedActions = countif(isnotempty(Error)),
+            ToolsAfter = make_set_if(Tool, isnotempty(Tool), 20), McpServersAfter = make_set_if(McpServer, isnotempty(McpServer), 10),
+            UsersAfter = make_set_if(ActionUser, isnotempty(ActionUser), 10), Conversations = dcountif(Conversation, isnotempty(Conversation)),
+            FirstActionAfter = min(ActionTime), LastActionAfter = max(ActionTime)
+    by BehaviorId, DetectionTime, Detection, Description, Categories, AttackTechniques, DetectedAgent, AgentPlatform, DetectionUser, DetectionUserId,
+       DetectionUrls = tostring(DetectionUrls), DetectionIPs = tostring(DetectionIPs), AgentId
+| extend SecondsToFirstAction = datetime_diff("second", FirstActionAfter, DetectionTime)
+| project DetectionTime, Detection, DetectedAgent, AgentPlatform, DetectionUser = coalesce(DetectionUser, SameUserUpn, DetectionUserId), Description, Categories, AttackTechniques, DetectionUrls, DetectionIPs,
+          ActionsAfter, ToolCallsAfter, InvocationsAfter, ActionsBySameUser, FailedActions, SecondsToFirstAction, ToolsAfter, McpServersAfter, UsersAfter, Conversations,
+          FirstActionAfter, LastActionAfter, AgentId, BehaviorId
+| order by Detection desc, ToolCallsAfter desc, ActionsBySameUser desc, DetectionTime desc
+'@ },
+    [pscustomobject]@{ Category = 'Runtime protection'; Name = 'Runtime protection: repeat offenders'
+                       Description = 'Users who repeatedly trigger runtime protection, across how many agents, with blocks against audits, attack categories, source addresses, and the identity context of the user'
+                       Query = @'
+let window = 30d;
+let minDetections = 3;
+let entities = BehaviorEntities
+| where Timestamp > ago(window) and ActionType startswith "BehaviorAgentRTP"
+| extend f = parse_json(AdditionalFields)
+| summarize UserId = take_anyif(tostring(f.AadUserId), EntityType == "User"),
+            UserUpn = take_anyif(coalesce(AccountUpn, tostring(f.Upn)), EntityType == "User"),
+            Agent = take_anyif(tostring(f.AgentName), EntityType == "AIAgent"),
+            AgentKey = take_anyif(tostring(f.AgentId), EntityType == "AIAgent"),
+            AgentPlatform = take_anyif(tostring(f.HostingPlatformType), EntityType == "AIAgent"),
+            Urls = make_set_if(tostring(f.Url), EntityType == "Url", 5),
+            IPs = make_set_if(tostring(f.Address), EntityType == "Ip", 5)
+    by BehaviorId;
+let identities = IdentityInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| project UserId = AccountObjectId, IdentityUpn = AccountUpn, DisplayName = AccountDisplayName, Department, JobTitle, IsAccountEnabled,
+          UserRiskLevel = tostring(column_ifexists("RiskLevel", "")), UserRiskStatus = tostring(column_ifexists("RiskStatus", "")), UserCriticality = toint(column_ifexists("CriticalityLevel", int(null))),
+          UserRoles = tostring(AssignedRoles);
+BehaviorInfo
+| where Timestamp > ago(window) and ActionType startswith "BehaviorAgentRTP"
+| project BehaviorId, Timestamp, Detection = ActionType, Categories = tostring(Categories), AttackTechniques = tostring(AttackTechniques)
+| join kind=inner entities on BehaviorId
+| where isnotempty(UserId)
+| summarize Detections = dcount(BehaviorId), Blocks = dcountif(BehaviorId, Detection == "BehaviorAgentRTPBlock"), Audits = dcountif(BehaviorId, Detection == "BehaviorAgentRTPAudit"),
+            AgentCount = dcount(AgentKey), Agents = make_set(Agent, 15), Platforms = make_set(AgentPlatform),
+            Categories = make_set(Categories), AttackTechniques = make_set_if(AttackTechniques, AttackTechniques != "[]"),
+            Urls = make_set(Urls, 10), IPs = make_set(IPs, 10), ActiveDays = dcount(bin(Timestamp, 1d)),
+            UserUpn = take_anyif(UserUpn, isnotempty(UserUpn)), FirstDetection = min(Timestamp), LastDetection = max(Timestamp)
+    by UserId
+| where Detections >= minDetections
+| join kind=leftouter identities on UserId
+| extend Pattern = case(Blocks > 0 and AgentCount > 1, "Blocked on several agents",
+                        Blocks > 0, "Blocked repeatedly on one agent",
+                        AgentCount > 1, "Audited on several agents",
+                        "Audited repeatedly on one agent")
+| project Pattern, User = coalesce(UserUpn, IdentityUpn, UserId), DisplayName, Department, JobTitle, IsAccountEnabled, UserRiskLevel, UserRiskStatus, UserCriticality, UserRoles,
+          Detections, Blocks, Audits, AgentCount, Agents, Platforms, Categories, AttackTechniques, Urls, IPs, ActiveDays, FirstDetection, LastDetection, UserId
+| order by Blocks desc, AgentCount desc, Detections desc
+'@ },
+    [pscustomobject]@{ Category = 'Posture'; Name = 'Agents with unused high permissions'
+                       Description = 'Agents holding high-privilege permissions or directory roles that show no evidence of use: permissions never seen in a Graph token, idle identities, and idle agents'
+                       Query = @'
+// Graph tokens list delegated scopes only; application permissions leave Scopes empty, so GraphResourcesCalled is given to judge those by the endpoints the identity reached
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let agentApps = agents
+| extend AppIds = pack_array(tostring(EntraAgentID), tostring(EntraBlueprintID))
+| mv-expand AppId = AppIds to typeof(string)
+| where isnotempty(AppId)
+| distinct AgentId, AppId;
+let apps = OAuthAppInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by OAuthAppId
+| join kind=inner agentApps on $left.OAuthAppId == $right.AppId;
+let granted = apps
+| extend Perms = iff(array_length(Permissions) > 0, Permissions, dynamic([null]))
+| mv-expand p = Perms
+| summarize HighPermissions = make_set_if(tostring(p.PermissionValue), tostring(p.PrivilegeLevel) == "High"),
+            HighPermissionDetail = make_set_if(strcat(tostring(p.PermissionValue), " [", tostring(p.PermissionType), "]"), tostring(p.PrivilegeLevel) == "High"),
+            AppPrivilegeLevel = make_set(PrivilegeLevel), AdminConsented = max(IsAdminConsented), Apps = make_set(AppName)
+    by AgentId;
+let roles = apps
+| mv-expand Role = AssignedRoles to typeof(string)
+| where isnotempty(Role)
+| summarize DirectoryRoles = make_set(Role) by AgentId;
+let graphUse = GraphAPIAuditEvents
+| where Timestamp > ago(window)
+| join kind=inner agentApps on $left.ApplicationId == $right.AppId
+| extend Path = tostring(parse_url(RequestUri).Path)
+| extend Resource = tolower(tostring(split(Path, "/")[2]))
+| summarize GraphCalls = count(), GraphWrites = countif(RequestMethod in ("POST", "PUT", "PATCH", "DELETE")), GraphFailures = countif(toint(ResponseStatusCode) >= 400),
+            GraphResourcesCalled = make_set_if(Resource, isnotempty(Resource), 25), LastGraphCall = max(Timestamp)
+    by AgentId;
+let scopesUsed = GraphAPIAuditEvents
+| where Timestamp > ago(window) and isnotempty(Scopes)
+| join kind=inner agentApps on $left.ApplicationId == $right.AppId
+| mv-expand Scope = split(tostring(Scopes), " ") to typeof(string)
+| where isnotempty(Scope)
+| summarize GraphScopesUsed = make_set(Scope) by AgentId;
+let signIns = EntraIdSpnSignInEvents
+| where Timestamp > ago(window)
+| extend SignInKey = iff(ServicePrincipalId in ((agentApps | project AppId)), ServicePrincipalId, ApplicationId)
+| join kind=inner agentApps on $left.SignInKey == $right.AppId
+| summarize SignIns = count(), LastSignIn = max(Timestamp) by AgentId;
+let actions = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "ExecuteToolBySDK")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId))
+| where isnotempty(EventId)
+| project Timestamp, ActionType, EventId, K, P, B;
+let actionsDirect = union
+    (actions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (actions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let activity = union
+    actionsDirect,
+    (actions | join kind=leftanti actionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(Timestamp, ActionType) by AgentId, EventId
+| summarize Invocations = countif(ActionType == "InvokeAgent"), ToolCalls = countif(ActionType == "ExecuteToolBySDK"), LastActivity = max(Timestamp) by AgentId;
+agents
+| join kind=inner granted on AgentId
+| join kind=leftouter roles on AgentId
+| where array_length(HighPermissions) > 0 or array_length(DirectoryRoles) > 0 or tostring(AppPrivilegeLevel) has "High"
+| join kind=leftouter graphUse on AgentId
+| join kind=leftouter scopesUsed on AgentId
+| join kind=leftouter signIns on AgentId
+| join kind=leftouter activity on AgentId
+| extend GraphCalls = coalesce(GraphCalls, 0), SignIns = coalesce(SignIns, 0), Invocations = coalesce(Invocations, 0), ToolCalls = coalesce(ToolCalls, 0),
+         HighPermissionsSeenInTokens = set_intersect(HighPermissions, coalesce(GraphScopesUsed, dynamic([]))),
+         HighPermissionsNotSeen = set_difference(HighPermissions, coalesce(GraphScopesUsed, dynamic([])))
+| extend Finding = case(GraphCalls == 0 and SignIns == 0 and Invocations == 0 and ToolCalls == 0, "Privileged and completely idle",
+                        GraphCalls == 0 and SignIns == 0, "Privileged identity idle, agent in use",
+                        array_length(HighPermissionsNotSeen) > 0 and array_length(HighPermissionsSeenInTokens) == 0, "No high permission seen in any token",
+                        array_length(HighPermissionsNotSeen) > 0, "Some high permissions never seen in a token",
+                        "")
+| where isnotempty(Finding)
+| project Finding, Agent = Name, Platform, PublishedStatus, LifecycleStatus, AppPrivilegeLevel, AdminConsented,
+          HighPermissionsNotSeen, HighPermissionsSeenInTokens, HighPermissionDetail, DirectoryRoles,
+          GraphCalls, GraphWrites = coalesce(GraphWrites, 0), GraphFailures = coalesce(GraphFailures, 0), GraphResourcesCalled, GraphScopesUsed,
+          SignIns, Invocations, ToolCalls, LastGraphCall, LastSignIn, LastActivity, Apps, Owners, AgentId, EntraAgentID, EntraBlueprintID
+| order by case(Finding startswith "Privileged and", 1, Finding startswith "Privileged identity", 2, Finding startswith "No high", 3, 4) asc, array_length(HighPermissionsNotSeen) desc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Posture'; Name = 'Copilot Studio agents without authentication'
+                       Description = 'Copilot Studio agents reachable without a user principal: authentication setting of None (anyone with the link can chat), public channels, what an anonymous caller can reach, posture indicators, and whether any activity without a user principal was logged'
+                       Query = @'
+// Purview audits Copilot Studio interactions for authenticated users only, so anonymous sessions produce no CopilotInteraction record; the configuration in the registry is the reliable signal and NoPrincipalEvents covers agent-to-agent and system invocations
+let window = 30d;
+let publicChannels = dynamic(["webchat", "directline", "customwebsite", "demowebsite", "web", "facebook", "telephony", "whatsapp", "sms", "slack"]);
+let agents = AgentsInfo
+| where Timestamp > ago(window) and Platform == "Copilot Studio"
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId)
+| mv-apply a = coalesce(r.governanceMetadata.authenticationSettings, dynamic([])) on (summarize AuthTypes = make_set(tostring(a.Type)), MultiTenant = max(tobool(a.MultiTenantSupport)))
+| extend AuthenticationType = case(array_length(AuthTypes) == 0, "Not reported", set_has_element(AuthTypes, "None"), "None", strcat_array(AuthTypes, ", "))
+| mv-apply ch = coalesce(Channels, dynamic([])) on (summarize ChannelList = make_set(tolower(tostring(ch))), PublicChannels = make_set_if(tolower(tostring(ch)), tolower(tostring(ch)) in (publicChannels)))
+| mv-apply t = coalesce(DeclaredTools, dynamic([])) on (summarize Tools = make_set(strcat(tostring(t.type), ":", tostring(t.name))), ToolAuth = make_set_if(tostring(t.authenticationUsed.type), isnotempty(tostring(t.authenticationUsed.type))))
+| mv-apply m = coalesce(McpServers, dynamic([])) on (summarize McpServerNames = make_set(tostring(m.name)))
+| mv-apply k = coalesce(DeclaredDataSources, dynamic([])) on (summarize KnowledgeSources = make_set(coalesce(tostring(k.name), tostring(k.type)), 15))
+| extend EntraAgentID = tostring(EntraAgentID), EntraBlueprintID = tostring(EntraBlueprintID), ObservabilityID = tostring(ObservabilityID), BotId = tostring(r.botId), SourceAgentId = tostring(SourceAgentId);
+let agentKeys = agents
+| extend Keys = pack_array(ObservabilityID, EntraAgentID, BotId, SourceAgentId, Name)
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let posture = ExposureGraphNodes
+| where NodeLabel in ("ai-agent", "copilot-studio-ai-agent")
+| extend p = NodeProperties.rawData
+| extend Keys = pack_array(tostring(p.aiAgentMetadata.id), tostring(p.aiAgentMetadata.entraAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| join kind=inner (agents | project AgentId, Key = AgentId) on Key
+| summarize NoAuthenticationIndicator = max(isnotnull(p.noAuthenticationIndicator)), NoGuardrailsIndicator = max(isnotnull(p.noGuardrailsIndicator)), WeakInstructionsIndicator = max(isnotnull(p.weakInstructionsIndicator)),
+            PrivilegedBusinessAccess = max(isnotnull(p.privilegedBusinessSystemAccessIndicator)), BlastRadius = max(tostring(p.blastRadiusIndicator.blastRadiusLevel)) by AgentId;
+let activity = CloudAppEvents
+// Tool executions never carry a user and are excluded; only interactions and invocations can show a missing principal
+| where Timestamp > ago(window) and ActionType in ("CopilotInteraction", "InvokeAgent")
+| extend d = RawEventData, c = RawEventData.CopilotEventData
+| extend K = iff(ActionType == "InvokeAgent", tostring(d.TargetAgentId), tostring(d.AgentId)), P = iff(ActionType == "InvokeAgent", tostring(d.PlatformTargetAgentId), tostring(d.PlatformAgentId)),
+         N = coalesce(iff(ActionType == "InvokeAgent", tostring(d.TargetAgentName), tostring(d.AgentName)), tostring(c.TargetAgentName)),
+         User = tostring(d.UserId), Host = coalesce(tostring(c.AppHost), tostring(d.ChannelName)), EventId = tostring(d.Id)
+| extend Keys = pack_array(K, P, N)
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| join kind=inner agentKeys on Key
+| summarize arg_max(Timestamp, User, Host, ActionType) by AgentId, EventId
+| summarize Events = count(), EventsWithUser = countif(User has "@"), NoPrincipalEvents = countif(not(User has "@")),
+            NoPrincipalActors = make_set_if(User, not(User has "@") and isnotempty(User), 5), NoPrincipalHosts = make_set_if(Host, not(User has "@"), 5),
+            Users = dcountif(User, User has "@"), Hosts = make_set_if(Host, isnotempty(Host), 8), LastEvent = max(Timestamp)
+    by AgentId;
+let userSignIns = EntraIdSignInEvents
+| where Timestamp > ago(window)
+| join kind=inner (agents | where isnotempty(EntraBlueprintID) | project AgentId, EntraBlueprintID) on $left.ApplicationId == $right.EntraBlueprintID
+| summarize UserSignIns = count(), SignedInUsers = dcount(AccountObjectId) by AgentId;
+agents
+| join kind=leftouter posture on AgentId
+| join kind=leftouter activity on AgentId
+| join kind=leftouter userSignIns on AgentId
+| extend Events = coalesce(Events, 0), NoPrincipalEvents = coalesce(NoPrincipalEvents, 0), Users = coalesce(Users, 0), UserSignIns = coalesce(UserSignIns, 0),
+         PublicChannelCount = coalesce(array_length(PublicChannels), 0), ToolCount = coalesce(array_length(Tools), 0) + coalesce(array_length(McpServerNames), 0), KnowledgeCount = coalesce(array_length(KnowledgeSources), 0)
+| where AuthenticationType in ("None", "Not reported") or coalesce(NoAuthenticationIndicator, false) or NoPrincipalEvents > 0
+| extend Finding = case(AuthenticationType == "None" and PublishedStatus =~ "Published" and PublicChannelCount > 0, "No authentication, published on a public channel",
+                        AuthenticationType == "None" and PublishedStatus =~ "Published", "No authentication, published",
+                        AuthenticationType == "None", "No authentication, not published",
+                        coalesce(NoAuthenticationIndicator, false), "No-authentication indicator in the exposure graph",
+                        NoPrincipalEvents > 0, "Activity without a user principal (agent or system invocations)",
+                        "Authentication setting not reported")
+| extend Severity = case(Finding startswith "No authentication, published" and (ToolCount > 0 or KnowledgeCount > 0 or coalesce(PrivilegedBusinessAccess, false)), "High",
+                         Finding startswith "No authentication, published", "Medium",
+                         Finding startswith "No authentication" or Finding startswith "No-authentication", "Medium",
+                         "Low")
+| project Severity, Finding, Agent = Name, AuthenticationType, MultiTenant, PublishedStatus, LifecycleStatus, Channels = ChannelList, PublicChannels,
+          Tools, ToolAuth, McpServerNames, KnowledgeSources,
+          NoAuthenticationIndicator, NoGuardrailsIndicator, WeakInstructionsIndicator, PrivilegedBusinessAccess, BlastRadius,
+          Events, EventsWithUser, NoPrincipalEvents, NoPrincipalActors, NoPrincipalHosts, Users, Hosts, LastEvent, UserSignIns, SignedInUsers,
+          Owners, CreatedDateTime, LastUpdatedDateTime, AgentId, EntraAgentID, EntraBlueprintID, BotId
+| order by case(Severity == "High", 1, Severity == "Medium", 2, 3) asc, Events desc, Agent asc
+'@ },
+    [pscustomobject]@{ Category = 'Access'; Name = 'Agent identity sign-ins from new locations'
+                       Description = 'Agent and blueprint service principals signing in from a country, network, or to a resource not seen in their baseline period, with failures and the registry agent behind the identity'
+                       Query = @'
+let window = 30d;
+let recent = 7d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend AgentId = tostring(AgentId);
+let agentApps = agents
+| extend Ids = pack_array(pack("Id", tostring(EntraAgentID), "Kind", "Agent identity"), pack("Id", tostring(EntraBlueprintID), "Kind", "Blueprint"))
+| mv-expand i = Ids
+| extend AppKey = tostring(i.Id), IdentityKind = tostring(i.Kind)
+| where isnotempty(AppKey)
+| summarize Agents = make_set(Name, 10), AgentCount = dcount(AgentId), Platforms = make_set(Platform), IdentityKind = take_any(IdentityKind) by AppKey;
+let signIns = EntraIdSpnSignInEvents
+| where Timestamp > ago(window)
+| extend AppKey = case(ServicePrincipalId in ((agentApps | project AppKey)), ServicePrincipalId, ApplicationId in ((agentApps | project AppKey)), ApplicationId, "")
+| where isnotempty(AppKey)
+// The leading address groups (IPv4 /16, IPv6 /48) approximate the network, which tolerates address rotation inside one provider range
+| extend Network = iff(IPAddress contains ":", strcat_array(array_slice(split(IPAddress, ":"), 0, 2), ":"), strcat_array(array_slice(split(IPAddress, "."), 0, 1), "."))
+| project Timestamp, AppKey, ServicePrincipalName, ApplicationId, ServicePrincipalId, IPAddress, Network, Country, City, ResourceDisplayName, UserAgent, ErrorCode, IsConfidentialClient;
+let baseline = signIns
+| where Timestamp <= ago(recent)
+| summarize BaselineSignIns = count(), BaselineCountries = make_set_if(Country, isnotempty(Country)), BaselineNetworks = make_set(Network),
+            BaselineResources = make_set(ResourceDisplayName), BaselineDays = dcount(bin(Timestamp, 1d))
+    by AppKey;
+signIns
+| where Timestamp > ago(recent)
+| summarize RecentSignIns = count(), Failures = countif(ErrorCode != 0), ErrorCodes = make_set_if(ErrorCode, ErrorCode != 0),
+            Countries = make_set_if(Country, isnotempty(Country)), Networks = make_set(Network), IPs = make_set(IPAddress, 25), Cities = make_set_if(City, isnotempty(City), 10),
+            Resources = make_set(ResourceDisplayName), UserAgents = make_set_if(UserAgent, isnotempty(UserAgent), 5),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by AppKey, ServicePrincipalName, ApplicationId, ServicePrincipalId
+| join kind=leftouter baseline on AppKey
+| extend NewCountries = set_difference(Countries, coalesce(BaselineCountries, dynamic([]))),
+         NewNetworks = set_difference(Networks, coalesce(BaselineNetworks, dynamic([]))),
+         NewResources = set_difference(Resources, coalesce(BaselineResources, dynamic([])))
+| extend Finding = case(isnull(BaselineSignIns), "Identity has no sign-in baseline",
+                        array_length(NewCountries) > 0, "New country",
+                        array_length(NewResources) > 0, "New resource",
+                        array_length(NewNetworks) > 0, "New network",
+                        "")
+| where isnotempty(Finding)
+| join kind=leftouter agentApps on AppKey
+| project Finding, ServicePrincipalName, IdentityKind, Agents, AgentCount, Platforms, NewCountries, NewResources, NewNetworks,
+          RecentSignIns, Failures, ErrorCodes, Countries, Cities, IPs, Resources, UserAgents,
+          BaselineSignIns = coalesce(BaselineSignIns, 0), BaselineDays = coalesce(BaselineDays, 0), BaselineCountries, BaselineResources,
+          FirstSeen, LastSeen, ApplicationId, ServicePrincipalId
+| order by case(Finding == "New country", 1, Finding == "New resource", 2, Finding == "New network", 3, 4) asc, Failures desc, RecentSignIns desc
+'@ },
+    [pscustomobject]@{ Category = 'Access'; Name = 'Agents accessed by risky users'
+                       Description = 'Agents accessed by risky users: why the user is risky, and which conditional access policies applied to their sign-ins'
+                       Query = @'
+// Sign-in risk level and risk state columns are not aggregated here; the service fails on them at this volume and they are unpopulated in this tenant
+let window = 30d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let agentApps = agents
+| extend AppIds = pack_array(tostring(EntraAgentID), tostring(EntraBlueprintID))
+| mv-expand AppId = AppIds to typeof(string)
+| where isnotempty(AppId)
+| distinct AgentId, AppId;
+// Users flagged by Entra ID Protection or carrying a Defender identity risk score
+let riskyUsers = IdentityInfo
+| where Timestamp > ago(window) and Type == "User"
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| where RiskLevel in~ ("Low", "Medium", "High") or RiskStatus in~ ("AtRisk", "ConfirmedCompromised")
+| project AccountObjectId, AccountUpn, AccountDisplayName, RiskLevel, RiskStatus, RiskScore, RiskScoreUpdateTime, RiskLevelDetails, Department, JobTitle;
+let riskyIds = riskyUsers | project AccountObjectId;
+// Agent interactions by those users
+let interactions = CloudAppEvents
+| where Timestamp > ago(window)
+| where ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction")
+| where AccountObjectId in (riskyIds)
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId))
+| where isnotempty(EventId)
+| project Timestamp, AccountObjectId, EventId, K, P, B, ActionType, Channel = tostring(RawEventData.ChannelName);
+let interactionsDirect = union
+    (interactions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (interactions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let access = union
+    interactionsDirect,
+    (interactions | join kind=leftanti interactionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(Timestamp, ActionType, Channel) by AgentId, AccountObjectId, EventId
+| summarize Interactions = count(), FirstAccess = min(Timestamp), LastAccess = max(Timestamp), Channels = make_set(Channel), ActionTypes = make_set(ActionType) by AgentId, AccountObjectId;
+// Sign-ins of those users, reduced to the columns needed; sets are built from distinct values and policy arrays are deduplicated before expansion
+let signIns = EntraIdSignInEvents
+| where Timestamp > ago(window)
+| where AccountObjectId in (riskyIds)
+| project Timestamp, AccountObjectId, ApplicationId, RequestId, ErrorCode, Country, RiskEventTypes = tostring(RiskEventTypes), Policies = tostring(ConditionalAccessPolicies),
+          CAStatus = case(tostring(ConditionalAccessStatus) == "0", "Success", tostring(ConditionalAccessStatus) == "1", "Failure", tostring(ConditionalAccessStatus) == "2", "Not applied", tostring(ConditionalAccessStatus));
+let signInCounts = signIns
+| summarize SignIns = dcount(RequestId), Failures = countif(ErrorCode != 0) by AccountObjectId;
+let signInSets = signIns
+| distinct AccountObjectId, Country, CAStatus
+| summarize Countries = make_set(Country), CAStatusAllSignIns = make_set(CAStatus) by AccountObjectId;
+let signInSummary = signInCounts
+| join kind=leftouter signInSets on AccountObjectId
+| project-away AccountObjectId1;
+let riskEvents = signIns
+| where isnotempty(RiskEventTypes) and RiskEventTypes != "[]"
+| distinct AccountObjectId, RiskEventTypes
+| mv-expand RiskEvent = parse_json(RiskEventTypes) to typeof(string)
+| summarize RiskEventTypes = make_set(RiskEvent) by AccountObjectId;
+let caAll = signIns
+| where isnotempty(Policies) and Policies != "[]"
+| distinct AccountObjectId, Policies
+| mv-expand pol = parse_json(Policies)
+| summarize CAPoliciesAllSignIns = make_set(strcat(tostring(pol.displayName), ": ", tostring(pol.result))) by AccountObjectId;
+let agentSignIns = signIns
+| join kind=inner agentApps on $left.ApplicationId == $right.AppId;
+let caAgentCounts = agentSignIns
+| summarize AgentAppSignIns = dcount(RequestId), CAStatusOnAgentApp = make_set(CAStatus) by AgentId, AccountObjectId;
+let caAgentPolicies = agentSignIns
+| where isnotempty(Policies) and Policies != "[]"
+| distinct AgentId, AccountObjectId, Policies
+| mv-expand pol = parse_json(Policies)
+| summarize CAPoliciesOnAgentApp = make_set(strcat(tostring(pol.displayName), ": ", tostring(pol.result))),
+            MfaEnforcedOnAgentApp = max(tostring(pol.enforcedGrantControls) has "Mfa" and tostring(pol.result) == "success")
+    by AgentId, AccountObjectId;
+// Alerts naming the user, as further explanation of the risk
+let userAlerts = AlertEvidence
+| where Timestamp > ago(window) and EntityType == "User"
+| where AccountObjectId in (riskyIds)
+| join kind=inner (AlertInfo | where Timestamp > ago(window) | project AlertId, Title, Severity) on AlertId
+| summarize UserAlerts = make_set(strcat(Severity, ": ", Title), 10) by AccountObjectId;
+access
+| join kind=inner riskyUsers on AccountObjectId
+| join kind=inner (agents | project AgentId, Agent = Name, Platform, PublishedStatus) on AgentId
+| join kind=leftouter signInSummary on AccountObjectId
+| join kind=leftouter riskEvents on AccountObjectId
+| join kind=leftouter caAll on AccountObjectId
+| join kind=leftouter caAgentCounts on AgentId, AccountObjectId
+| join kind=leftouter caAgentPolicies on AgentId, AccountObjectId
+| join kind=leftouter userAlerts on AccountObjectId
+| project User = AccountDisplayName, UserUpn = AccountUpn, Department, JobTitle,
+          RiskLevel, RiskStatus, RiskScore, RiskScoreUpdateTime, RiskEventTypes, UserAlerts,
+          Agent, Platform, PublishedStatus, Interactions, FirstAccess, LastAccess, Channels, ActionTypes,
+          AgentAppSignIns = coalesce(AgentAppSignIns, 0), CAStatusOnAgentApp, CAPoliciesOnAgentApp, MfaEnforcedOnAgentApp,
+          CAStatusAllSignIns, CAPoliciesAllSignIns, SignIns, Failures, Countries,
+          AccountObjectId, AgentId
+| order by RiskLevel asc, RiskScore desc, Interactions desc
+'@ },
+    [pscustomobject]@{ Category = 'Tools and MCP'; Name = 'MCP server inventory'
+                       Description = 'MCP server inventory: every server declared in the registry, observed in tool executions, or mapped in the exposure graph, with the agents sharing it, tools, users, approval mode, authentication, and first seen date'
+                       Query = @'
+// The registry and the exposure graph hold display names while tool executions hold runtime names, so one server can appear under both names; Sources shows where each name was seen
+let window = 30d;
+let recent = 7d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| summarize AgentId = take_any(AgentId), Agent = take_any(Name) by Key;
+let declared = agents
+| extend Servers = array_concat(coalesce(McpServers, dynamic([])), coalesce(r.mcpServers, dynamic([])))
+| mv-expand m = Servers
+| extend Server = tostring(m.name)
+| where isnotempty(Server)
+| project ServerKey = tolower(Server), Server, Source = "Registry", Agent = Name, Platform, Endpoint = tostring(coalesce(m.endpoint, m.url, m.command)),
+          ApprovalMode = tostring(m.approvalModeKind), Authentication = tostring(m.authenticationUsed.type), Tool = "", User = "", Seen = todatetime(CreatedDateTime), Calls = 0, Errors = 0;
+let conversations = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "CopilotInteraction")
+| extend Conversation = tostring(RawEventData.ConversationId), UserUpn = tostring(RawEventData.UserId)
+| where isnotempty(Conversation) and isnotempty(UserUpn)
+| summarize arg_min(Timestamp, UserUpn) by Conversation
+| project Conversation, UserUpn;
+let observed = CloudAppEvents
+| where Timestamp > ago(window) and ActionType == "ExecuteToolBySDK"
+| extend EventId = tostring(RawEventData.Id), K = tostring(RawEventData.AgentId), P = tostring(RawEventData.PlatformAgentId),
+         Tool = tostring(RawEventData.ToolName), ToolType = tostring(RawEventData.ToolType), ServerName = tostring(RawEventData.ToolServerName),
+         Conversation = tostring(RawEventData.ConversationId), Error = tostring(RawEventData.ErrorMessage)
+| where ToolType startswith "MCP" or isnotempty(ServerName)
+| extend Server = coalesce(ServerName, tostring(split(Tool, ":")[0]))
+| where isnotempty(Server) and isnotempty(EventId)
+| summarize arg_max(Timestamp, *) by EventId
+| extend AgentKey = coalesce(K, P)
+| join kind=leftouter agentKeys on $left.AgentKey == $right.Key
+| join kind=leftouter conversations on Conversation
+| project ServerKey = tolower(Server), Server, Source = "Tool executions", Agent = coalesce(Agent, AgentKey), Platform = "", Endpoint = "",
+          ApprovalMode = "", Authentication = "", Tool, User = UserUpn, Seen = Timestamp, Calls = 1, Errors = tolong(isnotempty(Error));
+let graph = ExposureGraphEdges
+| where EdgeLabel == "uses" and TargetNodeLabel == "mcp/server"
+| project ServerKey = tolower(TargetNodeName), Server = TargetNodeName, Source = "Exposure graph", Agent = SourceNodeName, Platform = "", Endpoint = "",
+          ApprovalMode = "", Authentication = "", Tool = "", User = "", Seen = datetime(null), Calls = 0, Errors = 0;
+union declared, observed, graph
+| summarize Server = take_any(Server), Sources = make_set(Source), AgentCount = dcount(Agent), Agents = make_set(Agent, 25), Platforms = make_set_if(Platform, isnotempty(Platform)),
+            Endpoints = make_set_if(Endpoint, isnotempty(Endpoint), 5), ApprovalModes = make_set_if(ApprovalMode, isnotempty(ApprovalMode)), Authentication = make_set_if(Authentication, isnotempty(Authentication)),
+            Calls = sum(Calls), Errors = sum(Errors), Tools = make_set_if(Tool, isnotempty(Tool), 25), Users = make_set_if(User, isnotempty(User), 15),
+            FirstSeen = min(Seen), LastCall = maxif(Seen, Source == "Tool executions")
+    by ServerKey
+| extend Flags = pack_array(
+    iff(AgentCount >= 3, "Shared by several agents", ""),
+    iff(FirstSeen > ago(recent), "First seen in the recent period", ""),
+    iff(tostring(ApprovalModes) has "never", "Runs without user approval", ""),
+    iff(tostring(Sources) == '["Tool executions"]', "Observed under a name not in the registry", ""),
+    iff(Calls == 0, "No executions in the period", ""))
+| mv-apply Flag = Flags to typeof(string) on (summarize Flags = make_list_if(Flag, isnotempty(Flag)))
+| project Server, Sources, AgentCount, Agents, Flags, Calls, Errors, Tools, Users, ApprovalModes, Authentication, Endpoints, Platforms, FirstSeen, LastCall
+| order by AgentCount desc, Calls desc
+'@ },
+    [pscustomobject]@{ Category = 'Tools and MCP'; Name = 'First seen tools by agent'
+                       Description = 'Tools an agent executed in the recent period that it never executed in its baseline period, with the users behind the calls and the tools and MCP servers the registry declares'
+                       Query = @'
+// The registry holds display names while activity records hold runtime names, so DeclaredNameMatch is only an exact-name hint; compare against DeclaredTools and DeclaredMcpServers
+let window = 30d;
+let recent = 7d;
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let declared = agents
+| mv-apply t = coalesce(DeclaredTools, dynamic([])) on (summarize DeclaredToolNames = make_set(tolower(tostring(t.name))))
+| mv-apply m = coalesce(McpServers, dynamic([])) on (summarize DeclaredMcpServers = make_set(tolower(tostring(m.name))))
+| project AgentId, Agent = Name, Platform, Owners, DeclaredToolNames, DeclaredMcpServers;
+// The user is only on the invocation record; tool executions inherit it through the conversation
+let conversations = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "CopilotInteraction")
+| extend Conversation = tostring(RawEventData.ConversationId), UserUpn = tostring(RawEventData.UserId)
+| where isnotempty(Conversation) and isnotempty(AccountObjectId)
+| summarize arg_min(Timestamp, UserUpn) by Conversation
+| project Conversation, UserUpn;
+let toolCalls = CloudAppEvents
+| where Timestamp > ago(window) and ActionType == "ExecuteToolBySDK"
+| extend EventId = tostring(RawEventData.Id), K = tostring(RawEventData.AgentId), P = tostring(RawEventData.PlatformAgentId), B = tostring(RawEventData.AgentBlueprintId),
+         Tool = tostring(RawEventData.ToolName), ToolType = tostring(RawEventData.ToolType), McpServer = tostring(RawEventData.ToolServerName),
+         Conversation = tostring(RawEventData.ConversationId), Error = tostring(RawEventData.ErrorMessage)
+| where isnotempty(EventId) and isnotempty(Tool)
+// The same MCP tool is logged both as server:tool and as tool with a separate server name
+| extend Tool = iff(Tool contains ":" or isempty(McpServer), Tool, strcat(McpServer, ":", Tool))
+| project Timestamp, EventId, K, P, B, Tool, ToolType, McpServer, Conversation, Error;
+let toolCallsDirect = union
+    (toolCalls | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (toolCalls | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let attributed = union
+    toolCallsDirect,
+    (toolCalls | join kind=leftanti toolCallsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(Timestamp, *) by AgentId, EventId;
+let baselineTools = attributed
+| where Timestamp <= ago(recent)
+| summarize BaselineCalls = count() by AgentId, Tool;
+let baselineAgents = baselineTools
+| summarize BaselineToolCount = dcount(Tool), BaselineTotalCalls = sum(BaselineCalls) by AgentId;
+attributed
+| where Timestamp > ago(recent)
+| join kind=leftanti baselineTools on AgentId, Tool
+| join kind=leftouter conversations on Conversation
+| summarize Calls = count(), Errors = countif(isnotempty(Error)), Users = make_set_if(UserUpn, isnotempty(UserUpn), 10),
+            ToolTypes = make_set_if(ToolType, isnotempty(ToolType)), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by AgentId, Tool, McpServer
+| join kind=leftouter baselineAgents on AgentId
+| join kind=leftouter declared on AgentId
+| extend Finding = iff(isnull(BaselineToolCount), "Agent has no tool baseline", "New tool for an established agent"),
+         DeclaredNameMatch = set_has_element(coalesce(DeclaredToolNames, dynamic([])), tolower(Tool))
+                              or set_has_element(coalesce(DeclaredMcpServers, dynamic([])), tolower(coalesce(McpServer, tostring(split(Tool, ":")[0]))))
+| project Finding, Agent, Platform, Tool, McpServer, ToolTypes, Calls, Errors, Users, FirstSeen, LastSeen, DeclaredNameMatch, DeclaredTools = DeclaredToolNames, DeclaredMcpServers,
+          BaselineToolCount = coalesce(BaselineToolCount, 0), BaselineTotalCalls = coalesce(BaselineTotalCalls, 0), Owners, AgentId
+| order by Finding desc, DeclaredNameMatch asc, Calls desc
+'@ },
+    [pscustomobject]@{ Category = 'Data security'; Name = 'Sensitive data agents with external reach'
+                       Description = 'Agents involved in DLP matches on the AI workload, with the policies, files, labels, and enforcement, set against the external resources the same agent can reach'
+                       Query = @'
+// DLP records carry no agent id; a match is attributed to the agent the same user interacted with closest in time, within the correlation window
+let window = 30d;
+let correlation = 5m;
+let isMicrosoft = (h: string) {
+    h matches regex @"(^|\.)(microsoft\.com|cloud\.microsoft|core\.microsoft|office\.com|office365\.com|sharepoint\.com|onmicrosoft\.com|microsoftonline\.com|azure\.com|azure\.net|windows\.net|live\.com|bing\.com|powerapps\.com|powerplatform\.com|dynamics\.com|azureml\.ms|microsoft)$"
+};
+let agents = AgentsInfo
+| where Timestamp > ago(window)
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = RawAgentInfo, AgentId = tostring(AgentId);
+let agentKeys = agents
+| extend Keys = pack_array(tostring(ObservabilityID), tostring(EntraAgentID), tostring(r.botId), tostring(SourceAgentId))
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| distinct AgentId, Key;
+let blueprintKeys = agents
+| where isnotempty(EntraBlueprintID)
+| summarize AgentId = take_any(AgentId), Agents = dcount(AgentId) by Key = tostring(EntraBlueprintID)
+| where Agents == 1
+| project AgentId, Key;
+let interactions = CloudAppEvents
+| where Timestamp > ago(window) and ActionType in ("InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction")
+| extend EventId = tostring(RawEventData.Id),
+         K = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentId), tostring(RawEventData.AgentId)),
+         P = iff(ActionType == "InvokeAgent", tostring(RawEventData.PlatformTargetAgentId), tostring(RawEventData.PlatformAgentId)),
+         B = iff(ActionType == "InvokeAgent", tostring(RawEventData.TargetAgentBlueprintID), tostring(RawEventData.AgentBlueprintId))
+| where isnotempty(EventId) and isnotempty(AccountObjectId)
+| project InteractionTime = Timestamp, UserId = AccountObjectId, EventId, K, P, B, RawEventData;
+let interactionsDirect = union
+    (interactions | where isnotempty(K) | join kind=inner agentKeys on $left.K == $right.Key),
+    (interactions | where isnotempty(P) | join kind=inner agentKeys on $left.P == $right.Key);
+let interactionsByAgent = union
+    interactionsDirect,
+    (interactions | join kind=leftanti interactionsDirect on EventId | where isnotempty(B) | join kind=inner blueprintKeys on $left.B == $right.Key)
+| summarize arg_max(InteractionTime, UserId, RawEventData) by AgentId, EventId;
+let dlp = CloudAppEvents
+| where Timestamp > ago(window) and ActionType =~ "DLPRuleMatch" and tostring(RawEventData.Workload) == "ExtendedApplications"
+| extend DlpId = tostring(RawEventData.Id), UserId = tostring(RawEventData.UserKey), User = tostring(RawEventData.UserId), Location = tostring(RawEventData.Location),
+         File = tostring(RawEventData.ItemMetadata.Name), FilePath = tostring(RawEventData.ItemMetadata.Path), Labels = RawEventData.ItemMetadata.SensitivityLabelIds,
+         Enforcement = tostring(RawEventData.RemediationDetails.RemediationActivity), Policies = RawEventData.PolicyDetails
+| project DlpTime = Timestamp, DlpId, UserId, User, Location, File, FilePath, Labels, Enforcement, Policies;
+let dlpByAgent = dlp
+| join kind=inner (interactionsByAgent | project AgentId, UserId, InteractionTime) on UserId
+| extend Gap = abs(datetime_diff("second", DlpTime, InteractionTime))
+| where Gap <= correlation / 1s
+| summarize arg_min(Gap, AgentId) by DlpId, DlpTime, User, Location, File, FilePath, Labels = tostring(Labels), Enforcement, Policies = tostring(Policies)
+| extend PolicyList = parse_json(Policies)
+| mv-apply pol = PolicyList on (
+    mv-expand rule = pol.Rules
+    | summarize PolicyNames = make_set(tostring(pol.PolicyName)), RuleNames = make_set(tostring(rule.RuleName)), RuleActions = make_set(rule.Actions), Severities = make_set(tostring(rule.Severity))
+  )
+| summarize DlpMatches = dcount(DlpId), Blocked = dcountif(DlpId, Enforcement contains "block"), Users = make_set(User, 10), UserCount = dcount(User),
+            Policies = make_set(PolicyNames), Rules = make_set(RuleNames), Actions = make_set(RuleActions), Severities = make_set(Severities), Enforcements = make_set_if(Enforcement, isnotempty(Enforcement)),
+            Files = make_set_if(File, isnotempty(File), 15), LabelledFiles = dcountif(FilePath, Labels != "[]" and isnotempty(Labels)), Locations = make_set(Location),
+            FirstMatch = min(DlpTime), LastMatch = max(DlpTime)
+    by AgentId;
+// External reach: declared endpoints, executed web search tools, and web resources recorded on interactions
+let declaredReach = agents
+| extend Endpoints = array_concat(coalesce(DeclaredTools, dynamic([])), coalesce(McpServers, dynamic([])))
+| mv-expand e = Endpoints
+| extend Host = tostring(parse_url(tostring(e.endpoint)).Host)
+| where isnotempty(Host) and not(isMicrosoft(Host))
+| project AgentId, Reach = strcat("Declared endpoint: ", Host);
+let searchReach = CloudAppEvents
+| where Timestamp > ago(window) and ActionType == "ExecuteToolBySDK"
+| extend K = tostring(RawEventData.AgentId), P = tostring(RawEventData.PlatformAgentId), Tool = tostring(RawEventData.ToolName), ToolType = tostring(RawEventData.ToolType)
+| where ToolType == "Knowledge" and Tool matches regex "(?i)bing|web|internet|public"
+| extend Keys = pack_array(K, P)
+| mv-expand Key = Keys to typeof(string)
+| where isnotempty(Key)
+| join kind=inner agentKeys on Key
+| project AgentId, Reach = strcat("Web search tool: ", Tool);
+let resourceReach = interactionsByAgent
+| mv-expand res = RawEventData.CopilotEventData.AccessedResources
+| extend Host = tostring(parse_url(tostring(res.SiteUrl)).Host), ResType = tostring(res.Type)
+| where ResType == "WebSearchQuery" or (isnotempty(Host) and not(isMicrosoft(Host)))
+| project AgentId, Reach = iff(ResType == "WebSearchQuery", "Web search query", strcat("Accessed: ", Host));
+let reach = union declaredReach, searchReach, resourceReach
+| summarize ExternalReach = make_set(Reach, 25), ExternalReachCount = dcount(Reach) by AgentId;
+dlpByAgent
+| join kind=inner agents on AgentId
+| join kind=leftouter reach on AgentId
+| extend ExternalReachCount = coalesce(ExternalReachCount, 0)
+| extend Finding = case(ExternalReachCount > 0 and Blocked < DlpMatches, "Sensitive data matched, not always blocked, agent has external reach",
+                        ExternalReachCount > 0, "Sensitive data matched and blocked, agent has external reach",
+                        "Sensitive data matched, no external reach observed")
+| project Finding, Agent = Name, Platform, PublishedStatus, DlpMatches, Blocked, UserCount, Users, Policies, Rules, Actions, Severities, Enforcements, Files, LabelledFiles, Locations,
+          ExternalReachCount, ExternalReach, FirstMatch, LastMatch, Owners, AgentId
+| order by ExternalReachCount desc, DlpMatches desc
+'@ },
+    [pscustomobject]@{ Category = 'Network'; Name = 'Agentic traffic blocked'
+                       Description = 'Agentic traffic denied, redirected, or flagged as a threat by Global Secure Access, one row per transaction, with the policy that acted and the prompt or MCP call involved'
+                       Query = @'
+// Source: NetworkAccessTraffic and NetworkAccessGenerativeAIInsights, Log Analytics tables reached through the workspace connected to the Defender portal. They are not listed in the Advanced Hunting schema pane.
+// Each table is read through a fuzzy union with a typed empty fallback, so the query returns no rows instead of failing where a table or a newer column is absent.
+let window = 30d;
+let trafficSchema = datatable(TimeGenerated:datetime, TransactionId:string, ConnectionId:string, DeviceId:string, UserPrincipalName:string, Action:string, AgentVersion:string,
+    AIAgentId:string, AIAgentName:string, IsAgentic:bool, IsTokenAgentic:bool, AIDetectionConfidence:int, AIDetectionEvidence:string, InitiatingProcessName:string, ProcessArgs:string,
+    DestinationFqdn:string, DestinationUrl:string, DestinationWebCategories:string, CloudAppName:string, CloudAppCategory:string, CloudAppRiskScore:int, HttpMethod:string, ResponseCode:int,
+    FilteringProfileName:string, PolicyName:string, RuleName:string, ThreatType:string, VendorNames:string,
+    AgentPlatform:string, AgenticSessionId:string, McpPrimitiveName:string, PolicyType:string)[];
+let insightSchema = datatable(TimeGenerated:datetime, TransactionId:string, Action:string, Activity:string, SubActivity:string, Content:string, LlmModel:string,
+    McpClientName:string, McpServerName:string, McpPrimitiveNames:string, ErrorCode:string, ErrorMessage:string)[];
+let traffic = union isfuzzy=true trafficSchema, (NetworkAccessTraffic | where TimeGenerated > ago(window));
+let insights = union isfuzzy=true insightSchema, (NetworkAccessGenerativeAIInsights | where TimeGenerated > ago(window))
+| project TransactionId, GenAiAction = Action, Activity, SubActivity, Content = substring(Content, 0, 500), LlmModel, McpClientName, McpServerName,
+          McpPrimitiveNames, McpErrorCode = ErrorCode, McpErrorMessage = ErrorMessage;
+traffic
+| where IsAgentic == true or IsTokenAgentic == true or isnotempty(AIAgentId) or isnotempty(AgentPlatform)
+| join kind=leftouter insights on TransactionId
+| where Action in~ ("Denied", "Redirect") or GenAiAction =~ "block" or isnotempty(ThreatType)
+| extend Outcome = case(Action =~ "Denied", "Denied", Action =~ "Redirect", "Redirected", GenAiAction =~ "block", "Prompt or MCP call blocked", "Threat flagged")
+| project TimeGenerated, Outcome, PolicyType, PolicyName, RuleName, FilteringProfileName, ThreatType, VendorNames,
+          Agent = AIAgentName, AgentPlatform, AgentVersion, IsTokenAgentic, User = UserPrincipalName, DeviceId, InitiatingProcessName, ProcessArgs = substring(ProcessArgs, 0, 200),
+          DestinationFqdn, DestinationUrl, CloudAppName, CloudAppCategory, CloudAppRiskScore, DestinationWebCategories, HttpMethod, ResponseCode,
+          McpPrimitiveName = coalesce(McpPrimitiveName, McpPrimitiveNames), McpServerName, McpClientName, McpErrorCode, McpErrorMessage, LlmModel, Activity, SubActivity, Content,
+          AIDetectionConfidence, AIDetectionEvidence, AgenticSessionId, TransactionId, ConnectionId, AIAgentId
+| order by TimeGenerated desc
+'@ }
+)
+
+# Hunting results as a table the results grid can show: one text column per field, in the order the query returns them, with
+# objects and lists written as compact JSON. Rows are what the hunting API returns (dictionaries) or any objects.
+function ConvertTo-HuntingTable {
+    param([string[]]$Columns, [object[]]$Rows)
+    $table = New-Object System.Data.DataTable
+    $names = @($Columns | Where-Object { $_ })
+    if (-not $names.Count) { $names = @(foreach ($r in @($Rows | Select-Object -First 1)) { if ($r -is [Collections.IDictionary]) { $r.Keys } else { $r.PSObject.Properties.Name } }) }
+    foreach ($c in $names) { [void]$table.Columns.Add([string]$c, [string]) }
+    foreach ($r in @($Rows)) {
+        $dr = $table.NewRow()
+        foreach ($c in $names) {
+            $v = if ($r -is [Collections.IDictionary]) { $r[$c] } else { $r.$c }
+            $dr[[string]$c] = if ($null -eq $v) { '' } elseif ($v -is [string] -or $v -is [ValueType]) { [string]$v } else { $v | ConvertTo-Json -Compress -Depth 6 }
+        }
+        [void]$table.Rows.Add($dr)
+    }
+    , $table
+}
+
+# Run one hunting query and keep the column order the service reports.
+function Invoke-HuntingRun {
+    param([string]$Query)
+    $resp = Invoke-Graph -Method POST -Uri 'https://graph.microsoft.com/v1.0/security/runHuntingQuery' -Body (@{ Query = $Query } | ConvertTo-Json) -ContentType 'application/json'
+    $cols = @($resp.schema | ForEach-Object { [string]$_.name })
+    $rows = @($resp.results)
+    [pscustomobject]@{ Columns = $cols; Rows = $rows; Table = (ConvertTo-HuntingTable -Columns $cols -Rows $rows) }
+}
+
+$HuntingXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Hunting" Width="1280" Height="760" ShowInTaskbar="False" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="Hunting"/>
+        <TextBlock Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap" Text="Built-in queries from the Agent365-Hunting library. Pick one, change it if you like, and run it against Microsoft Defender Advanced Hunting, which keeps about 30 days."/>
+      </StackPanel>
+    </Border>
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="290"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+      <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,1,0">
+        <ListBox x:Name="HuList" BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled" HorizontalContentAlignment="Stretch">
+          <ListBox.GroupStyle>
+            <GroupStyle>
+              <GroupStyle.HeaderTemplate>
+                <DataTemplate><TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#6B7280" Margin="10,12,0,4"/></DataTemplate>
+              </GroupStyle.HeaderTemplate>
+            </GroupStyle>
+          </ListBox.GroupStyle>
+          <ListBox.ItemTemplate>
+            <DataTemplate><TextBlock Text="{Binding Name}" Foreground="#1F2937" TextWrapping="Wrap" Margin="8,5"/></DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </Border>
+      <Grid Grid.Column="1">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="210"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+        <StackPanel Margin="16,12,16,8">
+          <TextBlock x:Name="HuTitle" FontSize="16" FontWeight="SemiBold" Foreground="#1F2937" Text="Pick a query"/>
+          <TextBlock x:Name="HuDesc" Foreground="#4B5563" TextWrapping="Wrap" Margin="0,2,0,0"/>
+        </StackPanel>
+        <TextBox x:Name="HuQuery" Grid.Row="1" Margin="16,0,16,0" Padding="8" FontFamily="Consolas" FontSize="12" AcceptsReturn="True" AcceptsTab="True" TextWrapping="NoWrap"
+                 VerticalContentAlignment="Top" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" ToolTip="The query that runs. Edit it before you run it if you like; Reset puts the built-in text back."/>
+        <DockPanel Grid.Row="2" Margin="16,10,16,10">
+          <Button x:Name="BtnHuExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" ToolTip="Save the results as CSV or JSON."/>
+          <Button x:Name="BtnHuOpen" Content="Copy and open Defender" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" ToolTip="Copy the query and open Advanced hunting in the Microsoft Defender portal, to paste it there."/>
+          <Button x:Name="BtnHuReset" Content="Reset" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" ToolTip="Put the built-in text of the query back."/>
+          <Button x:Name="BtnHuRun" Content="Run" DockPanel.Dock="Right" Style="{DynamicResource BtnAccent}" MinWidth="90" Margin="10,0,0,0"/>
+          <TextBlock x:Name="HuNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+        </DockPanel>
+        <Border Grid.Row="3" Background="White" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+          <DataGrid x:Name="HuGrid" AutoGenerateColumns="True" IsReadOnly="True" HeadersVisibility="Column" GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#F0F1F3"
+                    BorderThickness="0" Background="White" RowHeaderWidth="0" CanUserAddRows="False" MaxColumnWidth="380" EnableColumnVirtualization="True"/>
+        </Border>
+      </Grid>
+    </Grid>
+  </Grid>
+</Window>
+'@
+
+# Show the selected built-in query; its results go until it runs again.
+function Select-HuntingQuery {
+    param([System.Windows.Window]$Window)
+    $q = $Window.FindName('HuList').SelectedItem
+    if (-not $q) { return }
+    $Window.FindName('HuTitle').Text = $q.Name
+    $Window.FindName('HuDesc').Text = $q.Description
+    $Window.FindName('HuQuery').Text = $q.Query
+    $Window.FindName('HuGrid').ItemsSource = $null
+    $Window.FindName('HuNote').Text = 'Press Run to read the results.'
+    $Window.Tag = $null
+}
+
+function Invoke-HuntingWindowRun {
+    param([System.Windows.Window]$Window)
+    $note = $Window.FindName('HuNote'); $btn = $Window.FindName('BtnHuRun'); $grid = $Window.FindName('HuGrid')
+    $kql = [string]$Window.FindName('HuQuery').Text
+    if (-not $kql.Trim()) { $note.Text = 'Pick a query, or write one, first.'; return }
+    $btn.IsEnabled = $false
+    $note.Text = 'Running the query in Defender Advanced Hunting...'
+    $Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background)
+    try {
+        if (-not (Test-GraphScope 'ThreatHunting.Read.All')) { Request-GraphScope 'ThreatHunting.Read.All' }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $res = Invoke-HuntingRun -Query $kql
+        $Window.Tag = $res
+        $grid.ItemsSource = $res.Table.DefaultView
+        $note.Text = if ($res.Rows.Count) { '{0} row(s), {1} column(s), in {2:N0} s.' -f $res.Rows.Count, $res.Columns.Count, $sw.Elapsed.TotalSeconds } else { 'The query ran and returned nothing.' }
+    } catch {
+        $grid.ItemsSource = $null
+        $note.Text = 'The query failed: ' + $_.Exception.Message
+    } finally { $btn.IsEnabled = $true }
+}
+
+function New-HuntingWindow {
+    param([System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($HuntingXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:huWindow = $d
+    $view = [Windows.Data.CollectionViewSource]::GetDefaultView(@($script:HuntingQueries))
+    $view.GroupDescriptions.Add((New-Object Windows.Data.PropertyGroupDescription 'Category'))
+    $list = $d.FindName('HuList')
+    $list.ItemsSource = $view
+    $list.Add_SelectionChanged({ Select-HuntingQuery -Window $script:huWindow })
+    $d.FindName('BtnHuRun').Add_Click({ Invoke-HuntingWindowRun -Window $script:huWindow })
+    $d.FindName('BtnHuReset').Add_Click({ $q = $script:huWindow.FindName('HuList').SelectedItem; if ($q) { $script:huWindow.FindName('HuQuery').Text = $q.Query } })
+    $d.FindName('BtnHuOpen').Add_Click({
+        $kql = [string]$script:huWindow.FindName('HuQuery').Text
+        if ($kql.Trim()) { [Windows.Clipboard]::SetText($kql) }
+        $tenant = [string](Get-MgContext).TenantId
+        Start-Process ('https://security.microsoft.com/v2/advanced-hunting' + $(if ($tenant) { "?tid=$tenant" } else { '' }))
+        $script:huWindow.FindName('HuNote').Text = 'The query is on the clipboard: paste it into the query editor in Defender.'
+    })
+    $d.FindName('BtnHuExport').Add_Click({
+        $res = $script:huWindow.Tag
+        if (-not $res -or -not $res.Rows.Count) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'
+        $dlg.FileName = (([string]$script:huWindow.FindName('HuTitle').Text).ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-') + '.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        if ($dlg.FileName -match '\.json$') { $res.Rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else {
+            @(foreach ($dr in $res.Table.Rows) { $o = [ordered]@{}; foreach ($c in $res.Columns) { $o[$c] = $dr[$c] }; [pscustomobject]$o }) |
+                Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8
+        }
+    })
+    $d
+}
+
+$PurviewAuditXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Purview audit" Width="1280" Height="760" ShowInTaskbar="False" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+    </Style>
+    <Style x:Key="RiskText" TargetType="TextBlock">
+      <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="#6B7280"/><Setter Property="VerticalAlignment" Value="Top"/><Setter Property="Padding" Value="0,6"/>
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Risk}" Value="High"><Setter Property="Foreground" Value="#B91C1C"/></DataTrigger>
+        <DataTrigger Binding="{Binding Risk}" Value="Medium"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+      </Style.Triggers>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="260"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="AI activity in the Purview audit log"/>
+        <TextBlock x:Name="PaSummary" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap"/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="16,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <Button x:Name="BtnPaExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the events of the agents shown as CSV or JSON."/>
+        <Button x:Name="BtnPaLoad" Content="Read audit log" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Search the Purview audit log for the period chosen. A search takes a few minutes."/>
+        <TextBox x:Name="PaSearch" DockPanel.Dock="Right" Width="180" Height="30" Margin="12,0,0,0" VerticalContentAlignment="Center" ToolTip="Show only agents whose name or signals contain this text."/>
+        <CheckBox x:Name="PaRiskyOnly" Content="Risky only" DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Count only events with a risk signal."/>
+        <ComboBox x:Name="PaDaysBox" DockPanel.Dock="Right" SelectedIndex="1" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="The period to search. Longer periods take longer.">
+          <ComboBoxItem Content="Last day" Tag="1"/><ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+        </ComboBox>
+        <TextBlock x:Name="PaNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+      </DockPanel>
+    </Border>
+    <DataGrid x:Name="PaGrid" Grid.Row="2" Style="{StaticResource Grid}">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Agent" Binding="{Binding Agent}" Width="1.5*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="80" ElementStyle="{StaticResource RiskText}"/>
+        <DataGridTextColumn Header="Interactions" Binding="{Binding Interactions}" Width="95"/>
+        <DataGridTextColumn Header="Users" Binding="{Binding Users}" Width="60"/>
+        <DataGridTextColumn Header="High" Binding="{Binding High}" Width="55"/>
+        <DataGridTextColumn Header="Medium" Binding="{Binding Medium}" Width="74"/>
+        <DataGridTextColumn Header="Last activity" Binding="{Binding LastActivity, StringFormat=yyyy-MM-dd HH:mm}" Width="140"/>
+        <DataGridTextColumn Header="Top signals" Binding="{Binding TopSignals}" Width="2.5*" ElementStyle="{StaticResource Wrap}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Grid.Row="3" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+      <DataGrid x:Name="PaEvents" Style="{StaticResource Grid}">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Time" Binding="{Binding Time, StringFormat=yyyy-MM-dd HH:mm}" Width="140"/>
+          <DataGridTextColumn Header="User" Binding="{Binding User}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="App" Binding="{Binding App}" Width="1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Event" Binding="{Binding Kind}" Width="1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Risk" Binding="{Binding Risk}" Width="70" ElementStyle="{StaticResource RiskText}"/>
+          <DataGridTextColumn Header="What happened" Binding="{Binding Summary}" Width="2.5*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Signals" Binding="{Binding Signals}" Width="1.5*" ElementStyle="{StaticResource Wrap}"/>
+        </DataGrid.Columns>
+      </DataGrid>
+    </Border>
+    <Border Grid.Row="4" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Padding="16,8">
+      <TextBlock TextWrapping="Wrap" Foreground="#6B7280" Text="Events come from the Purview audit log (the source of DSPM's AI activity view); a search takes a few minutes and needs the AuditLogsQuery.Read.All permission and a Purview audit role. Risk comes from the audit signals, not from Insider Risk Management. The events of the selected agent are listed below, newest first."/>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Fill the page from the audit records already read, or search the audit log first (-Load). The period, risky-only and the
+# search only change what is shown, within the period that was searched.
+function Update-PurviewAuditWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('PaNote'); $grid = $Window.FindName('PaGrid'); $btn = $Window.FindName('BtnPaLoad'); $summary = $Window.FindName('PaSummary')
+    $days = [int]$Window.FindName('PaDaysBox').SelectedItem.Tag
+    if ($Load) {
+        try {
+            $btn.IsEnabled = $false
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { & $pump 'Granting audit log read access: finish the sign-in window...'; Request-GraphScope 'AuditLogsQuery.Read.All' }
+            & $pump ("Searching the Purview audit log for the last {0} day(s). This takes a few minutes..." -f $days)
+            $info = if ($script:ctx -and $script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
+            $null = Get-AiActivityData -Days $days -InfoTable $info -Packages $script:paState.Packages -OnWait $pump -Refresh
+        } catch {
+            $note.Text = 'Could not read the audit log: ' + $_.Exception.Message + ' (needs the AuditLogsQuery.Read.All permission and a Purview audit role).'
+            return
+        } finally { $btn.IsEnabled = $true }
+    }
+    $cache = $script:AiActivityCache
+    if (-not $cache) {
+        $grid.ItemsSource = @(); $Window.FindName('PaEvents').ItemsSource = @(); $summary.Text = ''
+        $note.Text = 'Not read yet. Choose a period and press Read audit log; a search takes a few minutes.'
+        return
+    }
+    $acts = @(Select-PurviewAuditActivities -Activities $cache.Activities -Days $days -OnlyIds $script:paState.OnlyIds -RiskyOnly:([bool]$Window.FindName('PaRiskyOnly').IsChecked))
+    $sum = @(Get-AiActivitySummary -Activities $acts -NameById $cache.Names)
+    $text = [string]$Window.FindName('PaSearch').Text
+    $shown = @(if ($text) { $sum | Where-Object { ("$($_.Agent) $($_.TopSignals)").IndexOf($text, [StringComparison]::OrdinalIgnoreCase) -ge 0 } } else { $sum })
+    $grid.ItemsSource = $shown
+    $Window.Tag = @{ Activities = $acts }
+    $scope = if (@($script:paState.OnlyIds).Count) { "the $(@($script:paState.OnlyIds).Count) ticked agent(s)" } else { 'all agents' }
+    $summary.Text = ("Last {0} days, {1}: {2} agent(s) with AI activity, {3} with a high-risk signal and {4} with a medium one. {5} event(s) belong to an agent outside the catalog and are not listed." -f
+        [Math]::Min($days, $cache.Days), $scope, $sum.Count, @($sum | Where-Object { $_.Risk -eq 'High' }).Count, @($sum | Where-Object { $_.Risk -eq 'Medium' }).Count, $cache.Unmapped)
+    $note.Text = if ($days -gt $cache.Days) { "The audit log was searched for the last $($cache.Days) day(s). Press Read audit log to search $days." }
+                 else { "Searched at {0:HH:mm} for the last {1} day(s). Select an agent for its events." -f $cache.At, $cache.Days }
+    if ($shown.Count) { $grid.SelectedIndex = 0 }
+    Update-PurviewAuditEvents -Window $Window
+}
+
+# The activity rows of one period, for chosen agents, risky only if asked.
+function Select-PurviewAuditActivities {
+    param([object[]]$Activities, [int]$Days = 7, [string[]]$OnlyIds, [switch]$RiskyOnly)
+    $since = (Get-Date).AddDays(-$Days)
+    $only = @($OnlyIds | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+    @($Activities | Where-Object { $_.TitleId -and $_.Time -ge $since -and (-not $only.Count -or $only -contains ([string]$_.TitleId).ToLowerInvariant()) -and (-not $RiskyOnly -or $_.Risk -ne 'None') })
+}
+
+function Update-PurviewAuditEvents {
+    param([System.Windows.Window]$Window)
+    $item = $Window.FindName('PaGrid').SelectedItem
+    $acts = if ($Window.Tag) { @($Window.Tag.Activities) } else { @() }
+    $Window.FindName('PaEvents').ItemsSource = @(if ($item) { $acts | Where-Object { $_.TitleId -eq $item.TitleId } | Sort-Object Time -Descending | Select-Object -First 500 })
+}
+
+function New-PurviewAuditWindow {
+    param([System.Windows.Window]$Owner, [object[]]$Packages, [string[]]$OnlyIds)
+    $d = [Windows.Markup.XamlReader]::Parse($PurviewAuditXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:paWindow = $d
+    $script:paState = @{ Packages = @($Packages); OnlyIds = @($OnlyIds | Where-Object { $_ }) }
+    $d.FindName('BtnPaLoad').Add_Click({ Update-PurviewAuditWindow -Window $script:paWindow -Load })
+    $d.FindName('PaDaysBox').Add_SelectionChanged({ Update-PurviewAuditWindow -Window $script:paWindow })
+    $d.FindName('PaRiskyOnly').Add_Click({ Update-PurviewAuditWindow -Window $script:paWindow })
+    $d.FindName('PaSearch').Add_TextChanged({ Update-PurviewAuditWindow -Window $script:paWindow })
+    $d.FindName('PaGrid').Add_SelectionChanged({ Update-PurviewAuditEvents -Window $script:paWindow })
+    $d.FindName('BtnPaExport').Add_Click({
+        $shown = @($script:paWindow.FindName('PaGrid').ItemsSource | ForEach-Object { $_.TitleId })
+        $acts = @(if ($script:paWindow.Tag) { $script:paWindow.Tag.Activities | Where-Object { $shown -contains $_.TitleId } })
+        if ($acts.Count -eq 0) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'purview-ai-activity.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($acts | Select-Object Time, Agent, User, App, Kind, Risk, Summary, Signals, Detail, Tools, Files, Web, Model, Conversation, RecordId)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+    })
+    $d
+}
+
+# Respond from an alert: act on the agent it names, with the console's own actions and confirmations.
+function Invoke-AlertResponse {
+    param([ValidateSet('block', 'compromise', 'revoke', 'mcp', 'show')][string]$Action)
+    $item = $script:aaWindow.FindName('AaGrid').SelectedItem
+    if (-not $item -or -not $script:ctx) { return }
+    $row = if ($item.AgentId) { $script:ctx.RowById[[string]$item.AgentId] } else { $null }
+    if (-not $row) { [void][Windows.MessageBox]::Show("$($item.Agent) is not in the agent catalog the console has loaded, so it cannot be acted on here.", 'Respond', 'OK', 'Information'); return }
+    switch ($Action) {
+        'block'      { if ($row.IsBlocked) { [void][Windows.MessageBox]::Show("$($row.Name) is already blocked.", 'Respond', 'OK', 'Information') } else { & $script:ctx.Apply 'Block' @($row) } }
+        'compromise' { & $script:ctx.ConfirmCompromised @($row) }
+        'revoke'     { & $script:ctx.RevokeSessions @($row) }
+        'mcp'        { Show-ShellPage 'tools'; $script:mcWindow.FindName('McSearch').Text = $row.Name }
+        'show'       { Show-ShellPage 'agents'; $script:ui.Search.Text = $row.Name }
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
 # Console shell: navigation on the left grouped like the Agent 365 portal, one page at a time on the right. All agents is the
 # console's own grid and Home is drawn here; every other page is the content of one of the feature windows above, moved into the
 # shell. The window object stays alive unseen, so its named elements, its Tag (the data it read) and its update functions work
@@ -7289,6 +8842,9 @@ function Initialize-Shell {
     & $page 'alerts' 'NavAlerts' $null { Mount-ShellPage 'alerts' (New-AgentAlertsWindow -Packages @(Get-ShellPackages)) } {
         param($Reload)
         $script:aaState.Packages = @(Get-ShellPackages); $script:aaState.OnlyIds = @(Get-ShellTicked); Update-AgentAlertsWindow -Window $script:aaWindow -Load:$Reload } -Scoped $true -FilterOnly $true
+    & $page 'hunting' 'NavHunting' $null { Mount-ShellPage 'hunting' (New-HuntingWindow) } $null
+    & $page 'purview' 'NavPurview' $null { Mount-ShellPage 'purview' (New-PurviewAuditWindow -Packages @(Get-ShellPackages)) } {
+        $script:paState.Packages = @(Get-ShellPackages); $script:paState.OnlyIds = @(Get-ShellTicked); Update-PurviewAuditWindow -Window $script:paWindow } -Scoped $true -FilterOnly $true
     & $page 'hits' 'NavHits' $null { Mount-ShellPage 'hits' (New-PolicyHitsWindow -Packages @(Get-ShellPackages)) } {
         $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load } -Scoped $true
     & $page 'ca' 'NavCa' $null { Mount-ShellPage 'ca' (New-CaCheckWindow) } {
@@ -7960,7 +9516,8 @@ function New-ConsoleWindow {
     }
 
     $script:ctx.ConfirmCompromised = {
-        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and $_.Package.agentIdentityId })
+        param([object[]]$Pick)
+        $rows = @(if ($Pick) { $Pick | Where-Object { $_.Package.agentIdentityId } } else { $script:ctx.Rows | Where-Object { $_.Checked -and $_.Package.agentIdentityId } })
         if ($rows.Count -eq 0) { return }
         $states = & $script:ctx.ReadRisk $rows
         if ($null -eq $states) { return }
@@ -8014,7 +9571,9 @@ function New-ConsoleWindow {
 
     $script:ctx.CheckConditionalAccess = { Show-ShellPage 'ca' }
     $script:ctx.RevokeSessions = {
-        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and ($_.Package.agentIdentityId -or @($_.Package.elementTypes) -contains 'AgenticUserTemplates') })
+        param([object[]]$Pick)
+        $hasIdentity = { $_.Package.agentIdentityId -or @($_.Package.elementTypes) -contains 'AgenticUserTemplates' }
+        $rows = @(if ($Pick) { $Pick | Where-Object $hasIdentity } else { $script:ctx.Rows | Where-Object { $_.Checked } | Where-Object $hasIdentity })
         if ($rows.Count -eq 0) { & $script:ctx.Idle 'The ticked agents have no Entra agent identity, so they have no agent user account to revoke.'; return }
         try {
             if (-not (Test-GraphScope 'User.RevokeSessions.All')) { & $script:ctx.Busy 'Granting the right to revoke sessions: finish the sign-in window...'; Request-GraphScope 'User.RevokeSessions.All' }
