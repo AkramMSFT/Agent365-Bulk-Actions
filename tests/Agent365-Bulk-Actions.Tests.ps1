@@ -3097,3 +3097,69 @@ Describe 'Conditional Access check ignores MCP blocks' {
         (@(Get-AgentCaDetailRows $c) | Where-Object Item -eq 'Block Mail MCP').Info | Should -BeLike '*specific resources*not counted as protection*'
     }
 }
+
+Describe 'Revoke sessions' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+    }
+    It 'finds the agent user accounts of an agent identity and of every identity made from a blueprint entry' {
+        Mock Get-AgentUserIdsByIdentity { @{ 'id-a' = @('u-a'); 'id-b1' = @('u-b1', 'u-b2'); 'id-b2' = @('u-b2') } }
+        Mock Get-McpBlueprintPackages { @{ 'T_B' = [pscustomobject]@{ AppId = 'bp-b'; Principal = 'bpsp-b'; Identities = @('ID-B1', 'id-b2') } } }
+        $pk = @([pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = 'id-a' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta Blueprint'; agentIdentityId = $null },
+                [pscustomobject]@{ id = 'P_N'; displayName = 'No identity'; agentIdentityId = $null })
+        $t = @(Get-AgentSessionTargets -Packages $pk)
+        $t.Count | Should -Be 3
+        $t[0].AgentUsers | Should -Be @('u-a')
+        $t[1].AgentUsers | Should -Be @('u-b1', 'u-b2'); $t[1].Identities.Count | Should -Be 2
+        @($t[2].AgentUsers).Count | Should -Be 0
+    }
+    It 'revokes each account on v1.0, reads back when sessions are valid from, and skips an agent with no account' {
+        Mock Invoke-Graph {
+            $script:calls += , [pscustomobject]@{ Method = $Method; Uri = $Uri }
+            if ($Method -eq 'POST') { @{ value = $true } } else { @{ userPrincipalName = 'agent@contoso.com'; signInSessionsValidFromDateTime = '2026-10-27T12:00:00Z' } }
+        }
+        $r = @(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }, [pscustomobject]@{ Agent = 'Bare'; AgentId = 'P_N'; AgentUsers = @() }) -PassThru)
+        $r.Count | Should -Be 2
+        $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'revokesessions'; $r[0].Account | Should -Be 'agent@contoso.com'; $r[0].ValidFrom | Should -Not -BeNullOrEmpty; $r[0].DisplayName | Should -Be 'Alpha'
+        $r[1].Result | Should -Be 'Skipped'; $r[1].Error | Should -BeLike '*no agent user account*cannot be revoked*'
+        ($script:calls | Where-Object Method -eq 'POST').Uri | Should -Be 'https://graph.microsoft.com/v1.0/users/u-a/revokeSignInSessions'
+    }
+    It 'records a refusal with the permission and role it needs, and changes nothing under -WhatIf' {
+        Mock Invoke-Graph { throw 'Forbidden' }
+        $r = @(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }) -PassThru)
+        $r[0].Result | Should -Be 'Failed'; $r[0].Error | Should -BeLike '*User.RevokeSessions.All*'
+        Mock Test-Proceed { $false }
+        Mock Invoke-Graph { $script:calls += 'x' }
+        (@(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }) -PassThru))[0].Result | Should -Be 'WhatIf'
+        $script:calls.Count | Should -Be 0
+    }
+    It 'takes the agents of an enforced MCP block, not report-only or failed ones, for revoking straight after' {
+        $recs = @([pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a;u-c' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'Report-only'; Agent = 'Beta'; AgentId = 'P_B'; IdentityId = 'id-b'; AgentUserIds = 'u-b' },
+                  [pscustomobject]@{ Result = 'Failed'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Gamma'; AgentId = 'P_G'; IdentityId = 'id-g'; AgentUserIds = 'u-g' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'unblockmcp'; Mode = 'Removed'; Agent = 'Delta'; AgentId = 'P_D'; IdentityId = 'id-d'; AgentUserIds = 'u-d' })
+        $t = @(ConvertTo-McpRevokeTargets $recs)
+        $t.Count | Should -Be 1
+        $t[0].Agent | Should -Be 'Alpha'; $t[0].AgentUsers | Should -Be @('u-a', 'u-c')
+    }
+    It 'revokes after a block or a compromise confirmation for the agents changed, in a log of its own, and keeps the action''s log path' {
+        Mock Get-AgentSessionTargets { @($Packages | ForEach-Object { [pscustomobject]@{ Agent = $_.displayName; AgentId = $_.id; Identities = @(); AgentUsers = @("u-$($_.id)") } }) }
+        Mock Invoke-AgentSessionRevoke { $script:revoked = @($Targets); $script:revokeLog = $script:OutFile }
+        $script:OutFile = 'C:\logs\block.csv'
+        $pk = @([pscustomobject]@{ id = 'P_1'; displayName = 'One' }, [pscustomobject]@{ id = 'P_2'; displayName = 'Two' }, [pscustomobject]@{ id = 'P_3'; displayName = 'Three' })
+        $recs = @([pscustomobject]@{ Result = 'Done'; Action = 'block'; Id = 'P_1' }, [pscustomobject]@{ Result = 'Skipped'; Action = 'block'; Id = 'P_2' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'confirmcompromised'; Id = 'P_3' })
+        Invoke-SessionRevokeAfter -Records $recs -Packages $pk
+        @($script:revoked | ForEach-Object { $_.AgentId }) | Should -Be @('P_1', 'P_3')
+        $script:revokeLog | Should -Be 'C:\logs\block-revoke.csv'
+        $script:OutFile | Should -Be 'C:\logs\block.csv'
+        $script:revoked = @()
+        Invoke-SessionRevokeAfter -Records @([pscustomobject]@{ Result = 'Failed'; Action = 'block'; Id = 'P_1' }) -Packages $pk
+        @($script:revoked).Count | Should -Be 0
+        $script:OutFile = $null
+    }
+}

@@ -14,6 +14,7 @@
     POST  /beta/security/rules/detectionRules                  block a local AI agent on one device (Defender custom detection rule)
     GET   /beta/identity/conditionalAccess/policies            which Conditional Access policies protect an agent
     POST  /beta/identity/conditionalAccess/policies            block an MCP server for chosen agents (and PATCH, DELETE)
+    POST  /v1.0/users/{id}/revokeSignInSessions                end the sessions of an agent's user account
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
 
@@ -84,6 +85,10 @@
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockMcp "Mail" -ForAgent "Java Demo Agent" -ReportOnly
   Block one MCP server for chosen agents with a Conditional Access policy, in report-only mode first. -UnblockMcp or -Undo <log> removes it.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -RevokeSessions
+  Block the agent and end the sessions of its user accounts, so the block applies at once. -RevokeSessions works the same with -BlockMcp and -ConfirmCompromised.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
@@ -378,6 +383,11 @@ param(
     [Parameter(ParameterSetName = 'UnblockMcp', Mandatory)]
     [string[]]$UnblockMcp,                  # remove this tool's block of these MCP servers for the agents in -ForAgent
 
+    [Parameter(ParameterSetName = 'Block')]
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [Parameter(ParameterSetName = 'Compromise')]
+    [switch]$RevokeSessions,                # Block, BlockMcp, ConfirmCompromised: also end the sessions of the agents' user accounts, so the change applies at once
+
     [Parameter(ParameterSetName = 'BlockMcp')]
     [switch]$ReportOnly,                    # BlockMcp: report-only mode, which blocks nothing and logs what it would have blocked
 
@@ -419,7 +429,7 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
                       'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All',
-                      'Policy.ReadWrite.ConditionalAccess')
+                      'Policy.ReadWrite.ConditionalAccess', 'User.RevokeSessions.All')
 
 # A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
@@ -551,6 +561,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -a
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'McpAccess') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All') }
 if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess') }
+if ($RevokeSessions) { $scopes += 'User.RevokeSessions.All', 'User.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess' }
 if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
@@ -3448,6 +3459,96 @@ function ConvertTo-McpUndoItems {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Revoke sessions: end the sessions of agents' user accounts. Entra invalidates their refresh tokens and tells the resources that
+# support continuous access evaluation (Exchange, SharePoint, Teams, Microsoft Graph) to refuse the access tokens already issued,
+# so a block or a Conditional Access change applies at once instead of when those tokens expire. Other resources accept an access
+# token until it expires, about an hour. An agent identity's own tokens (the agent acting as itself) cannot be revoked; blocking
+# the agent or disabling its identity stops new ones. Revoking cannot be undone and needs nothing undone: the agent signs in again.
+# ---------------------------------------------------------------------------------------------
+
+# The agent user accounts behind catalog agents: those of the agent's own identity, or of every identity made from a blueprint entry.
+# Returns one target per package: { Agent; AgentId; Identities; AgentUsers }.
+function Get-AgentSessionTargets {
+    param([object[]]$Packages)
+    $users = Get-AgentUserIdsByIdentity
+    $bps = Get-McpBlueprintPackages -Packages $Packages
+    foreach ($p in @($Packages)) {
+        $ids = if ($p.agentIdentityId) { @([string]$p.agentIdentityId) } elseif ($bps[[string]$p.id]) { @($bps[[string]$p.id].Identities) } else { @() }
+        [pscustomobject]@{
+            Agent = [string]$p.displayName; AgentId = [string]$p.id; Identities = $ids
+            AgentUsers = @($ids | ForEach-Object { $i = ([string]$_).ToLowerInvariant(); if ($users.ContainsKey($i)) { $users[$i] } } | Get-Distinct)
+        }
+    }
+}
+
+# Revoke the sessions of every agent user account of the targets, then read back when Entra now accepts sessions from.
+function Invoke-AgentSessionRevoke {
+    param([object[]]$Targets, [switch]$PassThru)
+    $who = (Get-MgContext).Account
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $skip = 0; $fail = 0
+    Write-Host ("`nRevoke the sessions of the agent user accounts of {0} agent(s):" -f @($Targets).Count) -ForegroundColor Cyan
+    foreach ($t in @($Targets)) {
+        $users = @($t.AgentUsers | Where-Object { $_ })
+        if ($users.Count -eq 0) {
+            $why = 'The agent has no agent user account. Its identity''s own tokens cannot be revoked; block the agent or disable its identity to stop new ones.'
+            Write-Host ("  SKIP {0}: {1}" -f $t.Agent, $why) -ForegroundColor DarkGray
+            $log.Add([pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = ''; Account = ''; ValidFrom = ''; Result = 'Skipped'; Error = $why })
+            $skip++; continue
+        }
+        foreach ($u in $users) {
+            $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = $u; Account = ''; ValidFrom = ''; Result = ''; Error = '' }
+            if (-not (Test-Proceed ("{0} (agent user {1})" -f $t.Agent, $u) 'Revoke sign-in sessions')) { $rec.Result = 'WhatIf' }
+            else {
+                try {
+                    Invoke-Graph -Method POST -Uri "https://graph.microsoft.com/v1.0/users/$u/revokeSignInSessions" | Out-Null
+                    try {
+                        $back = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/users/$u`?`$select=userPrincipalName,signInSessionsValidFromDateTime"
+                        $rec.Account = [string]$back.userPrincipalName
+                        $when = ConvertTo-EndpointTime $back.signInSessionsValidFromDateTime
+                        if ($when) { $rec.ValidFrom = $when.ToString('o') }
+                    } catch { $null = $_ }
+                    Write-Host ("  OK   {0}: {1}" -f $t.Agent, $(if ($rec.Account) { $rec.Account } else { $u })) -ForegroundColor Green
+                    $rec.Result = 'Done'; $ok++
+                } catch {
+                    $msg = $_.Exception.Message
+                    if ($msg -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $msg += ' (this needs the User.RevokeSessions.All permission and an Entra role that can manage the account, such as Agent ID Administrator for agent user accounts)' }
+                    Write-Host ("  FAIL {0} ({1}): {2}" -f $t.Agent, $u, $msg) -ForegroundColor Red
+                    $rec.Result = 'Failed'; $rec.Error = $msg; $fail++
+                }
+            }
+            $log.Add([pscustomobject]$rec)
+        }
+    }
+    Write-Host ("Done: {0} account(s) revoked, {1} agent(s) skipped, {2} failed." -f $ok, $skip, $fail) -ForegroundColor Cyan
+    if ($ok) { Write-Host 'Entra applies it within a few minutes. Exchange, SharePoint, Teams and Microsoft Graph then refuse the tokens already issued; other resources accept them until they expire, about an hour. The agent signs in again on its own, subject to any block now in place.' -ForegroundColor Yellow }
+    Export-ActionLog -Records $log.ToArray()
+    if ($PassThru) { $log.ToArray() }
+}
+
+# Revoke straight after a containment action. The revocation gets a log of its own beside -OutFile (name-revoke.csv), because
+# -Undo needs the log of the action intact. Records are the action's log: block, confirm compromised (by package id) or MCP block.
+function Invoke-SessionRevokeAfter {
+    param([object[]]$Records, [object[]]$Packages)
+    $mcp = @(ConvertTo-McpRevokeTargets $Records)
+    $ids = @($Records | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'confirmcompromised' } | ForEach-Object { [string]$_.Id } | Get-Distinct)
+    $targets = @($mcp) + @(if ($ids.Count) { Get-AgentSessionTargets -Packages @($Packages | Where-Object { $ids -contains [string]$_.id }) })
+    if ($targets.Count -eq 0) { Write-Host 'Nothing was changed, so no session was revoked.' -ForegroundColor DarkGray; return }
+    $keep = $script:OutFile
+    if ($keep) { $script:OutFile = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($keep))) ([IO.Path]::GetFileNameWithoutExtension($keep) + '-revoke' + [IO.Path]::GetExtension($keep)) }
+    try { Invoke-AgentSessionRevoke -Targets $targets } finally { $script:OutFile = $keep }
+}
+
+# Targets for the agents of MCP block records that were applied, so their sessions can be revoked straight after.
+function ConvertTo-McpRevokeTargets {
+    param([object[]]$Records)
+    @($Records | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'blockmcp' -and $_.Mode -eq 'On' } | Group-Object AgentId | ForEach-Object {
+        $g = @($_.Group)
+        [pscustomobject]@{ Agent = $g[0].Agent; AgentId = $g[0].AgentId; Identities = @($g[0].IdentityId)
+                           AgentUsers = @($g | ForEach-Object { ([string]$_.AgentUserIds).Split(';', [StringSplitOptions]::RemoveEmptyEntries) } | Get-Distinct) }
+    })
+}
+
+# ---------------------------------------------------------------------------------------------
 # Entra ID Protection for agents: confirm an agent identity as compromised, or dismiss its risk.
 # Confirming sets the risk level to High; a Conditional Access policy that blocks high agent risk then enforces it.
 # These calls exist on beta only.
@@ -5324,12 +5425,13 @@ $GuiXaml = @'
           <Button x:Name="BtnApplyOwner" Content="Apply suggested" Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Adds the suggested owner (or sponsor) to the ticked agents. Choose an Ownership filter first: Needs an owner, Missing an Entra sponsor, or Missing a sponsor or owner. Only rows that show a suggestion can be applied."/>
           <Button x:Name="BtnRestrict" Content="Restrict access..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Narrow who can use the selected agents (nobody, their owner, named users and groups) or reopen them. A softer step than Block; the old scope is saved for Undo."/>
           <Button x:Name="BtnAssign" Content="Assign owner..." Style="{StaticResource Btn}" Margin="0,0,8,0" IsEnabled="False" ToolTip="Pick a new owner for the selected agents. Only shared agents can be reassigned; the button stays off until one is selected."/>
-          <Button x:Name="BtnCompromise" Content="Entra risk &#9662;" Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Entra ID Protection actions for the selected agents' identities: confirm them as compromised (risk level High, which a Conditional Access policy that blocks high agent risk then enforces) or clear that flag. Needs the Security Administrator role.">
+          <Button x:Name="BtnCompromise" Content="Entra risk &#9662;" Style="{StaticResource Btn}" IsEnabled="False" ToolTip="Entra actions for the selected agents' identities: confirm them as compromised (risk level High, which a Conditional Access policy that blocks high agent risk then enforces) or clear that flag (Security Administrator role), check Conditional Access, or revoke the sessions of their agent user accounts.">
             <Button.ContextMenu>
               <ContextMenu>
                 <MenuItem Header="Confirm as compromised..." ToolTip="Entra sets the risk level to High. Undo last run dismisses it."/>
                 <MenuItem Header="Clear the compromised flag..." ToolTip="Dismiss the Entra risk of the selected agents. Entra shows them as dismissed afterwards."/>
                 <MenuItem Header="Check Conditional Access..." ToolTip="Read-only. Check whether a Conditional Access policy blocks each ticked agent at High agent risk, and which policies apply. With nothing ticked it checks every agent that has an Entra identity."/>
+                <MenuItem Header="Revoke sessions..." ToolTip="End the sessions of the ticked agents' user accounts, so a block or a Conditional Access change applies at once instead of when their tokens expire. An agent identity's own tokens cannot be revoked. Cannot be undone, and needs nothing undone."/>
               </ContextMenu>
             </Button.ContextMenu>
           </Button>
@@ -6800,6 +6902,27 @@ function Invoke-McpWindowBlock {
         $why = (@($failed | Select-Object -First 5 | ForEach-Object { "$($_.Agent) -> $($_.Server): $($_.Error)" }) -join "`n")
         [void][Windows.MessageBox]::Show("$($failed.Count) change(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
     }
+    $revoke = @(ConvertTo-McpRevokeTargets $recs | Where-Object { @($_.AgentUsers).Count })
+    if ($Mode -eq 'On' -and $revoke.Count) { Invoke-McpWindowRevoke -Window $Window -Targets $revoke }
+}
+
+# After an enforced block, offer to end the sessions of the blocked agents' user accounts so the block applies at once.
+function Invoke-McpWindowRevoke {
+    param([System.Windows.Window]$Window, [object[]]$Targets)
+    $note = $Window.FindName('McNote')
+    $n = @($Targets | ForEach-Object { $_.AgentUsers }).Count
+    $ask = "Also revoke the sessions of the $n agent user account(s) of these agents now?`n`nWithout it the block applies when their current tokens expire, within about an hour. With it, Exchange, SharePoint, Teams and Microsoft Graph refuse those tokens within minutes. An agent identity's own tokens cannot be revoked and expire on their own.`n`nRevoking cannot be undone and needs nothing undone: the agents sign in again, subject to the block."
+    if ([Windows.MessageBox]::Show($ask, 'Revoke sessions', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+    $pump = { $Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
+    try { if (-not (Test-GraphScope 'User.RevokeSessions.All')) { $note.Text = 'Granting the right to revoke sessions: finish the sign-in window...'; & $pump; Request-GraphScope 'User.RevokeSessions.All' } }
+    catch { $note.Text = 'Sign-in failed: ' + $_.Exception.Message; return }
+    $blockLog = $script:OutFile
+    if ($script:ctx) { & $script:ctx.NewLogPath 'revoke-sessions' }
+    $note.Text = 'Revoking sessions...'; & $pump
+    $rv = @(Invoke-AgentSessionRevoke -Targets $Targets -PassThru)
+    $failed = @($rv | Where-Object { $_.Result -eq 'Failed' })
+    $note.Text += (" Sessions revoked for {0} account(s), {1} failed.{2}" -f @($rv | Where-Object { $_.Result -eq 'Done' }).Count, $failed.Count, $(if ($script:OutFile -and $script:OutFile -ne $blockLog) { " Log: $script:OutFile" } else { '' }))
+    if ($failed.Count) { [void][Windows.MessageBox]::Show("$($failed.Count) account(s) could not be revoked:`n`n$(Get-FailureSummary $failed)", 'Revoke sessions', 'OK', 'Warning') }
 }
 
 function New-McpAccessWindow {
@@ -7033,7 +7156,7 @@ function New-ConsoleWindow {
             if ($r.IsBlocked) { $canUnblock = $true } else { $canBlock = $true }
             if (-not $canAssign -and (Test-Reassignable $r.Package)) { $canAssign = $true }
             if (-not $canApply -and $script:ctx.Suggest.ContainsKey($r.Id)) { $canApply = $true }
-            if (-not $canCompromise -and $r.Package.agentIdentityId) { $canCompromise = $true }
+            if (-not $canCompromise -and ($r.Package.agentIdentityId -or @($r.Package.elementTypes) -contains 'AgenticUserTemplates')) { $canCompromise = $true }
         }
         $shown = @($script:ctx.View).Count
         $script:ui.CountTotal.Text = $total
@@ -7637,6 +7760,30 @@ function New-ConsoleWindow {
         & $script:ctx.Idle ("Conditional Access: {0} agent(s) checked, {1} protected." -f @($report.Rows).Count, @($report.Rows | Where-Object { $_.Kind -eq 'Protected' }).Count)
         (New-CaCheckWindow -Report $report -Owner $script:w).ShowDialog() | Out-Null
     }
+    $script:ctx.RevokeSessions = {
+        $rows = @($script:ctx.Rows | Where-Object { $_.Checked -and ($_.Package.agentIdentityId -or @($_.Package.elementTypes) -contains 'AgenticUserTemplates') })
+        if ($rows.Count -eq 0) { & $script:ctx.Idle 'The ticked agents have no Entra agent identity, so they have no agent user account to revoke.'; return }
+        try {
+            if (-not (Test-GraphScope 'User.RevokeSessions.All')) { & $script:ctx.Busy 'Granting the right to revoke sessions: finish the sign-in window...'; Request-GraphScope 'User.RevokeSessions.All' }
+            & $script:ctx.Busy 'Finding the agent user accounts of the ticked agents...'
+            $targets = @(Get-AgentSessionTargets -Packages @($rows | ForEach-Object { $_.Package }))
+        } catch { & $script:ctx.Idle 'Could not read the agent user accounts.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Revoke sessions', 'OK', 'Error'); return }
+        $ready = @($targets | Where-Object { @($_.AgentUsers).Count })
+        if ($ready.Count -eq 0) { & $script:ctx.Idle 'None of the ticked agents has an agent user account. An agent identity''s own tokens cannot be revoked; block the agent to stop new ones.'; return }
+        $n = @($ready | ForEach-Object { $_.AgentUsers }).Count
+        $list = (($ready | Select-Object -First 12 | ForEach-Object { "  - {0}    ({1} agent user account(s))" -f $_.Agent, @($_.AgentUsers).Count }) -join "`n") + $(if ($ready.Count -gt 12) { "`n  ... and $($ready.Count - 12) more" } else { '' })
+        $text = "Revoke the sessions of $n agent user account(s)?`n`n$list`n`nEntra ends their sessions within a few minutes: refresh tokens stop working, and Exchange, SharePoint, Teams and Microsoft Graph refuse the access tokens already issued. The agents sign in again on their own, subject to any block in place. An agent identity's own tokens cannot be revoked.`n`nThis cannot be undone, and needs nothing undone." + $(if ($targets.Count -gt $ready.Count) { "`n`n$($targets.Count - $ready.Count) ticked agent(s) have no agent user account and are left out." } else { '' })
+        if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Warning', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
+        & $script:ctx.NewLogPath 'revoke-sessions'
+        & $script:ctx.Busy ("Revoking the sessions of {0} agent user account(s)..." -f $n)
+        $recs = @(Invoke-AgentSessionRevoke -Targets $ready -PassThru)
+        # A revocation cannot be undone, so it is not offered to Undo last run.
+        $script:ctx.LastRun = @()
+        $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+        & $script:ctx.Refilter
+        & $script:ctx.Idle ("Sessions revoked for {0} agent user account(s), {1} failed. Entra applies it within a few minutes. Log: {2}" -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, $failed.Count, $script:OutFile)
+        if ($failed.Count) { [void][Windows.MessageBox]::Show("$($failed.Count) account(s) could not be revoked:`n`n$(Get-FailureSummary $failed)", 'Some changes failed', 'OK', 'Warning') }
+    }
     $script:ui.BtnCompromise.Add_Click({
         $m = $script:ui.BtnCompromise.ContextMenu
         $m.PlacementTarget = $script:ui.BtnCompromise
@@ -7646,6 +7793,7 @@ function New-ConsoleWindow {
     $script:ui.BtnCompromise.ContextMenu.Items[0].Add_Click({ & $script:ctx.ConfirmCompromised })
     $script:ui.BtnCompromise.ContextMenu.Items[1].Add_Click({ & $script:ctx.ClearCompromised })
     $script:ui.BtnCompromise.ContextMenu.Items[2].Add_Click({ & $script:ctx.CheckConditionalAccess })
+    $script:ui.BtnCompromise.ContextMenu.Items[3].Add_Click({ & $script:ctx.RevokeSessions })
     $script:ui.BtnAssign.Add_Click({
         $checked = @($script:ctx.Rows | Where-Object { $_.Checked })
         $rows = @($checked | Where-Object { Test-Reassignable $_.Package })
@@ -7940,7 +8088,9 @@ switch ($PSCmdlet.ParameterSetName) {
             if (@($ready | Where-Object { $_.ServerKey -eq 'agenttools' }).Count) { Write-Warning 'Agent Tools (shared permission) covers every MCP server the shared permission reaches, so those agents lose all of them.' }
         }
         if (-not (Confirm-Batch -Count $ready.Count -Action $(if ($blocking) { 'block MCP access for' } else { 'remove the MCP block of' }))) { Write-Host 'Cancelled.'; break }
-        Invoke-McpBlockChange -Items @($ready | ForEach-Object { ConvertTo-McpBlockItem -Row $_ -Target $mode })
+        $recs = @(Invoke-McpBlockChange -Items @($ready | ForEach-Object { ConvertTo-McpBlockItem -Row $_ -Target $mode }) -PassThru)
+        if ($RevokeSessions -and $mode -eq 'On') { Invoke-SessionRevokeAfter -Records $recs -Packages $targets }
+        elseif ($RevokeSessions) { Write-Host '-RevokeSessions applies to an enforced block only. Report-only blocks nothing, so no session was revoked.' -ForegroundColor DarkGray }
     }
     'BlockLocalAgent' {
         $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
@@ -8117,7 +8267,8 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host ("{0} agent identit{1} will be confirmed as compromised. Entra sets the risk level to High, and a Conditional Access policy that blocks high agent risk then blocks them. -Undo or -DismissRisk clears it." -f
             $pending.Count, $(if ($pending.Count -eq 1) { 'y' } else { 'ies' })) -ForegroundColor Yellow
         if (-not (Confirm-Batch -Count $pending.Count -Action 'confirm as compromised')) { Write-Host 'Cancelled.'; break }
-        Invoke-AgentRiskAction -Packages $withId -Action confirmCompromised -WaitSeconds $WaitSeconds
+        $recs = @(Invoke-AgentRiskAction -Packages $withId -Action confirmCompromised -WaitSeconds $WaitSeconds -PassThru)
+        if ($RevokeSessions) { Invoke-SessionRevokeAfter -Records $recs -Packages $withId }
     }
     'DismissRisk' {
         $targets = @(Resolve-Packages $DismissRisk)
@@ -8252,7 +8403,8 @@ switch ($PSCmdlet.ParameterSetName) {
         Write-Host ("{0} of {1} target(s) need {2}." -f $pending.Count, $targets.Count, $verb) -ForegroundColor Cyan
         if ($Impact) { Show-ImpactPreview $targets } else { $targets | Select-Object displayName, id, isBlocked | Format-Table -AutoSize | Out-Host }
         if (-not (Confirm-Batch -Count $pending.Count -Action $verb)) { Write-Host 'Cancelled.'; break }
-        Invoke-PackageAction -Packages $targets -Action $verb
+        $recs = @(Invoke-PackageAction -Packages $targets -Action $verb -PassThru)
+        if ($RevokeSessions) { Invoke-SessionRevokeAfter -Records $recs -Packages $targets }
     }
     'Select'  {
         $catalog = @(Get-Packages -AgentsOnly:$AgentsOnly)
