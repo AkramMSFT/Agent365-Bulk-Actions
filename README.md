@@ -28,6 +28,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Check Conditional Access for agents](#check-conditional-access-for-agents)
   - [Agent users and licenses](#agent-users-and-licenses)
   - [Purview policy hits on agents](#purview-policy-hits-on-agents)
+  - [MCP access and per-agent MCP blocks](#mcp-access-and-per-agent-mcp-blocks)
   - [Policy file](#policy-file)
   - [Snapshots and change reports](#snapshots-and-change-reports)
   - [Graphical console](#graphical-console)
@@ -52,6 +53,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | AI activity | Risky AI activity per agent from the Purview audit log, with per-event detail | `-AiActivity` |
 | Agent users | Which users interacted with which agent in the last 7, 14 or 30 days, and whether each has an Agent 365 or E7 license | `-AgentUsers` |
 | Policy hits | Which Purview policies fired on which agents: DLP rule matches and DLP or Insider Risk alerts over the last 7, 14 or 30 days | `-AgentPolicyHits` |
+| MCP access | Which MCP servers and tools each agent may reach, sets up and calls, and a Conditional Access block for chosen agents and one server | `-McpAccess`, `-BlockMcp`, `-UnblockMcp` |
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk | `-ConfirmCompromised`, `-DismissRisk` |
@@ -108,18 +110,19 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
 | `IdentityRiskyAgent.ReadWrite.All` | Reading an agent identity's Entra risk and confirming it compromised or dismissing the risk. Needs the Security Administrator role. The console asks for it only when you use that action. |
 | `CustomDetection.ReadWrite.All` | Blocking a local AI agent on a device (a Defender custom detection rule) and reading which are blocked. Needs a Defender role that manages custom detections and can remediate files. The console asks for it only when you use that action. |
-| `Policy.Read.All` | Reading Conditional Access policies (`-CheckConditionalAccess`). The console asks for it only when you use that action. |
+| `Policy.Read.All` | Reading Conditional Access policies (`-CheckConditionalAccess`, `-McpAccess`). The console asks for it only when you use that action. |
+| `Policy.ReadWrite.ConditionalAccess` | Blocking an MCP server for chosen agents (`-BlockMcp`, `-UnblockMcp`, the console's MCP access window). Needs the Conditional Access Administrator role. The console asks for it only when you use that action. |
 | `IdentityRiskyAgent.Read.All` | Reading an agent identity's Entra risk without changing it (`-CheckConditionalAccess`). `IdentityRiskyAgent.ReadWrite.All` also satisfies it. |
 | `SecurityAlert.Read.All` | Reading DLP and Insider Risk alerts (`-AgentPolicyHits`). |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
-| `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`). The console shows the same data when these permissions have been consented for your account. |
+| `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`, `-McpAccess`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
 
 ## Safety model
 
 - **Preview first.** `-WhatIf` shows what would happen. `-Action list` shows the matched set without acting.
 - **One confirmation per batch.** Each write mode lists its targets and asks once. `-Force` skips the question. A selection made in a picker counts as confirmation.
-- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners and access scope, removes sponsors or owners the run added, and dismisses a compromised flag the run set.
+- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners and access scope, removes sponsors or owners the run added, dismisses a compromised flag the run set, and puts MCP blocks back the way they were.
 - **Agents already in the target state are skipped.**
 - **Throttling is handled.** HTTP 429 and transient 5xx responses are retried with the service's delay; large reads are batched and writes are paced.
 - **Errors say why.** A failed call shows the service's own error code and message and the request that failed.
@@ -134,6 +137,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | Graph Entra endpoints (agent identities, users, groups, permission grants) | Identity state, owners, sponsors, permissions, managers |
 | Graph beta `/security/rules/detectionRules` | Blocking a local AI agent on a device (a Defender custom detection rule that stops and quarantines its files) |
 | Graph beta `/identityProtection/riskyAgents` | Reading an agent identity's risk, confirming it compromised or dismissing the risk |
+| Graph beta `/identity/conditionalAccess/policies` | Reading Conditional Access policies; creating, updating and deleting this tool's MCP block policies |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
 
 On each run the tool ensures the `Microsoft.Graph.Authentication` module is present, signs in requesting only the permissions the chosen mode needs, reads the catalog, resolves your targets, applies the action and prints an `OK` or `FAIL` line per agent.
@@ -433,6 +437,7 @@ Read-only. For each agent it answers one question: would Microsoft Entra Conditi
 - **Blocked now needs Entra to rate the agent.** Agent risk comes from Entra's own detections or from confirming the agent compromised. Defender alerts do not change it, so a Defender-risky agent that Entra has not flagged is *Protected* but *not blocked now*. Confirming it as compromised (see [Respond to a compromised agent](#respond-to-a-compromised-agent)) raises its risk to High, which the policy then enforces.
 - **Enabled does not mean effective.** An enabled policy whose target resources are *None* never applies; the tool lists these by name.
 - **Agents without an Entra agent identity** (for example declarative agents) cannot be covered by Conditional Access for agents and are listed separately.
+- **MCP blocks are not protection.** A policy that names specific resources, such as one made by `-BlockMcp`, blocks the agent there only, so it is listed but not counted as protection at High risk.
 - **What is not evaluated.** Policies for the on-behalf-of flow (they target users), policies for agent user accounts, and attribute rules. Resources that accept an API key instead of a token are outside Conditional Access.
 - **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
 - **In the console**, tick agents and open **Entra risk > Check Conditional Access...** for the same result in a window, with the policies behind the selected agent below. With nothing ticked it checks every agent that has an Entra identity.
@@ -484,6 +489,41 @@ The **Defender alerts...** button on the main console (and the one in the Policy
 - **What is listed.** An alert is listed when it carries the agent as an entity (Security for AI alerts, for example) or names the Azure AI resource a Foundry agent runs on. An alert naming an agent that Defender's inventory does not list is kept and named as the alert names it.
 - **What is not.** Defender for AI Services alerts about model deployments (jailbreak attempts against a model, LLM reconnaissance) name no agent, so they are not listed; they are in the Defender portal under Incidents and alerts.
 - **Source.** Defender Advanced Hunting (`AlertInfo` and `AlertEvidence`), so about 30 days.
+
+### MCP access and per-agent MCP blocks
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -McpAccess                                              # every agent, last 30 days
+.\Agent365-Bulk-Actions.ps1 -McpAccess -McpDays 7 -Unused                           # permissions with no call in 7 days
+.\Agent365-Bulk-Actions.ps1 -McpAccess -ForAgent "Contoso HR Agent" -OutFile .\mcp.csv
+.\Agent365-Bulk-Actions.ps1 -BlockMcp "Mail" -ForAgent "Contoso HR Agent" -ReportOnly   # report-only first
+.\Agent365-Bulk-Actions.ps1 -BlockMcp "Mail","Teams" -ForAgent "Contoso HR Agent","Northwind Agent" -OutFile .\mcp-block.csv
+.\Agent365-Bulk-Actions.ps1 -UnblockMcp "Mail" -ForAgent "Contoso HR Agent"
+```
+
+Agent 365's Tools registry (**Agents > Tools** in the Microsoft 365 admin center) and its Block switch act on every agent at once and have no public API. `-McpAccess` answers the same questions per agent from three sources the tool can read, and `-BlockMcp` blocks one server for chosen agents with Conditional Access.
+
+| Column | What it shows | Where it comes from |
+| --- | --- | --- |
+| Permission | Whether the agent may call the server | Entra delegated permission grants. Each Microsoft MCP server is its own application with the scope `Tools.ListInvoke.All` (*Own*). Agents set up earlier hold shared scopes, `McpServers.<Name>.All`, on the one *Agent Tools* application (*Shared*). A grant to a blueprint reaches its agent identities only when the blueprint lists the server as inheritable (*Blueprint only* when it does not). |
+| Set up | The MCP servers the agent declares | Defender Advanced Hunting, `AgentsInfo` |
+| Calls | The tool calls the agent made: how many in the period, when, which tools and how (Agent 365 gateway, SDK or Power Platform connector) | Defender Advanced Hunting, `CloudAppEvents` events `ExecuteToolByGateway` and `ExecuteToolBySDK` |
+| Block | Whether a Conditional Access policy that names the server blocks the agent: *Blocked*, *Partly blocked* (its identity or its agent user account only), *Report-only* | Microsoft Entra Conditional Access |
+
+- **Output.** A summary line, a *By server* table (agents with a permission, agents that set it up, agents that called it, calls, blocks) and one row per agent and server with a note such as *Has the permission but no call in 30 days*. `-Unused` lists only permissions with no call in the period, the candidates to remove. `-OutFile` writes every row with the permission detail, the tools called and the block policies.
+- **One name per server.** A server goes by several names, for example `Work IQ Mail MCP`, `McpServers.Mail.All`, `mcp_MailTools` and `a365outlookmailmcp`; the tool counts them as one.
+- **Not only agents.** Without `-ForAgent`, blueprints with no catalog entry and applications that are not agents (the Agent 365 CLI, for example) are listed with their kind when they hold MCP permissions.
+- **Blueprint entries.** A catalog entry that stands for a whole blueprint (an A365 SDK agent registered as a template) has no agent identity of its own. The tool counts the identities made from it under that entry and blocks through the blueprint, which covers all of them.
+
+**Blocking a server for chosen agents.** `-BlockMcp` puts the agents in a Conditional Access policy whose only resource is that server's Entra application, so Entra refuses them a token for it and nothing else changes. Entra does not accept agent identities and agent user accounts in one policy, so the tool keeps one policy for each per server and mode, named `Agent365 Bulk Actions: block MCP server <server> for agent identities` and `... for agent user accounts` (with `(report-only)` in report-only mode), and adds or removes agents in them. A policy left with nobody in it is deleted. Policies made by hand are read, never changed.
+
+- **Report-only first.** With `-ReportOnly` nothing is blocked; Entra's sign-in logs record what would have been. Running `-BlockMcp` again without it moves the agents to the enforced policy.
+- **The shared permission.** An agent that reaches a server only through a shared scope cannot be blocked from that server alone. Block *Agent Tools* (`-BlockMcp "Agent Tools"`), which stops every server the shared permission covers for that agent.
+- **What it does not cover.** An agent acting on behalf of a signed-in person (user policies apply there), Copilot Studio agents (they reach MCP servers through Power Platform connectors: use a Power Platform data policy, or remove the tool from the agent) and agents with no Entra agent identity. The block applies at the agent's next token request; a token already issued stays valid for up to an hour.
+- **Undo.** `-UnblockMcp` removes the block. `-Undo <log>` and **Undo last run** put each agent and server back the way it was: blocked, report-only or not blocked.
+- **Requirements.** To read: `DelegatedPermissionGrant.Read.All`, `Application.Read.All`, `Policy.Read.All`, `AgentIdentity.Read.All`, `User.Read.All`, `ThreatHunting.Read.All` and `CopilotPackages.Read.All`. To block: `Policy.ReadWrite.ConditionalAccess` and the Conditional Access Administrator role. All are part of `-SignIn`. Conditional Access for agents needs Microsoft 365 E7, or Agent 365 with at least Microsoft Entra ID P1. The policy calls are beta.
+- **In the console**, **MCP access...** opens the same view in a window for the ticked agents, or every agent when none is ticked, with a period, a filter (everything, permission but not used, used, blocked or report-only), a search box, export and a detail pane. Select one or more rows and press **Block...**, **Block in report-only...** or **Remove block**; a row that cannot be blocked says why.
+
 ### Policy file
 
 Declare governance rules once, review the plan, then apply it. See [policy.example.json](policy.example.json).
@@ -536,7 +576,7 @@ The report lists agents that are new or removed, newly blocked or unblocked, and
 pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
 
-A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Agent users...**, **Policy hits...**, **Defender alerts...**, **Endpoint AI...**, **Export** and **Undo last run** on top (the window cannot be narrower than 1280 pixels, so this row always fits); **Apply suggested**, **Restrict access...**, **Assign owner...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
+A Windows desktop window over the same catalog. It opens on every agent with no filter applied. The action bar has two rows: selection, **Details...**, **AI activity...**, **Agent users...**, **Policy hits...**, **Defender alerts...**, **Endpoint AI...**, **Export** and **Undo last run** on top (the window cannot be narrower than 1280 pixels, so this row always fits); **Apply suggested**, **Restrict access...**, **Assign owner...**, **Entra risk**, **MCP access...**, **Verify identity state**, **Unblock selected** and **Block selected** below.
 
 | To do this | Use |
 | --- | --- |
@@ -554,7 +594,8 @@ A Windows desktop window over the same catalog. It opens on every agent with no 
 | See which policies fired | **Policy hits...** lists the DLP rule matches and the DLP and Insider Risk alerts that concern each agent over the last 7, 14 or 30 days. It covers the ticked agents, or every agent when none is ticked. |
 | See Defender alerts on agents | **Defender alerts...** lists the Defender alerts that concern the ticked agents, or every agent when none is ticked, over the last 7, 14 or 30 days, with severity filters, a detail pane and **Open in Defender**. |
 | Entra risk | Tick agents and open **Entra risk**: **Confirm as compromised...** sets the risk level of their Entra identities to High, and **Clear the compromised flag...** dismisses the risk again. The console does not wait for Entra to show the new state, which takes a few minutes. **Check Conditional Access...** shows whether a policy blocks each ticked agent (every agent with an Entra identity when none is ticked) at High agent risk, with the policies behind the selected one. |
-| Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition or compromised flag (it dismisses the risk). |
+| Govern MCP servers | **MCP access...** shows which MCP servers each ticked agent (or every agent when none is ticked) may reach, sets up and calls, with the Conditional Access block of each. Select rows and press **Block...**, **Block in report-only...** or **Remove block**. |
+| Undo | **Undo last run** reverses the previous block, unblock, access change, sponsor addition, compromised flag (it dismisses the risk) or MCP block change. |
 | Export | **Export** saves the grid as CSV or JSON. |
 
 Each write action saves a result log under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`.
@@ -572,7 +613,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-Unblock` | names and/or ids | Unblock packages. |
 | `-Select` | switch | Pick agents from a grid or numbered menu, then apply `-Action`. |
 | `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent in a CSV with an `Id` or `DisplayName` column. |
-| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners, compromised flags). |
+| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners, compromised flags, MCP blocks). |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-Risky` | switch | Act on agents with Defender AI-security alerts or detections. |
 | `-Ownerless` | switch | Propose owners for shared agents whose owner is missing. Add `-Action reassign` to apply. |
@@ -590,6 +631,9 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-AiActivity` | switch | Risky AI activity per agent from the Purview audit log. |
 | `-AgentUsers` | switch | Which users interacted with which agent, and whether each has an Agent 365 or E7 license. Read-only. |
 | `-AgentPolicyHits` | switch | Which DLP rules matched and which DLP or Insider Risk alerts were raised on which agent. Read-only. |
+| `-McpAccess` | switch | Which MCP servers each agent may reach, sets up and calls, and whether Conditional Access blocks it. Read-only. |
+| `-BlockMcp` | server names | Block these MCP servers (Mail, Calendar, a BYO server, or Agent Tools for the shared permission) for the agents in `-ForAgent` with Conditional Access. |
+| `-UnblockMcp` | server names | Remove this tool's block of these MCP servers for the agents in `-ForAgent`. |
 | `-DeleteCandidates` | switch | List agents blocked at least `-MinDaysBlocked` days (default 30). Deletes nothing. |
 | `-Policy` | path | Evaluate a JSON policy and print the plan. |
 | `-Snapshot` | path | Save the inventory to a JSON file. |
@@ -628,11 +672,14 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-OwnerOnly` | `-Restrict` | switch | Keep each agent available to its own owner (with `-AvailableTo Some`). |
 | `-IncludeDeployment` | `-Restrict` | switch | Also change who the agent is deployed to. |
 | `-AllAgents` | `-CheckConditionalAccess` | switch | Check every agent in the catalog instead of the risky ones. Not with `-ForAgent`. |
-| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess`, `-AgentUsers`, `-AgentPolicyHits` | names and/or ids | List the individual events of these agents, check these agents instead of the risky ones, or show only the users of these agents. |
+| `-ForAgent` | `-AiActivity`, `-CheckConditionalAccess`, `-AgentUsers`, `-AgentPolicyHits`, `-McpAccess`, `-BlockMcp`, `-UnblockMcp` | names and/or ids | List the individual events of these agents, check these agents instead of the risky ones, show only these agents, or the agents to block or unblock (required with `-BlockMcp` and `-UnblockMcp`). |
 | `-UserDays` | `-AgentUsers` | 7, 14 or 30, default 30 | The period for interactions. |
 | `-Unlicensed` | `-AgentUsers` | switch | Only users who have neither an Agent 365 nor an E7 license. |
 | `-HitDays` | `-AgentPolicyHits` | 7, 14 or 30, default 30 | The period for policy hits. |
 | `-IncludeUnattributed` | `-AgentPolicyHits` | switch | Also list the hits that name only a person, so no agent can be named. |
+| `-McpDays` | `-McpAccess` | 7, 14 or 30, default 30 | The period for calls and for "not used". |
+| `-Unused` | `-McpAccess` | switch | Only permissions with no call in the period. |
+| `-ReportOnly` | `-BlockMcp` | switch | Block in report-only mode: nothing is blocked, and Entra's sign-in logs record what would have been. |
 | `-AiDays` | `-AiActivity` | 1 to 180, default 30 | How far back to search. |
 | `-RiskyOnly` | `-AiActivity`, `-EndpointAi` | switch | Only events with a risk signal, or only tools rated High or Medium. |
 | `-EndpointDays` | `-EndpointAi`, `-BlockLocalAgent` | 1 to 30, default 30 | Days of endpoint telemetry to read. |
@@ -650,10 +697,11 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 - **Agent users counts what the audit trail can attribute.** An interaction appears only when Defender ties it to a user and the event carries an id that maps to a catalog agent. Agents that emit no user-attributed events, and events with no agent id, are not counted. Retention is about 30 days.
 - **Policy hits are evidence, not configuration.** `-AgentPolicyHits` shows what fired. A hit is tied to an agent only through the application id it names or an agent user account; a hit that names only a person stays unattributed, which can be most of them (117 of 121 in the tenant this was built against). Insider Risk alerts and Communication Compliance depend on the policies you have created, and Communication Compliance has no source at all.
+- **MCP access shows what Entra and Defender can see.** Registry status, tool switches and calls older than about 30 days are not shown. A Copilot Studio agent's MCP servers come through Power Platform connectors and carry no Entra permission, so they show as set up and called, never as granted.
 - **E7 is recognised by name or by its Agent 365 plan.** The Learn licensing reference lists no E7 SKU yet, so a user counts as E7-licensed when a SKU name contains E7, and as Agent 365-licensed when a SKU carries the `AGENT_365` plan.
-- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls, the Conditional Access policy read and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
+- **Beta APIs.** Block, unblock, reassign, the Entra agent-identity calls, the Entra agent-risk calls, the Conditional Access policy calls and the Defender custom detection rules used to block a local AI agent target `/beta` and can change without notice. Listing, details and the availability scope use `v1.0`.
 - **Reassigning Copilot Studio agents can fail at the service.** The package reassign call can answer HTTP 424 with "An error occurred while reassigning the agent" or "The agent could not be reassigned in Power Platform". It was observed for every Copilot Studio agent in one tenant, including agents with a valid owner and a reassignment to the current owner, and the Microsoft 365 admin center's Assign new owner failed the same way, so the cause is on the service side. For a support case use the `request-id` and `client-request-id` from the response. Setting the owner in Copilot Studio, or adding a sponsor or owner on the Entra identity, are the alternatives.
-- **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. There is no supported API to list, block or delete MCP servers either (most are readable by id only).
+- **No delete and no clear.** The catalog API cannot delete an agent or clear an owner. The Agent 365 Tools registry (its list of MCP servers, its Block and its tool switches) has no public API either: `-McpAccess` reads permissions, set-up servers and calls instead, and `-BlockMcp` blocks per agent with Conditional Access.
 - **Write calls are delegated-only.** Block, unblock, reassign, restrict and sponsor changes need a signed-in administrator and have no app-only option. A scheduled task can reuse a saved administrator sign-in (create it with `-SignIn`, as the account that runs the task) until it expires; the run then fails with a message to run `-SignIn` again.
 - **Entra applies risk changes with a delay.** Confirming an agent as compromised, or dismissing its risk, shows up a minute or two after Entra accepts it. See [Respond to a compromised agent](#respond-to-a-compromised-agent).
 - **Retention.** Advanced Hunting keeps about 30 days. The Purview audit log keeps what your licence allows (180 days or one year).
@@ -679,6 +727,8 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | Agent users says license details could not be read | The signed-in account needs an Entra role that can read license details (License Administrator, User Administrator, Global Reader). |
 | Policy hits ties nothing to an agent | Many DLP events name the person who typed the prompt, not the agent. Run with `-IncludeUnattributed` to see them with the application id they carry. A per-agent policy ties its hits to the agent; a tenant-wide one cannot. |
 | Policy hits shows no Insider Risk alert | No Insider Risk policy raised one in the period, or none exists. Insider Risk alerts come from the Graph alerts API (source `microsoftInsiderRiskManagement`); the Risky agents risk levels are visible only in the Purview portal. |
+| Blocking an MCP server is refused | Grant `Policy.ReadWrite.ConditionalAccess` (run `-SignIn` again) and hold the Conditional Access Administrator role. Conditional Access for agents also needs Microsoft 365 E7, or Agent 365 with Microsoft Entra ID P1. |
+| An agent still reaches an MCP server after a block | A token issued before the block stays valid for up to an hour. Check that the block is not report-only, that the agent does not reach the server through the shared permission (block *Agent Tools*), and that it is not acting on behalf of a signed-in person or running in Copilot Studio, which Conditional Access for agents does not cover. |
 | Adding a sponsor is refused | Add an owner instead (`-AsOwner`) or use the Entra admin center; the Agent ID Administrator role is required either way. |
 
 ## Appendix: hunting queries

@@ -2847,3 +2847,253 @@ Describe 'Policy hits: clarity and Defender alerts' {
         ($g | Where-Object Item -eq 'In the inventory').Info | Should -BeLike 'No:*'
     }
 }
+
+Describe 'MCP access' {
+    BeforeAll {
+        $script:mail = 'app-mail'; $script:teams = 'app-teams'
+        function New-McpScenario {
+            param([switch]$IncludeOthers)
+            $now = Get-Date
+            $pk = @(
+                [pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = 'id-a'; platform = 'Not Available'; manifestId = $null; elementTypes = @('AgentMetadatas') },
+                [pscustomobject]@{ id = 'P_C'; displayName = 'Studio'; agentIdentityId = 'id-c'; platform = 'Copilot Studio'; manifestId = $null; elementTypes = @() },
+                [pscustomobject]@{ id = 'T_B'; displayName = 'Beta Blueprint'; agentIdentityId = $null; platform = 'Not Available'; manifestId = 'bp-b'; elementTypes = @('AgenticUserTemplates') })
+            $ids = @{ 'id-a' = [pscustomobject]@{ AppId = 'app-a'; Blueprint = 'bp-a'; Principal = 'bpsp-a' }; 'id-c' = [pscustomobject]@{ AppId = 'app-c'; Blueprint = ''; Principal = '' } }
+            $bps = @{ 'T_B' = [pscustomobject]@{ AppId = 'bp-b'; Principal = 'bpsp-b'; Identities = @('id-b1') } }
+            $users = @{ 'id-a' = @('u-a'); 'id-b1' = @('u-b1') }
+            $clients = @{
+                'bpsp-a' = [pscustomobject]@{ Id = 'bpsp-a'; Name = 'Alpha Blueprint'; AppId = 'bp-a'; Type = 'blueprint' }
+                'bpsp-b' = [pscustomobject]@{ Id = 'bpsp-b'; Name = 'Beta Blueprint'; AppId = 'bp-b'; Type = 'blueprint' }
+                'bpsp-x' = [pscustomobject]@{ Id = 'bpsp-x'; Name = 'Lonely Blueprint'; AppId = 'bp-x'; Type = 'blueprint' }
+                'cli'    = [pscustomobject]@{ Id = 'cli'; Name = 'Some CLI'; AppId = 'app-cli'; Type = 'app' }
+            }
+            $g = { param($c, $app, $name, [string[]]$s, $consent = 'AllPrincipals') [pscustomobject]@{ ClientId = $c; ResourceAppId = $app; ResourceName = $name; Scopes = $s; Consent = $consent } }
+            $grants = @(
+                (& $g 'bpsp-a' $script:mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')),
+                (& $g 'bpsp-a' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Calendar.All')),
+                (& $g 'bpsp-a' $script:teams 'Work IQ Teams MCP' @('Tools.ListInvoke.All')),
+                (& $g 'bpsp-b' $script:mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')),
+                (& $g 'cli' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Mail.All') 'Principal'),
+                (& $g 'bpsp-x' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Excel.All')))
+            $inherit = @{
+                'bp-a' = @(@{ resourceAppId = $script:mail; inheritableScopes = @{ kind = 'allAllowed' } }, @{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'enumerated'; scopes = @('McpServers.Calendar.All') } })
+                'bp-b' = @(@{ resourceAppId = $script:mail; inheritableScopes = @{ kind = 'allAllowed' } })
+            }
+            $declared = @([pscustomobject]@{ CatalogId = 'p_c'; Agent = 'Studio'; Platform = 'Copilot Studio'; Server = 'Work IQ Mail (Preview)'; Endpoint = '' },
+                          [pscustomobject]@{ CatalogId = 'p_a'; Agent = 'Alpha'; Platform = 'Other'; Server = 'Work IQ Word (Preview)'; Endpoint = '' })
+            $u = { param($agent, $server, $calls, $c7, $c14, $connects, $daysAgo, [string[]]$tools, [string]$via, $bp = '')
+                   [pscustomobject]@{ AgentId = $agent; PlatformAgentId = ''; BlueprintId = $bp; AgentName = ''; Server = $server; Calls = $calls; Calls7 = $c7; Calls14 = $c14; Connects = $connects; Errors = 0
+                                      Last = $now.AddDays(-$daysAgo).ToString('o'); LastCall = $(if ($calls) { $now.AddDays(-$daysAgo).ToString('o') }); Tools = $tools; Via = @($via) } }
+            $usage = @((& $u 'id-a' 'mcp_MailTools' 4 1 2 0 1 @('SendEmail') 'Agent 365 gateway'),
+                       (& $u 'bot-c' 'a365outlookmailmcp' 0 0 0 2 2 @() 'Power Platform connector'),
+                       (& $u 'id-b1' 'mcp_MailTools' 1 0 1 0 10 @('CreateDraft') 'Agent 365 gateway' 'bp-b'))
+            $apps = @{ mail = [pscustomobject]@{ AppId = $script:mail; Name = 'Work IQ Mail MCP' }; teams = [pscustomobject]@{ AppId = $script:teams; Name = 'Work IQ Teams MCP' }
+                       agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } }
+            New-McpAccessRows -Packages $pk -IdentityIds $ids -AgentUsers $users -Grants $grants -Clients $clients -Inherit $inherit -Declared $declared -Usage $usage `
+                -KeyMap @{ 'bot-c' = @('p_c') } -ServerApps $apps -Blueprints $bps -IncludeOthers:$IncludeOthers
+        }
+        function Get-Row { param($Built, $Agent, $Key) @($Built.Rows | Where-Object { $_.Agent -eq $Agent -and $_.ServerKey -eq $Key })[0] }
+        function New-RawMcpPolicy {
+            param([string]$Name, [string]$State = 'enabled', [string]$App = 'app-mail', [string[]]$Identities = @(), [string[]]$Users = @('None'), [string[]]$Risk = @())
+            @{ id = "id-$Name"; displayName = $Name; state = $State; grantControls = @{ builtInControls = @('block') }
+               conditions = @{ agentIdRiskLevels = $Risk; users = @{ includeUsers = $Users; excludeUsers = @() }; applications = @{ includeApplications = @($App); excludeApplications = @() }
+                               clientApplications = $(if ($Identities.Count) { @{ includeAgentIdServicePrincipals = $Identities } } else { $null }) } }
+        }
+        function New-McpItem { param([string]$Target = 'On', [string[]]$Users = @('u-a')) [pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = $Users; Server = 'Work IQ Mail MCP'; ResourceAppId = 'app-mail'; ResourceName = 'Work IQ Mail MCP'; Target = $Target } }
+    }
+
+    It 'gives one key to every name a server goes by' {
+        foreach ($n in 'Work IQ Mail MCP', 'McpServers.Mail.All', 'mcp_MailTools', 'a365outlookmailmcp', 'Work IQ Mail (Preview)', 'WorkIQMail', 'Microsoft Outlook Mail MCP') { ConvertTo-McpServerKey $n | Should -Be 'mail' -Because $n }
+        foreach ($n in 'McpServers.CopilotMCP.All', 'a365copilotchatmcp', 'mcp_M365Copilot', 'Work IQ Copilot MCP') { ConvertTo-McpServerKey $n | Should -Be 'copilot' -Because $n }
+        foreach ($n in 'a365memcp', 'Work IQ User (Preview)', 'McpServers.Me.All', 'mcp_MeServer') { ConvertTo-McpServerKey $n | Should -Be 'me' -Because $n }
+        ConvertTo-McpServerKey 'Work IQ Calendar MCP Connector' | Should -Be 'calendar'
+        ConvertTo-McpServerKey 'McpServers.M365Admin.All' | Should -Be 'admin'
+        ConvertTo-McpServerKey 'mcp_ODSPRemoteServer' | Should -Be 'onedrivesharepoint'
+        ConvertTo-McpServerKey 'McpServers.OneDriveSharepoint.All' | Should -Be 'onedrivesharepoint'
+        ConvertTo-McpServerKey 'JokesMCPServer' | Should -Be 'jokes'
+        ConvertTo-McpServerKey 'ext_Learn1 - BYO' | Should -Be 'extlearn1'
+        ConvertTo-McpServerKey 'MCP' | Should -Be 'mcp'
+    }
+    It 'keeps only the MCP scopes of a grant, not the metadata scope' {
+        Get-McpScopes 'openid McpServersMetadata.Read.All McpServers.Mail.All Tools.ListInvoke.All User.Read' | Should -Be @('McpServers.Mail.All', 'Tools.ListInvoke.All')
+        @(Get-McpScopes 'User.Read McpServersMetadata.Read.All').Count | Should -Be 0
+    }
+    It 'knows whether a blueprint passes a scope on to its agent identities' {
+        $inh = @(@{ resourceAppId = 'app-1'; inheritableScopes = @{ kind = 'allAllowed' } }, @{ resourceAppId = 'app-2'; inheritableScopes = @{ kind = 'enumerated'; scopes = @('A.All') } }, @{ resourceAppId = 'app-3'; inheritableScopes = @{ kind = 'none' } })
+        Test-McpInherited -Inherit $inh -ResourceAppId 'APP-1' -Scope 'Any' | Should -BeTrue
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-2' -Scope 'A.All' | Should -BeTrue
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-2' -Scope 'B.All' | Should -BeFalse
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-3' -Scope 'Any' | Should -BeFalse
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-4' -Scope 'Any' | Should -BeFalse
+        Test-McpInherited -Inherit $null -ResourceAppId 'app-1' -Scope 'Any' | Should -BeFalse
+    }
+    It 'joins permissions, set-up servers and calls into one row per agent and server' {
+        $b = New-McpScenario
+        $m = Get-Row $b 'Alpha' 'mail'
+        $m.Permission | Should -Be 'Own'; $m.Granted | Should -BeTrue; $m.Calls30 | Should -Be 4; $m.Calls7 | Should -Be 1; $m.Tools | Should -Be 'SendEmail'; $m.Via | Should -Be 'Agent 365 gateway'
+        $m.ResourceAppId | Should -Be 'app-mail'; $m.Server | Should -Be 'Work IQ Mail MCP'; $m.CanBlock | Should -Be ''
+        $m.CaKeys | Should -Be @('id-a', 'bpsp-a'); $m.AgentUserIds | Should -Be @('u-a'); $m.PermParts[0] | Should -BeLike 'Blueprint: Tools.ListInvoke.All on Work IQ Mail MCP (inherited)'
+        $c = Get-Row $b 'Alpha' 'calendar'
+        $c.Permission | Should -Be 'Shared'; $c.Granted | Should -BeTrue; $c.Server | Should -Be 'Calendar'; $c.CanBlock | Should -BeLike '*only through the shared permission*'
+        $t = Get-Row $b 'Alpha' 'teams'
+        $t.Permission | Should -Be 'Blueprint only'; $t.Granted | Should -BeFalse; $t.PermParts[0] | Should -BeLike '*not inherited*'
+        $s = Get-Row $b 'Alpha' 'agenttools'
+        $s.Server | Should -Be 'Agent Tools (shared permission)'; $s.Covers | Should -Be 'Calendar'; $s.ResourceAppId | Should -Be $script:AgentToolsAppId; $s.CanBlock | Should -Be ''
+        $w = Get-Row $b 'Alpha' 'word'
+        $w.Declared | Should -BeTrue; $w.Permission | Should -Be 'None found'
+    }
+    It 'counts a blueprint package and the identities made from it, and targets the blueprint principal' {
+        $r = Get-Row (New-McpScenario) 'Beta Blueprint' 'mail'
+        $r.Kind | Should -Be 'Agent'; $r.Platform | Should -Be 'A365 SDK blueprint'; $r.IdentityKind | Should -Be 'Blueprint'
+        $r.IdentityId | Should -Be 'bpsp-b'; $r.CaKeys | Should -Be @('bpsp-b'); $r.AgentUserIds | Should -Be @('u-b1')
+        $r.Granted | Should -BeTrue; $r.Calls30 | Should -Be 1; $r.CanBlock | Should -Be ''
+    }
+    It 'refuses Copilot Studio connectors, apps and blueprints that are not catalog agents, with the reason' {
+        $s = Get-Row (New-McpScenario) 'Studio' 'mail'
+        $s.Declared | Should -BeTrue; $s.Connects | Should -Be 2; $s.Calls30 | Should -Be 0; $s.CanBlock | Should -BeLike '*Power Platform connector*'
+        $o = New-McpScenario -IncludeOthers
+        $cli = Get-Row $o 'Some CLI' 'mail'
+        $cli.Kind | Should -Be 'App, not an agent'; $cli.CanBlock | Should -BeLike 'An application*'; $cli.PermParts[0] | Should -BeLike '*for one user*'
+        (Get-Row $o 'Lonely Blueprint' 'excel').Kind | Should -Be 'Blueprint, not in the catalog'
+        @((New-McpScenario).Rows | Where-Object { $_.Kind -ne 'Agent' }).Count | Should -Be 0
+    }
+    It 'filters a period: permissions not used, servers used, and blocked ones, with a note on each' {
+        $rows = @((New-McpScenario).Rows)
+        $unused = @(Select-McpAccessRows -Rows $rows -Days 30 -Show Unused | ForEach-Object { "$($_.Agent)|$($_.ServerKey)" })
+        $unused | Should -Contain 'Alpha|calendar'; $unused | Should -Not -Contain 'Alpha|mail'; $unused | Should -Not -Contain 'Alpha|teams'
+        $used7 = @(Select-McpAccessRows -Rows $rows -Days 7 -Show Used | ForEach-Object { "$($_.Agent)|$($_.ServerKey)" })
+        $used7 | Should -Contain 'Alpha|mail'; $used7 | Should -Contain 'Studio|mail'; $used7 | Should -Not -Contain 'Beta Blueprint|mail'
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Alpha' 'mail').Calls | Should -Be 1
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Studio' 'mail').Note | Should -BeLike '*Connected but called no tool*Power Platform connector*'
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Alpha' 'teams').Note | Should -BeLike '*does not pass it to the agent*'
+        @(Select-McpAccessRows -Rows $rows -Show Blocked).Count | Should -Be 0
+        @(Select-McpAccessRows -Rows $rows -Text 'TEAMS').Count | Should -Be 1
+        $s = Get-McpAccessSummary -Rows @(Select-McpAccessRows -Rows $rows -Days 30) -Days 30
+        $s.Agents | Should -Be 3; $s.Granted | Should -Be 3; $s.GrantedUsed | Should -Be 2; $s.Unused | Should -Be 1; $s.Connectors | Should -Be 1
+    }
+    It 'reads whether Conditional Access blocks an agent from a server, for its identity and its agent user accounts' {
+        $idOn = New-RawMcpPolicy -Name 'ids on' -Identities @('BPSP-A')
+        $usersReport = New-RawMcpPolicy -Name 'users report' -State 'enabledForReportingButNotEnforced' -Users @('u-a')
+        $usersOn = New-RawMcpPolicy -Name 'users on' -Users @('AllAgentIdUsers')
+        $state = { param($p, [string[]]$users = @('u-a')) Get-McpBlockState -Policies $p -AppId 'app-mail' -IdentityKeys @('id-a', 'bpsp-a') -AgentUserIds $users }
+        $s = & $state @($idOn, $usersReport)
+        $s.Kind | Should -Be 'Partly blocked'; $s.Identity | Should -Be 'On'; $s.Users | Should -Be 'Report-only'; $s.Policies.Count | Should -Be 2
+        (& $state @($idOn, $usersOn)).Kind | Should -Be 'Blocked'
+        (& $state @($idOn) @()).Kind | Should -Be 'Blocked'
+        (& $state @($usersReport)).Kind | Should -Be 'Report-only'
+        (& $state @((New-RawMcpPolicy -Name 'risk' -Identities @('id-a') -Risk @('high')), (New-RawMcpPolicy -Name 'other app' -App 'app-x' -Identities @('id-a')), (New-RawMcpPolicy -Name 'off' -State 'disabled' -Identities @('id-a')))).Kind | Should -Be ''
+        (& $state @($idOn) @('u-a', 'u-b')).Kind | Should -Be 'Partly blocked'
+    }
+    It 'builds the policy body for agent identities and for agent user accounts' {
+        $i = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Identities -Ids @('id-a') -Mode 'Report-only'
+        $i.displayName | Should -Be 'Agent365 Bulk Actions: block MCP server Work IQ Mail MCP for agent identities (report-only)'
+        $i.state | Should -Be 'enabledForReportingButNotEnforced'; $i.conditions.users.includeUsers | Should -Be @('None')
+        $i.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-a'); $i.conditions.applications.includeApplications | Should -Be @('app-mail')
+        $i.grantControls.builtInControls | Should -Be @('block')
+        $u = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Users -Ids @('u-a') -Mode On
+        $u.displayName | Should -Be 'Agent365 Bulk Actions: block MCP server Work IQ Mail MCP for agent user accounts'; $u.state | Should -Be 'enabled'
+        $u.conditions.Contains('clientApplications') | Should -BeFalse; $u.conditions.users.includeUsers | Should -Be @('u-a')
+        (New-McpBlockPolicyBody -AppId 'a' -ResourceName 'n' -Subject Users -Ids @('u') -Mode On -ConditionsOnly).Keys | Should -Be @('conditions')
+        $raw = @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent user accounts') -Users @('u-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a')))
+        (Find-McpBlockPolicy -Policies $raw -AppId 'APP-MAIL' -Subject Identities -Mode On).displayName | Should -BeLike '*identities'
+        (Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Users -Mode On).displayName | Should -BeLike '*user accounts'
+        Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Identities -Mode 'Report-only' | Should -BeNullOrEmpty
+    }
+    Context 'writing the block policies' {
+        BeforeEach {
+            Mock Write-Host { }
+            Mock Export-ActionLog { }
+            Mock Test-Proceed { $true }
+            $script:writes = @()
+            Mock Invoke-Graph { $script:writes += , [pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($Body) { $Body | ConvertFrom-Json }) }; if ($Method -eq 'POST') { @{ id = 'new'; displayName = ($Body | ConvertFrom-Json).displayName } } }
+        }
+        It 'creates one policy for the identity and one for its agent user accounts' {
+            Mock Get-CaPoliciesRaw { @() }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'blockmcp'; $r[0].Mode | Should -Be 'On'; $r[0].WasMode | Should -Be ''; $r[0].AgentUserIds | Should -Be 'u-a'
+            $r[0].Policies | Should -BeLike '*for agent identities*for agent user accounts*'
+            @($script:writes | Where-Object Method -eq 'POST').Count | Should -Be 2
+            ($script:writes | Where-Object { $_.Body.displayName -like '*identities' }).Body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-a')
+            ($script:writes | Where-Object { $_.Body.displayName -like '*user accounts' }).Body.conditions.users.includeUsers | Should -Be @('u-a')
+        }
+        It 'moves an agent from report-only to on, keeping the other agents and deleting a policy left empty' {
+            Mock Get-CaPoliciesRaw { @(
+                (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'Work IQ Mail MCP for agent identities (report-only)') -State 'enabledForReportingButNotEnforced' -Identities @('id-a', 'id-z')),
+                (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'Work IQ Mail MCP for agent user accounts (report-only)') -State 'enabledForReportingButNotEnforced' -Users @('u-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].WasMode | Should -Be 'Report-only'
+            @($script:writes | Where-Object Method -eq 'POST').Count | Should -Be 2
+            $patch = @($script:writes | Where-Object Method -eq 'PATCH')
+            $patch.Count | Should -Be 1; $patch[0].Body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-z')
+            @($script:writes | Where-Object Method -eq 'DELETE').Count | Should -Be 1
+        }
+        It 'skips an agent already blocked in that mode and writes nothing' {
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent identities') -Identities @('ID-A')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent user accounts') -Users @('u-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Skipped'; $r[0].Error | Should -Be 'Already blocked.'
+            $script:writes.Count | Should -Be 0
+        }
+        It 'removes a block by deleting a policy that no longer names anyone, and leaves policies made by hand alone' {
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem -Target '' -Users @()) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'unblockmcp'; $r[0].Mode | Should -Be 'Removed'; $r[0].WasMode | Should -Be 'On'
+            $script:writes.Count | Should -Be 1; $script:writes[0].Method | Should -Be 'DELETE'; $script:writes[0].Uri | Should -BeLike '*/id-Agent365 Bulk Actions*'
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a'))) }
+            $script:writes = @()
+            (@(Invoke-McpBlockChange -Items @(New-McpItem -Target '' -Users @()) -PassThru))[0].Error | Should -BeLike 'Not in a block policy made by this tool*'
+            $script:writes.Count | Should -Be 0
+        }
+        It 'records a refusal with the permission and role it needs, and changes nothing under -WhatIf' {
+            Mock Get-CaPoliciesRaw { @() }
+            Mock Invoke-Graph { throw 'Forbidden' }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Failed'; $r[0].Error | Should -BeLike '*Policy.ReadWrite.ConditionalAccess*Conditional Access Administrator*'
+            Mock Test-Proceed { $false }
+            (@(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru))[0].Result | Should -Be 'WhatIf'
+        }
+        It 'skips an item with no identity or no application for the server' {
+            Mock Get-CaPoliciesRaw { @() }
+            $it = New-McpItem; $it.ResourceAppId = ''
+            (@(Invoke-McpBlockChange -Items @($it) -PassThru))[0].Result | Should -Be 'Skipped'
+            $script:writes.Count | Should -Be 0
+        }
+    }
+    It 'turns a log back into the changes that undo it' {
+        $log = @([pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a;u-b'; Server = 'Work IQ Mail MCP'; ResourceAppId = 'app-mail'; ResourceName = 'Work IQ Mail MCP'; Mode = 'On'; WasMode = 'Report-only' },
+                 [pscustomobject]@{ Result = 'Done'; Action = 'unblockmcp'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = ''; Server = 'Agent Tools'; ResourceAppId = 'x'; ResourceName = 'Agent Tools'; Mode = 'Removed'; WasMode = 'On' },
+                 [pscustomobject]@{ Result = 'Failed'; Action = 'blockmcp'; Agent = 'Beta' })
+        $u = @(ConvertTo-McpUndoItems $log)
+        $u.Count | Should -Be 2
+        $u[0].Target | Should -Be 'Report-only'; $u[0].AgentUserIds | Should -Be @('u-a', 'u-b')
+        $u[1].Target | Should -Be 'On'; @($u[1].AgentUserIds).Count | Should -Be 0
+    }
+    It 'prepares a block for a server the agent has not used yet' {
+        $b = New-McpScenario
+        $report = [pscustomobject]@{ Rows = $b.Rows; Agents = $b.Agents; Policies = @()
+                                     ServerApps = @{ teams = [pscustomobject]@{ AppId = 'app-teams'; Name = 'Work IQ Teams MCP' }; agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } } }
+        $pk = @([pscustomobject]@{ id = 'P_C'; displayName = 'Studio' })
+        $r = @(Resolve-McpBlockRows -Report $report -Packages $pk -Servers @('Teams', 'Agent Tools', 'Nowhere'))
+        $r.Count | Should -Be 3
+        $r[0].ResourceAppId | Should -Be 'app-teams'; $r[0].Server | Should -Be 'Work IQ Teams MCP'
+        $r[1].ServerKey | Should -Be 'agenttools'
+        $r[2].CanBlock | Should -Not -BeNullOrEmpty
+        $r[0].CanBlock | Should -BeLike '*Power Platform*'
+    }
+    It 'explains a row in the detail pane' {
+        $d = @(Get-McpAccessDetailRows (Get-Row (New-McpScenario) 'Beta Blueprint' 'mail'))
+        ($d | Where-Object Item -eq 'Blueprint principal').Info | Should -BeLike 'bpsp-b (a block on it covers every agent identity*'
+        ($d | Where-Object Item -eq 'Entra application').Info | Should -Be 'Work IQ Mail MCP (app-mail)'
+        ($d | Where-Object Item -eq 'Can this tool block it').Info | Should -BeLike 'Yes:*'
+    }
+}
+
+Describe 'Conditional Access check ignores MCP blocks' {
+    It 'does not count a policy that names specific resources as protection at High' {
+        $raw = @{ id = 'id-mcp'; displayName = 'Block Mail MCP'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }
+                  conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('agent-1') }; agentIdRiskLevels = @(); users = @{ includeUsers = @('None') }
+                                  applications = @{ includeApplications = @('16b1878d-62c7-4009-aa25-68989d63bbad'); excludeApplications = @() } } }
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies @(ConvertTo-AgentCaPolicy $raw) -RiskLevel 'high'
+        $c.Kind | Should -Be 'Unprotected'; $c.Policies[0].Partial | Should -BeTrue
+        (@(Get-AgentCaDetailRows $c) | Where-Object Item -eq 'Block Mail MCP').Info | Should -BeLike '*specific resources*not counted as protection*'
+    }
+}

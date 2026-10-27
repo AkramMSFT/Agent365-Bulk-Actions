@@ -13,6 +13,7 @@
     POST  /beta/identityProtection/riskyAgents/confirmCompromised   mark an agent identity compromised (and /dismiss)
     POST  /beta/security/rules/detectionRules                  block a local AI agent on one device (Defender custom detection rule)
     GET   /beta/identity/conditionalAccess/policies            which Conditional Access policies protect an agent
+    POST  /beta/identity/conditionalAccess/policies            block an MCP server for chosen agents (and PATCH, DELETE)
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
 
@@ -75,6 +76,14 @@
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -AgentPolicyHits -HitDays 14
   Which DLP rules matched and which DLP or Insider Risk alerts were raised on which agent in the last 7, 14 or 30 days. -ForAgent <name> limits it; -IncludeUnattributed also lists hits that name only a person.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -McpAccess -McpDays 14
+  Which agent may reach, sets up and calls which MCP server, and whether Conditional Access blocks it. -Unused lists only permissions with no call in the period.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -BlockMcp "Mail" -ForAgent "Java Demo Agent" -ReportOnly
+  Block one MCP server for chosen agents with a Conditional Access policy, in report-only mode first. -UnblockMcp or -Undo <log> removes it.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockLocalAgent "Ollama" -ForDevice "lab-pc-01"
@@ -154,7 +163,10 @@ param(
     [Parameter(ParameterSetName = 'CaCheck')]
     [Parameter(ParameterSetName = 'AgentUsers')]
     [Parameter(ParameterSetName = 'PolicyHits')]
-    [string[]]$ForAgent,                    # AI activity: show the individual events of these agents. Conditional Access check: check these agents (names or ids) instead of every risky one. Agent users: only these agents
+    [Parameter(ParameterSetName = 'McpAccess')]
+    [Parameter(ParameterSetName = 'BlockMcp', Mandatory)]
+    [Parameter(ParameterSetName = 'UnblockMcp', Mandatory)]
+    [string[]]$ForAgent,                    # AI activity: show the individual events of these agents. Conditional Access check: check these agents (names or ids) instead of every risky one. Agent users, policy hits, MCP access: only these agents. BlockMcp, UnblockMcp: the agents to change
 
     [Parameter(ParameterSetName = 'AiActivity')]
     [ValidateRange(1, 180)]
@@ -350,6 +362,25 @@ param(
     [Parameter(ParameterSetName = 'UnblockLocalAgent', Mandatory)]
     [string[]]$UnblockLocalAgent,           # remove the block rule of these local AI agents (names, wildcards allowed) on the devices in -ForDevice
 
+    [Parameter(ParameterSetName = 'McpAccess', Mandatory)]
+    [switch]$McpAccess,                     # which agent may reach, sets up and calls which MCP server, and whether Conditional Access blocks it
+
+    [Parameter(ParameterSetName = 'McpAccess')]
+    [ValidateSet(7, 14, 30)]
+    [int]$McpDays = 30,                     # MCP access: the period in days for calls (Defender keeps about 30)
+
+    [Parameter(ParameterSetName = 'McpAccess')]
+    [switch]$Unused,                        # MCP access: only permissions with no call in the period
+
+    [Parameter(ParameterSetName = 'BlockMcp', Mandatory)]
+    [string[]]$BlockMcp,                    # block these MCP servers (Mail, Calendar, a BYO server, or Agent Tools for the shared permission) for the agents in -ForAgent
+
+    [Parameter(ParameterSetName = 'UnblockMcp', Mandatory)]
+    [string[]]$UnblockMcp,                  # remove this tool's block of these MCP servers for the agents in -ForAgent
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [switch]$ReportOnly,                    # BlockMcp: report-only mode, which blocks nothing and logs what it would have blocked
+
     [Parameter(ParameterSetName = 'SignIn', Mandatory)]
     [switch]$SignIn,                          # sign in once from a terminal with every permission the tool can use; later runs reuse the saved session
 
@@ -387,7 +418,8 @@ if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -Error
 # Every permission the tool can use. -SignIn asks for all of them once, so no later mode has to prompt.
 $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
-                      'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All')
+                      'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All',
+                      'Policy.ReadWrite.ConditionalAccess')
 
 # A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
@@ -517,6 +549,9 @@ if ($PSCmdlet.ParameterSetName -eq 'UnblockLocalAgent') { $scopes = @('CustomDet
 if ($PSCmdlet.ParameterSetName -eq 'CaCheck') { $scopes = @('CopilotPackages.Read.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'ThreatHunting.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blocklocalagent')) { $scopes += 'CustomDetection.ReadWrite.All' }
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
+if ($PSCmdlet.ParameterSetName -eq 'McpAccess') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All') }
+if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess') }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess' }
 if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
@@ -1934,14 +1969,7 @@ function ConvertTo-AgentCaPolicy {
 }
 
 function Get-AgentCaPolicies {
-    $out = New-Object 'System.Collections.Generic.List[object]'
-    $uri = $script:CaPolicyBase
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($r in @($page.value)) { $out.Add((ConvertTo-AgentCaPolicy $r)) }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
-    $out.ToArray()
+    @(Get-CaPoliciesRaw | ForEach-Object { ConvertTo-AgentCaPolicy $_ })
 }
 
 # Is this agent among the agents the policy targets? Ids holds every id the agent can be known by: its identity, its app id, its
@@ -1972,20 +2000,21 @@ function Get-AgentCaCoverage {
         if ($t.Result -eq 'No') { continue }
         $enforced = $p.State -eq 'enabled'
         $reportOnly = $p.State -eq 'enabledForReportingButNotEnforced'
-        $live = $enforced -and $p.Blocks -and $p.ResourceScope -ne 'None'
+        # A policy that names specific resources (an MCP server block, say) blocks the agent there only, so it is not protection.
+        $live = $enforced -and $p.Blocks -and $p.ResourceScope -notin 'None', 'Specific resources'
         $rows.Add([pscustomobject]@{
             Policy = $p.Name; State = $p.State; Applies = $t.Result; Why = $t.Why; Blocks = $p.Blocks
             RiskLevels = $(if ($p.RiskLevels.Count) { $p.RiskLevels -join ', ' } else { 'any risk level' }); Resources = $p.ResourceScope
             AtHigh = [bool](-not $p.RiskLevels.Count -or $p.RiskLevels -contains 'high')
             AtCurrent = [bool](-not $p.RiskLevels.Count -or $p.RiskLevels -contains $level)
-            Enforced = $enforced; ReportOnly = $reportOnly; NoEffect = [bool]($enforced -and $p.Blocks -and $p.ResourceScope -eq 'None'); Live = $live
+            Enforced = $enforced; ReportOnly = $reportOnly; NoEffect = [bool]($enforced -and $p.Blocks -and $p.ResourceScope -eq 'None'); Live = $live; Partial = [bool]($p.ResourceScope -eq 'Specific resources')
         })
     }
     $names = { param($set) (@($set | ForEach-Object { $_.Policy }) -join '; ') }
     $yes = @($rows | Where-Object { $_.Applies -eq 'Yes' })
     $blocksHigh = @($yes | Where-Object { $_.Live -and $_.AtHigh })
     $blocksNow = @($yes | Where-Object { $_.Live -and $_.AtCurrent -and ($level -ne 'none' -or $_.RiskLevels -eq 'any risk level') })
-    $reportHigh = @($yes | Where-Object { $_.ReportOnly -and $_.Blocks -and $_.AtHigh -and $_.Resources -ne 'None' })
+    $reportHigh = @($yes | Where-Object { $_.ReportOnly -and $_.Blocks -and $_.AtHigh -and $_.Resources -notin 'None', 'Specific resources' })
     $noEffect = @($yes | Where-Object { $_.NoEffect -and $_.AtHigh })
     $maybe = @($rows | Where-Object { $_.Applies -eq 'Maybe' -and $_.Live -and $_.AtHigh })
     if ($blocksHigh.Count) {
@@ -2071,7 +2100,7 @@ function Get-AgentCaCovering {
     param([object]$Row)
     $match = switch ($Row.Kind) {
         'Protected'   { { $_.Applies -eq 'Yes' -and $_.Live -and $_.AtHigh } }
-        'Report-only' { { $_.Applies -eq 'Yes' -and $_.ReportOnly -and $_.Blocks -and $_.AtHigh -and $_.Resources -ne 'None' } }
+        'Report-only' { { $_.Applies -eq 'Yes' -and $_.ReportOnly -and $_.Blocks -and $_.AtHigh -and $_.Resources -notin 'None', 'Specific resources' } }
         'No effect'   { { $_.Applies -eq 'Yes' -and $_.NoEffect -and $_.AtHigh } }
         'Possible'    { { $_.Applies -eq 'Maybe' -and $_.Live -and $_.AtHigh } }
         default       { $null }
@@ -2097,7 +2126,7 @@ function Get-AgentCaDetailRows {
     & $add 'Agent' 'Entra risk now' $Row.EntraRisk
     foreach ($p in @($Row.Policies | Sort-Object @{ e = { -[int]$_.Live } }, Policy)) {
         $state = switch ($p.State) { 'enabled' { 'On' } 'enabledForReportingButNotEnforced' { 'Report-only' } 'disabled' { 'Off' } default { $p.State } }
-        $note = if ($p.NoEffect) { ' It protects no resources, so it never applies.' } else { '' }
+        $note = if ($p.NoEffect) { ' It protects no resources, so it never applies.' } elseif ($p.Partial) { ' It names specific resources (an MCP server block, for example), so it blocks the agent there only and is not counted as protection.' } else { '' }
         & $add 'Policies' $p.Policy ("{0}. Applies: {1} ({2}) Risk levels: {3}. Protects: {4}. Action: {5}.{6}" -f $state, $p.Applies, $p.Why, $p.RiskLevels, $p.Resources, $(if ($p.Blocks) { 'block' } else { 'not a block' }), $note)
     }
     if (-not @($Row.Policies).Count) { & $add 'Policies' '(none)' 'No Conditional Access policy targets this agent.' }
@@ -2677,6 +2706,745 @@ function Get-AgentAlertDetailRows {
     & $add 'Agent' 'In the inventory' $(if ($Row.InInventory) { 'Yes' } else { 'No: Defender''s agent inventory does not list this agent, so it is named as the alert names it.' })
     & $add 'Where to look' 'Defender portal' $Row.Link
     $out.ToArray()
+}
+
+# ---------------------------------------------------------------------------------------------
+# MCP access: which agent may reach which MCP server, which servers it sets up and which it calls, and a block for one agent
+# and one server. Agent 365's Tools registry, and its Block switch that applies to every agent at once, have no public API, so
+# this view joins three other sources:
+#   - Entra permissions. Each Microsoft MCP server is its own application with the delegated scope Tools.ListInvoke.All.
+#     Agents set up before that hold shared scopes (McpServers.<Name>.All) on the one "Agent Tools" application. A grant to a
+#     blueprint reaches the blueprint's agent identities only when the blueprint lists that application as inheritable.
+#   - Defender's agent inventory (AgentsInfo): the MCP servers each agent sets up.
+#   - Defender's audit events (CloudAppEvents): the tool calls each agent made, through the Agent 365 tooling gateway, the SDK or
+#     a Power Platform connector.
+# The block is a Conditional Access policy whose only resource is the server's Entra application. Entra does not accept agent
+# identities and agent user accounts in one policy, so each server gets one policy for each, in each mode (on and report-only).
+# Policies made by hand are read, never changed.
+# ---------------------------------------------------------------------------------------------
+$script:AgentToolsAppId = 'ea9ffc3e-8a23-4a7d-836d-234d7c7565c1'
+$script:McpBlockPrefix = 'Agent365 Bulk Actions: block MCP server '
+# Microsoft's own MCP server applications, the same in every tenant. Knowing them lets a server that no agent holds a permission
+# for still be named and blocked.
+$script:McpServerApps = [ordered]@{
+    mail = '16b1878d-62c7-4009-aa25-68989d63bbad'; calendar = '910333d2-47e9-43ca-981f-6df2f4531ef4'; teams = 'ce5029ee-c1d3-45c0-bdcc-efb5a4245687'
+    sharepoint = '292cff14-c0e8-4116-9e3b-99934ae05766'; onedrive = 'b0b2a2bb-6361-4549-a00c-a018417eb8e2'; word = 'c2d0c2b6-8013-4346-9f8b-b81d3b754a29'
+    copilot = 'ab7c82de-7946-4454-ac28-70249d17c95e'; windows365foragents = 'da81128c-e5b5-4f9e-8d89-50d906f107c5'
+}
+# Other names the same server goes by in Defender's inventory, the audit events and the shared scopes.
+$script:McpAliases = @{
+    outlookmail = 'mail'; email = 'mail'; outlookcalendar = 'calendar'; user = 'me'; userprofile = 'me'; copilotchat = 'copilot'; copilotsearch = 'copilot'
+    odsp = 'onedrivesharepoint'; sharepointandonedrive = 'onedrivesharepoint'; admincenter = 'admin'
+}
+$script:McpLabels = @{
+    mail = 'Mail'; calendar = 'Calendar'; teams = 'Teams'; sharepoint = 'SharePoint'; onedrive = 'OneDrive'; onedrivesharepoint = 'OneDrive and SharePoint'
+    sharepointlists = 'SharePoint Lists'; word = 'Word'; copilot = 'Copilot'; me = 'User profile'; knowledge = 'Knowledge'; admin = 'Microsoft 365 admin'
+    excel = 'Excel'; planner = 'Planner'; windows365foragents = 'Windows 365 for Agents'; agenttools = 'Agent Tools (shared permission)'
+}
+
+# One key for every name a server goes by: "Work IQ Mail MCP", "McpServers.Mail.All", "mcp_MailTools" and "a365outlookmailmcp" are all "mail".
+function ConvertTo-McpServerKey {
+    param([string]$Name)
+    $n = ([string]$Name).ToLowerInvariant().Trim()
+    if ($n -match '^mcpservers\.(.+)\.all$') { $n = $Matches[1] }
+    $n = $n -replace '\((preview|deprecated)\)', '' -replace '\s*-\s*byo$', ''
+    $n = $n -replace '^(mcp_|a365)', ''
+    $n = $n -replace '^(work\s*iq|microsoft(\s*365)?|m365)\s*', ''
+    $n = $n -replace '[^a-z0-9]', ''
+    do { $before = $n; $n = $n -replace '(remoteserver|server|tools|mcp|connector)$', '' } while ($n -and $n -ne $before)
+    if ($script:McpAliases.ContainsKey($n)) { $n = $script:McpAliases[$n] }
+    if (-not $n) { $n = ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]', '' }
+    $n
+}
+
+# The MCP scopes in a grant: shared server scopes and the per-server scope. McpServersMetadata.Read.All only lists servers.
+function Get-McpScopes {
+    param([string]$Scope)
+    @(([string]$Scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { $_ -match '^McpServers\.[^.]+\.All$' -or $_ -eq 'Tools.ListInvoke.All' })
+}
+
+# Does a blueprint pass one scope of a resource on to its agent identities? Inherit is its inheritablePermissions list.
+function Test-McpInherited {
+    param([object[]]$Inherit, [string]$ResourceAppId, [string]$Scope)
+    foreach ($e in @($Inherit | Where-Object { $_ })) {
+        if ([string]$e.resourceAppId -ne $ResourceAppId) { continue }
+        $kind = [string]$e.inheritableScopes.kind
+        if ($kind -eq 'allAllowed') { return $true }
+        if ($kind -like 'enumerated*') { return (@($e.inheritableScopes.scopes) -contains $Scope) }
+        return $false
+    }
+    $false
+}
+
+$script:McpDeclaredKql = @'
+AgentsInfo
+| summarize arg_max(Timestamp, *) by AgentId
+| extend r = todynamic(RawAgentInfo)
+| extend Servers = array_concat(coalesce(McpServers, dynamic([])), coalesce(r.mcpServers, dynamic([])))
+| mv-expand m = Servers
+| extend Server = tostring(m.name)
+| where isnotempty(Server)
+| project CatalogId = tolower(tostring(r.titleId)), Agent = Name, Platform, Server, Endpoint = tostring(coalesce(m.endpoint, m.url))
+| distinct CatalogId, Agent, Platform, Server, Endpoint
+'@
+
+# Tool calls to MCP servers. Initialize and ListTools are the connection handshake, counted apart from the calls themselves.
+$script:McpUsageKql = @'
+CloudAppEvents
+| where Timestamp > ago(30d) and ActionType in ("ExecuteToolByGateway", "ExecuteToolBySDK")
+| extend d = todynamic(RawEventData)
+| extend ToolType = tostring(d.ToolType), Server = tostring(d.ToolServerName), Tool = tostring(d.ToolName)
+| extend Server = iff(isempty(Server) and Tool startswith "mcp_", extract(@"^(mcp_[A-Za-z0-9]+)", 1, Tool), Server)
+| where isnotempty(Server) and (ActionType == "ExecuteToolByGateway" or ToolType startswith "MCP" or isnotempty(tostring(d.ToolServerName)) or Tool startswith "mcp_")
+| extend Op = iff(ToolType has "Initialize" or ToolType has "ListTools", "connect", "call"),
+         Via = case(ActionType == "ExecuteToolByGateway", "Agent 365 gateway", ToolType has "Power Platform", "Power Platform connector", "Agent SDK"),
+         Failed = isnotempty(tostring(d.ErrorMessage)) or isnotempty(tostring(d.ErrorCode))
+| summarize Calls = countif(Op == "call"), Calls7 = countif(Op == "call" and Timestamp > ago(7d)), Calls14 = countif(Op == "call" and Timestamp > ago(14d)),
+            Connects = countif(Op == "connect"), Errors = countif(Failed), Last = max(Timestamp), LastCall = maxif(Timestamp, Op == "call"),
+            Tools = make_set_if(Tool, Op == "call", 12), Via = make_set(Via), AgentName = take_any(tostring(d.AgentName))
+    by AgentId = tolower(tostring(d.AgentId)), PlatformAgentId = tolower(tostring(d.PlatformAgentId)), BlueprintId = tolower(tostring(d.AgentBlueprintId)), Server
+'@
+
+# The tenant's Conditional Access policies as Graph returns them.
+function Get-CaPoliciesRaw {
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $uri = $script:CaPolicyBase
+    do {
+        $page = Invoke-Graph -Uri $uri
+        foreach ($r in @($page.value)) { $out.Add($r) }
+        $uri = [string]$page.'@odata.nextLink'
+    } while ($uri)
+    $out.ToArray()
+}
+
+# Agent identity id (lowercased) -> the ids of its agent user accounts.
+function Get-AgentUserIdsByIdentity {
+    $map = @{}
+    $uri = 'https://graph.microsoft.com/beta/users/microsoft.graph.agentUser?$select=id,identityParentId&$top=100'
+    do {
+        $page = Invoke-Graph -Uri $uri
+        foreach ($u in @($page.value)) {
+            $p = ([string]$u.identityParentId).ToLowerInvariant()
+            if (-not $p) { continue }
+            if (-not $map.ContainsKey($p)) { $map[$p] = @() }
+            $map[$p] += [string]$u.id
+        }
+        $uri = [string]$page.'@odata.nextLink'
+    } while ($uri)
+    $map
+}
+
+# Every delegated grant that carries an MCP scope, with the client and the resource it joins. Grants are read tenant-wide because
+# a BYO server can have any name; only the MCP scopes are kept.
+function Get-McpGrantData {
+    $raw = New-Object 'System.Collections.Generic.List[object]'
+    $uri = 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999'
+    do {
+        $page = Invoke-Graph -Uri $uri
+        foreach ($g in @($page.value)) { if ((Get-McpScopes ([string]$g.scope)).Count) { $raw.Add($g) } }
+        $uri = [string]$page.'@odata.nextLink'
+    } while ($uri)
+    $ids = @(@($raw | ForEach-Object { [string]$_.clientId; [string]$_.resourceId }) | Where-Object { $_ } | Get-Distinct)
+    $sp = if ($ids.Count) { Invoke-GraphBatch -Version beta -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals/{0}?$select=id,appId,displayName' -f $_) } }) -Activity 'Reading MCP permission holders' } else { @{} }
+    $clients = @{}
+    foreach ($id in $ids) {
+        $b = if ($sp[$id] -and $sp[$id].Status -eq 200) { $sp[$id].Body } else { $null }
+        $type = switch -Wildcard ([string]$b.'@odata.type') { '*agentIdentityBlueprintPrincipal' { 'blueprint' } '*agentIdentity' { 'identity' } default { 'app' } }
+        $clients[$id.ToLowerInvariant()] = [pscustomobject]@{ Id = $id; Name = $(if ($b) { [string]$b.displayName } else { $id }); AppId = $(if ($b) { [string]$b.appId } else { '' }); Type = $type }
+    }
+    $grants = @($raw | ForEach-Object {
+        $res = $clients[([string]$_.resourceId).ToLowerInvariant()]
+        [pscustomobject]@{ ClientId = ([string]$_.clientId).ToLowerInvariant(); ResourceAppId = [string]$res.AppId; ResourceName = [string]$res.Name
+                           Scopes = @(Get-McpScopes ([string]$_.scope)); Consent = [string]$_.consentType }
+    })
+    [pscustomobject]@{ Grants = $grants; Clients = $clients }
+}
+
+# Blueprint app id (lowercased) -> its inheritablePermissions entries, for the blueprints among the grant holders.
+function Get-McpInheritance {
+    param([string[]]$BlueprintAppIds)
+    $map = @{}
+    $apps = @($BlueprintAppIds | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Get-Distinct)
+    if ($apps.Count -eq 0) { return $map }
+    $objs = Invoke-GraphBatch -Requests @($apps | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/applications(appId='{0}')?`$select=id" -f $_) } }) -Activity 'Reading agent blueprints'
+    $objectIds = @{}
+    foreach ($a in $apps) { if ($objs[$a] -and $objs[$a].Status -eq 200) { $objectIds[$a] = [string]$objs[$a].Body.id } }
+    if ($objectIds.Count -eq 0) { return $map }
+    $res = Invoke-GraphBatch -Version beta -Requests @($objectIds.Keys | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/applications/{0}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions' -f $objectIds[$_]) } }) -Activity 'Reading inheritable permissions'
+    foreach ($a in $objectIds.Keys) { $map[$a] = if ($res[$a] -and $res[$a].Status -eq 200) { @(Get-ItemList $res[$a].Body.value) } else { @() } }
+    $map
+}
+
+# Catalog packages that stand for a whole blueprint (an A365 SDK agent registered as a template) carry no agent identity; their
+# manifest id is the blueprint's app id. Returns package id -> { AppId; Principal; Identities }, the blueprint principal being
+# what Conditional Access targets to cover every agent identity made from the blueprint.
+function Get-McpBlueprintPackages {
+    param([object[]]$Packages)
+    $map = @{}
+    $cands = @($Packages | Where-Object { -not $_.agentIdentityId -and [string]$_.manifestId -match $script:GuidPattern -and @($_.elementTypes) -contains 'AgenticUserTemplates' })
+    if ($cands.Count -eq 0) { return $map }
+    $apps = @($cands | ForEach-Object { ([string]$_.manifestId).ToLowerInvariant() } | Get-Distinct)
+    $reqs = @($apps | ForEach-Object {
+        @{ id = "p:$_"; method = 'GET'; url = ("/servicePrincipals?`$filter=appId eq '{0}'&`$select=id" -f $_) }
+        @{ id = "i:$_"; method = 'GET'; url = ("/servicePrincipals/microsoft.graph.agentIdentity?`$filter=agentIdentityBlueprintId eq '{0}'&`$select=id" -f $_) } })
+    $res = Invoke-GraphBatch -Version beta -Requests $reqs -Activity 'Reading agent blueprints'
+    foreach ($p in $cands) {
+        $a = ([string]$p.manifestId).ToLowerInvariant()
+        $pr = if ($res["p:$a"] -and $res["p:$a"].Status -eq 200) { @(Get-ItemList $res["p:$a"].Body.value)[0] } else { $null }
+        if (-not $pr) { continue }
+        $map[[string]$p.id] = [pscustomobject]@{ AppId = $a; Principal = [string]$pr.id
+                                                Identities = @(if ($res["i:$a"] -and $res["i:$a"].Status -eq 200) { Get-ItemList $res["i:$a"].Body.value | ForEach-Object { [string]$_.id } }) }
+    }
+    $map
+}
+
+# Server key -> its Entra application { AppId; Name }: the per-server applications agents hold grants to, plus Microsoft's own
+# servers that exist in the tenant.
+function Get-McpServerApps {
+    param([object[]]$Grants)
+    $apps = @{}
+    foreach ($g in @($Grants)) {
+        if ($g.Scopes -contains 'Tools.ListInvoke.All' -and $g.ResourceAppId) { $apps[(ConvertTo-McpServerKey $g.ResourceName)] = [pscustomobject]@{ AppId = $g.ResourceAppId; Name = $g.ResourceName } }
+    }
+    $missing = @($script:McpServerApps.Keys | Where-Object { -not $apps.ContainsKey($_) })
+    if ($missing.Count) {
+        $list = ($missing | ForEach-Object { "'{0}'" -f $script:McpServerApps[$_] }) -join ','
+        try {
+            foreach ($s in @((Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId in ({0})&`$select=appId,displayName" -f $list)).value)) {
+                $k = @($missing | Where-Object { $script:McpServerApps[$_] -eq [string]$s.appId })[0]
+                if ($k) { $apps[$k] = [pscustomobject]@{ AppId = [string]$s.appId; Name = [string]$s.displayName } }
+            }
+        } catch { $null = $_ }
+    }
+    $apps['agenttools'] = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' }
+    $apps
+}
+
+# Why a row cannot be blocked, or an empty string when it can.
+function Get-McpBlockReason {
+    param([object]$Row)
+    if ($Row.Kind -eq 'App, not an agent') { return 'An application, not an agent. Its access is an ordinary app permission: review or remove it in Entra (Enterprise applications > Permissions).' }
+    if ($Row.Kind -ne 'Agent') { return 'Not an agent in the catalog, so there is no agent identity to block. Block its identities in Entra Conditional Access directly.' }
+    if (-not $Row.Granted -and ($Row.Via -like '*Power Platform connector*' -or $Row.Platform -eq 'Copilot Studio')) { return 'It reaches this server through a Power Platform connector (Copilot Studio), which Conditional Access for agents does not cover. Use a Power Platform data policy, or remove the tool from the agent.' }
+    if (-not $Row.IdentityId) { return 'The agent has no Entra agent identity, so Conditional Access for agents cannot apply to it.' }
+    if ($Row.ServerKey -ne 'agenttools' -and $Row.Shared -and -not $Row.OwnApp) { return 'It reaches this server only through the shared permission. Block the "Agent Tools (shared permission)" row of this agent instead, which blocks every server that permission covers.' }
+    if (-not $Row.ResourceAppId) { return 'No Entra application is known for this server in your tenant, so Conditional Access has nothing to target.' }
+    ''
+}
+
+# Whether Conditional Access blocks one agent from one MCP server, for its identity and for its agent user accounts, enforced or
+# report-only. Only policies that name the server's application count: a policy for all resources is not an MCP block, and one
+# with an agent risk condition blocks only at that risk.
+function Get-McpBlockState {
+    param([object[]]$Policies, [string]$AppId, [string[]]$IdentityKeys, [string[]]$AgentUserIds)
+    $rank = @{ '' = 0; 'Report-only' = 1; 'On' = 2 }
+    $ik = @($IdentityKeys | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+    $uk = @($AgentUserIds | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+    $app = ([string]$AppId).ToLowerInvariant()
+    $idState = ''; $userHits = @{}; $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($p in @($Policies)) {
+        if (-not $app) { break }
+        $state = switch ([string]$p.state) { 'enabled' { 'On' } 'enabledForReportingButNotEnforced' { 'Report-only' } default { '' } }
+        if (-not $state -or @($p.grantControls.builtInControls) -notcontains 'block') { continue }
+        $c = $p.conditions
+        if (@($c.agentIdRiskLevels | Where-Object { $_ }).Count) { continue }
+        $apps = @($c.applications.includeApplications | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        if ($apps -notcontains $app -or @($c.applications.excludeApplications | ForEach-Object { ([string]$_).ToLowerInvariant() }) -contains $app) { continue }
+        $hit = $false
+        $inc = @($c.clientApplications.includeAgentIdServicePrincipals | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        $exc = @(@($c.clientApplications.excludeAgentIdServicePrincipals) + @($c.clientApplications.excludeServicePrincipals) | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        if ($ik.Count -and ($inc -contains 'all' -or @($inc | Where-Object { $ik -contains $_ }).Count) -and -not @($exc | Where-Object { $ik -contains $_ }).Count) {
+            if ($rank[$state] -gt $rank[$idState]) { $idState = $state }
+            $hit = $true
+        }
+        $users = @($c.users.includeUsers | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        $userExc = @($c.users.excludeUsers | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        foreach ($u in $uk) {
+            if (($users -contains 'allagentidusers' -or $users -contains $u) -and $userExc -notcontains $u) {
+                if (-not $userHits.ContainsKey($u) -or $rank[$state] -gt $rank[$userHits[$u]]) { $userHits[$u] = $state }
+                $hit = $true
+            }
+        }
+        if ($hit) { $names.Add(('{0} ({1})' -f $p.displayName, $(if ($state -eq 'On') { 'on' } else { 'report-only' }))) }
+    }
+    $userState = 'n/a'
+    if ($uk.Count) {
+        $min = (@($uk | ForEach-Object { if ($userHits.ContainsKey($_)) { $rank[$userHits[$_]] } else { 0 } }) | Measure-Object -Minimum).Minimum
+        $userState = @('', 'Report-only', 'On')[[int]$min]
+    }
+    $parts = @($idState) + @(if ($userState -ne 'n/a') { $userState })
+    $kind = if (@($parts | Where-Object { $_ -ne 'On' }).Count -eq 0) { 'Blocked' }
+            elseif (@($parts | Where-Object { $_ -eq 'On' }).Count) { 'Partly blocked' }
+            elseif (@($parts | Where-Object { $_ -eq 'Report-only' }).Count) { 'Report-only' }
+            else { '' }
+    $word = { param($s) switch ($s) { 'On' { 'blocked' } 'Report-only' { 'report-only' } default { 'not blocked' } } }
+    $text = if ($kind) {
+        'Agent identity: {0}. {1}' -f (& $word $idState), $(if ($userState -eq 'n/a') { 'It has no agent user account.' } else { 'Agent user account{0}: {1}.' -f $(if ($uk.Count -gt 1) { 's' } else { '' }), (& $word $userState) })
+    } else { '' }
+    [pscustomobject]@{ Kind = $kind; Identity = $idState; Users = $userState; Policies = $names.ToArray(); Text = $text }
+}
+
+function Set-McpBlockState {
+    param([object]$Row, [object[]]$Policies)
+    $s = Get-McpBlockState -Policies $Policies -AppId $Row.ResourceAppId -IdentityKeys $Row.CaKeys -AgentUserIds $Row.AgentUserIds
+    $Row.Block = $s.Kind; $Row.BlockText = $s.Text; $Row.BlockPolicies = ($s.Policies -join '; ')
+}
+
+# A row for one agent and one server, with nothing known yet.
+function New-McpAccessRow {
+    param([object]$AgentInfo, [string]$ServerKey)
+    [pscustomobject]@{
+        Agent = $AgentInfo.Agent; AgentId = $AgentInfo.AgentId; Kind = $AgentInfo.Kind; Platform = $AgentInfo.Platform; IdentityId = $AgentInfo.IdentityId; IdentityKind = $AgentInfo.IdentityKind
+        CaKeys = @($AgentInfo.CaKeys); AgentUserIds = @($AgentInfo.AgentUserIds)
+        Server = ''; ServerKey = $ServerKey; Names = (New-Object 'System.Collections.Generic.List[string]'); ResourceAppId = ''; ResourceName = ''
+        Granted = $false; OwnApp = $false; Shared = $false; SharedScope = $false; NotInherited = $false; PermParts = (New-Object 'System.Collections.Generic.List[string]'); Permission = 'None found'; Covers = ''
+        Declared = $false; DeclaredAs = ''
+        Calls = 0; Calls7 = 0; Calls14 = 0; Calls30 = 0; Connects = 0; Errors = 0; LastSeen = $null; LastCall = $null; Tools = ''; Via = ''
+        Block = ''; BlockText = ''; BlockPolicies = ''; CanBlock = ''; Note = ''
+    }
+}
+
+# Join permissions, set-up servers and tool calls into one row per agent and server. Inputs are already read: Grants and Clients
+# from Get-McpGrantData, Inherit from Get-McpInheritance, IdentityIds from Get-AgentIdentityIds, AgentUsers from
+# Get-AgentUserIdsByIdentity, Declared and Usage from the hunting queries, KeyMap from Get-AgentKeyMap, ServerApps from
+# Get-McpServerApps. Packages are the catalog agents in scope; IncludeOthers adds blueprints and apps that are not one of them.
+function New-McpAccessRows {
+    param([object[]]$Packages, [hashtable]$IdentityIds, [hashtable]$AgentUsers, [object[]]$Grants, [hashtable]$Clients, [hashtable]$Inherit,
+          [object[]]$Declared, [object[]]$Usage, [hashtable]$KeyMap, [hashtable]$ServerApps, [hashtable]$Blueprints, [switch]$IncludeOthers)
+    $agents = @{}; $rows = [ordered]@{}
+    $byIdentity = @{}; $byPrincipal = @{}; $byCatalog = @{}; $byBlueprint = @{}
+    $usersOf = { param([string[]]$Ids) @($Ids | Where-Object { $_ } | ForEach-Object { $i = $_.ToLowerInvariant(); if ($AgentUsers -and $AgentUsers.ContainsKey($i)) { $AgentUsers[$i] } }) }
+    $addPrincipal = { param([string]$Principal, [string]$Key) $pr = $Principal.ToLowerInvariant(); if (-not $byPrincipal.ContainsKey($pr)) { $byPrincipal[$pr] = @() }; $byPrincipal[$pr] += $Key }
+    foreach ($p in @($Packages)) {
+        $key = ([string]$p.id).ToLowerInvariant()
+        $iid = ([string]$p.agentIdentityId).ToLowerInvariant()
+        $ids = if ($iid -and $IdentityIds) { $IdentityIds[[string]$p.agentIdentityId] } else { $null }
+        $bp = if (-not $iid -and $Blueprints) { $Blueprints[[string]$p.id] } else { $null }
+        $agents[$key] = if ($bp) {
+            [pscustomobject]@{ Agent = [string]$p.displayName; AgentId = [string]$p.id; Kind = 'Agent'; Platform = 'A365 SDK blueprint'; IdentityId = $bp.Principal; IdentityKind = 'Blueprint'
+                               CaKeys = @($bp.Principal); AgentUserIds = @(& $usersOf $bp.Identities); BlueprintAppId = $bp.AppId }
+        } else {
+            [pscustomobject]@{ Agent = [string]$p.displayName; AgentId = [string]$p.id; Kind = 'Agent'; Platform = (Get-PlatformLabel -Package $p); IdentityId = [string]$p.agentIdentityId; IdentityKind = 'Agent identity'
+                               CaKeys = @([string]$p.agentIdentityId, $(if ($ids) { [string]$ids.Principal }) | Where-Object { $_ })
+                               AgentUserIds = @(& $usersOf @($iid)); BlueprintAppId = $(if ($ids) { ([string]$ids.Blueprint).ToLowerInvariant() } else { '' }) }
+        }
+        $byCatalog[$key] = $key
+        if ($iid) { $byIdentity[$iid] = $key }
+        if ($ids -and $ids.Principal) { & $addPrincipal $ids.Principal $key }
+        if ($bp) { & $addPrincipal $bp.Principal $key; $byBlueprint[$bp.AppId] = $key }
+    }
+    # An agent identity with no package of its own is counted under its blueprint's package.
+    foreach ($p in @($Packages)) {
+        $bp = if ($Blueprints) { $Blueprints[[string]$p.id] } else { $null }
+        if ($bp) { foreach ($i in $bp.Identities) { $i = $i.ToLowerInvariant(); if (-not $byIdentity.ContainsKey($i)) { $byIdentity[$i] = ([string]$p.id).ToLowerInvariant() } } }
+    }
+    $other = {
+        param([string]$Key, [string]$Name, [string]$Kind)
+        if (-not $agents.ContainsKey($Key)) { $agents[$Key] = [pscustomobject]@{ Agent = $Name; AgentId = ''; Kind = $Kind; Platform = ''; IdentityId = ''; IdentityKind = ''; CaKeys = @(); AgentUserIds = @(); BlueprintAppId = '' } }
+        $Key
+    }
+    $rowFor = {
+        param([string]$AgentKey, [string]$ServerKey, [string]$Name)
+        $k = "$AgentKey|$ServerKey"
+        if (-not $rows.Contains($k)) { $rows[$k] = New-McpAccessRow -AgentInfo $agents[$AgentKey] -ServerKey $ServerKey }
+        if ($Name -and -not $rows[$k].Names.Contains($Name)) { $rows[$k].Names.Add($Name) }
+        $rows[$k]
+    }
+
+    # Permissions: a grant to the agent identity itself, or to its blueprint (which counts only when the blueprint passes it on).
+    foreach ($g in @($Grants)) {
+        $c = $Clients[$g.ClientId]
+        $type = if ($c) { $c.Type } else { 'app' }
+        $targets = @(switch ($type) {
+            'identity'  { if ($byIdentity.ContainsKey($g.ClientId)) { $byIdentity[$g.ClientId] } }
+            'blueprint' { if ($byPrincipal.ContainsKey($g.ClientId)) { $byPrincipal[$g.ClientId] } }
+        })
+        if ($targets.Count -eq 0) {
+            if (-not $IncludeOthers) { continue }
+            $kind = switch ($type) { 'blueprint' { 'Blueprint, not in the catalog' } 'identity' { 'Agent identity, not in the catalog' } default { 'App, not an agent' } }
+            $targets = @(& $other "client:$($g.ClientId)" $(if ($c) { $c.Name } else { $g.ClientId }) $kind)
+        }
+        foreach ($t in $targets) {
+            $a = $agents[$t]
+            foreach ($s in $g.Scopes) {
+                $own = $s -eq 'Tools.ListInvoke.All'
+                $sk = if ($own) { ConvertTo-McpServerKey $g.ResourceName } else { ConvertTo-McpServerKey $s }
+                $passed = $type -ne 'blueprint' -or -not $a.BlueprintAppId -or (Test-McpInherited -Inherit $(if ($Inherit) { $Inherit[$a.BlueprintAppId] }) -ResourceAppId $g.ResourceAppId -Scope $s)
+                if ($type -eq 'blueprint' -and $a.Kind -ne 'Agent') { $passed = $true }
+                $holder = switch ($type) { 'identity' { 'Agent identity' } 'blueprint' { 'Blueprint' } default { 'Application' } }
+                $line = '{0}: {1} on {2}{3}{4}' -f $holder, $s, $g.ResourceName, $(if ($g.Consent -eq 'Principal') { ', for one user' } else { '' }),
+                        $(if (-not $passed) { ' (not inherited, so the agent does not get it)' } elseif ($type -eq 'blueprint' -and $a.Kind -eq 'Agent') { ' (inherited)' } else { '' })
+                $r = & $rowFor $t $sk $(if ($own) { $g.ResourceName } else { '' })
+                $r.PermParts.Add($line)
+                if ($passed) { $r.Granted = $true; if ($own) { $r.OwnApp = $true } else { $r.Shared = $true } } else { $r.NotInherited = $true }
+                if (-not $own) {
+                    $r.SharedScope = $true
+                    $sr = & $rowFor $t 'agenttools' ''
+                    $sr.PermParts.Add($line)
+                    if ($passed) { $sr.Granted = $true; $sr.Shared = $true } else { $sr.NotInherited = $true }
+                }
+            }
+        }
+    }
+
+    # Servers the agents set up, from Defender's inventory.
+    foreach ($d in @($Declared)) {
+        $cid = ([string]$d.CatalogId).ToLowerInvariant()
+        $t = if ($cid -and $agents.ContainsKey($cid)) { $cid } elseif ($IncludeOthers -and $d.Agent) { & $other "name:$($d.Agent)" ([string]$d.Agent) 'Not in the catalog' } else { $null }
+        if (-not $t) { continue }
+        $sk = ConvertTo-McpServerKey $d.Server
+        if (-not $script:McpLabels.ContainsKey($sk) -and [string]$d.Endpoint -match '/servers/(mcp_[A-Za-z0-9]+)') { $sk = ConvertTo-McpServerKey $Matches[1] }
+        $r = & $rowFor $t $sk ([string]$d.Server)
+        $r.Declared = $true
+        $r.DeclaredAs = (@(@($r.DeclaredAs) + ('{0}{1}' -f $d.Server, $(if ($d.Endpoint) { " ($($d.Endpoint))" } else { '' }))) | Where-Object { $_ } | Get-Distinct) -join '; '
+    }
+
+    # Tool calls, tied to an agent through the ids the event carries.
+    foreach ($u in @($Usage)) {
+        $t = $null
+        foreach ($k in @($u.AgentId, $u.PlatformAgentId)) {
+            $k = ([string]$k).ToLowerInvariant()
+            if (-not $k) { continue }
+            if ($byIdentity.ContainsKey($k)) { $t = $byIdentity[$k]; break }
+            if ($byCatalog.ContainsKey($k)) { $t = $k; break }
+            $cid = if ($KeyMap) { Get-KeyAgent $KeyMap $k } else { '' }
+            if ($cid -and $agents.ContainsKey($cid)) { $t = $cid; break }
+        }
+        $bpk = ([string]$u.BlueprintId).ToLowerInvariant()
+        if (-not $t -and $bpk -and $byBlueprint.ContainsKey($bpk)) { $t = $byBlueprint[$bpk] }
+        if (-not $t -and $bpk -and $KeyMap) { $cid = Get-KeyAgent $KeyMap $bpk; if ($cid -and $agents.ContainsKey($cid)) { $t = $cid } }
+        if (-not $t) {
+            if (-not $IncludeOthers) { continue }
+            $label = if ($u.AgentName) { [string]$u.AgentName } else { [string]$u.AgentId }
+            if (-not $label) { continue }
+            $t = & $other "name:$label" $label 'Not in the catalog'
+        }
+        $r = & $rowFor $t (ConvertTo-McpServerKey $u.Server) ([string]$u.Server)
+        $r.Calls30 += [int]$u.Calls; $r.Calls7 += [int]$u.Calls7; $r.Calls14 += [int]$u.Calls14; $r.Connects += [int]$u.Connects; $r.Errors += [int]$u.Errors
+        foreach ($pair in @(@('LastSeen', $u.Last), @('LastCall', $u.LastCall))) {
+            $when = ConvertTo-EndpointTime $pair[1]
+            if ($when -and (-not $r.($pair[0]) -or $when -gt $r.($pair[0]))) { $r.($pair[0]) = $when }
+        }
+        $r.Tools = (@(@($r.Tools -split '; ') + @($u.Tools | ForEach-Object { [string]$_ }) | Where-Object { $_ } | Get-Distinct) -join '; ')
+        $r.Via = (@(@($r.Via -split '; ') + @($u.Via | ForEach-Object { [string]$_ }) | Where-Object { $_ } | Get-Distinct) -join '; ')
+    }
+
+    # Finish each row: names, the application a block would target, what the shared row covers, and the permission in short.
+    foreach ($r in $rows.Values) {
+        $app = if ($ServerApps) { $ServerApps[$r.ServerKey] } else { $null }
+        if ($app) { $r.ResourceAppId = $app.AppId; $r.ResourceName = $app.Name }
+        $r.Server = if ($r.ServerKey -eq 'agenttools') { $script:McpLabels['agenttools'] } elseif ($app) { $app.Name } elseif ($script:McpLabels.ContainsKey($r.ServerKey)) { $script:McpLabels[$r.ServerKey] } elseif ($r.Names.Count) { $r.Names[0] } else { $r.ServerKey }
+        $r.Permission = if ($r.OwnApp -and $r.Shared) { 'Own and shared' } elseif ($r.OwnApp) { 'Own' } elseif ($r.Shared) { 'Shared' } elseif ($r.NotInherited) { 'Blueprint only' } else { 'None found' }
+    }
+    foreach ($r in @($rows.Values | Where-Object { $_.ServerKey -eq 'agenttools' })) {
+        $mine = @($rows.Values | Where-Object { $_.ServerKey -ne 'agenttools' -and $_.Agent -eq $r.Agent -and $_.AgentId -eq $r.AgentId -and $_.SharedScope })
+        $r.Covers = (@($mine | ForEach-Object { $_.Server }) | Get-Distinct) -join ', '
+        $r.Tools = $r.Covers
+        foreach ($m in $mine) {
+            $r.Calls30 += $m.Calls30; $r.Calls7 += $m.Calls7; $r.Calls14 += $m.Calls14; $r.Connects += $m.Connects; $r.Errors += $m.Errors
+            if ($m.LastSeen -and (-not $r.LastSeen -or $m.LastSeen -gt $r.LastSeen)) { $r.LastSeen = $m.LastSeen }
+            if ($m.LastCall -and (-not $r.LastCall -or $m.LastCall -gt $r.LastCall)) { $r.LastCall = $m.LastCall }
+            $r.Via = (@(@($r.Via -split '; ') + @($m.Via -split '; ')) | Where-Object { $_ } | Get-Distinct) -join '; '
+        }
+    }
+    foreach ($r in $rows.Values) { $r.Calls = $r.Calls30; $r.CanBlock = Get-McpBlockReason $r }
+    [pscustomobject]@{ Rows = @($rows.Values); Agents = $agents }
+}
+
+# Read everything the MCP view needs and build its rows. OnlyIds limits the agents (catalog ids); without it, blueprints and apps
+# that are not catalog agents but hold MCP permissions are listed too.
+function Get-McpAccessReport {
+    param([object[]]$Packages, [string[]]$OnlyIds, [scriptblock]$OnStatus)
+    $say = { param($m) if ($OnStatus) { & $OnStatus $m } }
+    $only = @($OnlyIds | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() })
+    $scope = @(if ($only.Count) { $Packages | Where-Object { $only -contains ([string]$_.id).ToLowerInvariant() } } else { $Packages })
+    & $say 'Reading MCP permissions in Entra...'
+    $g = Get-McpGrantData
+    $serverApps = Get-McpServerApps -Grants $g.Grants
+    & $say 'Reading agent identities, blueprints and agent user accounts...'
+    $ids = Get-AgentIdentityIds @($scope | ForEach-Object { $_.agentIdentityId })
+    $blueprints = Get-McpBlueprintPackages -Packages $scope
+    $inherit = Get-McpInheritance @(@($ids.Values | ForEach-Object { $_.Blueprint }) + @($blueprints.Values | ForEach-Object { $_.AppId }))
+    $users = Get-AgentUserIdsByIdentity
+    & $say 'Reading the MCP servers agents set up and the tool calls they made (Defender)...'
+    $keyMap = Get-AgentKeyMap
+    $declared = @(Invoke-HuntingQuery -Query $script:McpDeclaredKql -Hint 'Check ThreatHunting.Read.All consent and that Security for AI is onboarded.')
+    $usage = @(Invoke-HuntingQuery -Query $script:McpUsageKql -Hint 'Check ThreatHunting.Read.All consent and that the Agent 365 audit feed reaches Defender.' | ForEach-Object {
+        [pscustomobject]@{ AgentId = [string]$_.AgentId; PlatformAgentId = [string]$_.PlatformAgentId; BlueprintId = [string]$_.BlueprintId; AgentName = [string]$_.AgentName; Server = [string]$_.Server
+                           Calls = [int]$_.Calls; Calls7 = [int]$_.Calls7; Calls14 = [int]$_.Calls14; Connects = [int]$_.Connects; Errors = [int]$_.Errors
+                           Last = $_.Last; LastCall = $_.LastCall; Tools = @(ConvertTo-ObjectList $_.Tools); Via = @(ConvertTo-ObjectList $_.Via) } })
+    & $say 'Reading Conditional Access policies...'
+    $policies = @(Get-CaPoliciesRaw)
+    $built = New-McpAccessRows -Packages $scope -IdentityIds $ids -AgentUsers $users -Grants $g.Grants -Clients $g.Clients -Inherit $inherit `
+        -Declared $declared -Usage $usage -KeyMap $keyMap -ServerApps $serverApps -Blueprints $blueprints -IncludeOthers:($only.Count -eq 0)
+    foreach ($r in $built.Rows) { Set-McpBlockState -Row $r -Policies $policies }
+    [pscustomobject]@{ Rows = $built.Rows; Agents = $built.Agents; ServerApps = $serverApps; Policies = $policies }
+}
+
+# Why a row matters, in a few words, for the chosen period.
+function Get-McpRowNote {
+    param([object]$Row, [int]$Days, [bool]$Used)
+    $n = @()
+    if ($Row.Granted -and -not $Used) { $n += "Has the permission but no call in $Days days" }
+    if ($Used -and $Row.Calls -eq 0) { $n += 'Connected but called no tool' }
+    if ($Used -and -not $Row.Granted) { $n += $(if ($Row.Via -like '*Power Platform connector*') { 'Reached through a Power Platform connector' } else { 'Called, but Entra shows no permission for it' }) }
+    if ($Row.Declared -and -not $Row.Granted -and -not $Used) { $n += 'Set up, but no permission and no call found' }
+    if ($Row.NotInherited -and -not $Row.Granted) { $n += 'The blueprint holds it but does not pass it to the agent' }
+    if ($Row.ServerKey -eq 'agenttools') { $n += 'One permission for every server it covers' }
+    $n -join '. '
+}
+
+# The rows of one period, filtered: All, Unused (a permission with no call), Used, or Blocked (including report-only). Sets each
+# row's Calls and Note for the period.
+function Select-McpAccessRows {
+    param([object[]]$Rows, [ValidateSet(7, 14, 30)][int]$Days = 30, [ValidateSet('All', 'Unused', 'Used', 'Blocked')][string]$Show = 'All', [string]$Text)
+    $since = (Get-Date).AddDays(-$Days)
+    $picked = foreach ($r in @($Rows)) {
+        $r.Calls = if ($Days -eq 7) { $r.Calls7 } elseif ($Days -eq 14) { $r.Calls14 } else { $r.Calls30 }
+        $used = [bool]($r.LastSeen -and $r.LastSeen -ge $since)
+        $r.Note = Get-McpRowNote -Row $r -Days $Days -Used $used
+        if ($Show -eq 'Unused' -and (-not $r.Granted -or $used)) { continue }
+        if ($Show -eq 'Used' -and -not $used) { continue }
+        if ($Show -eq 'Blocked' -and -not $r.Block) { continue }
+        if ($Text -and ("$($r.Agent) $($r.Server) $($r.Tools) $($r.Permission) $($r.Block)").IndexOf($Text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $r
+    }
+    @($picked | Sort-Object Agent, @{ e = { $_.ServerKey -eq 'agenttools' } }, Server)
+}
+
+# Counts for one period's rows (already passed through Select-McpAccessRows for that period).
+function Get-McpAccessSummary {
+    param([object[]]$Rows, [int]$Days = 30)
+    $since = (Get-Date).AddDays(-$Days)
+    $servers = @($Rows | Where-Object { $_.ServerKey -ne 'agenttools' })
+    $agentRows = @($servers | Where-Object { $_.Kind -eq 'Agent' })
+    $used = @($servers | Where-Object { $_.LastSeen -and $_.LastSeen -ge $since })
+    [pscustomobject]@{
+        Servers = @($servers | ForEach-Object { $_.ServerKey } | Get-Distinct).Count
+        Agents = @($agentRows | ForEach-Object { $_.AgentId } | Get-Distinct).Count
+        Granted = @($servers | Where-Object { $_.Granted }).Count
+        GrantedUsed = @($used | Where-Object { $_.Granted }).Count
+        Unused = @($servers | Where-Object { $_.Granted -and -not ($_.LastSeen -and $_.LastSeen -ge $since) }).Count
+        Used = $used.Count
+        Calls = [int](@($servers | ForEach-Object { $_.Calls }) | Measure-Object -Sum).Sum
+        Blocked = @($Rows | Where-Object { $_.Block -in 'Blocked', 'Partly blocked' }).Count
+        ReportOnly = @($Rows | Where-Object { $_.Block -eq 'Report-only' }).Count
+        Others = @($Rows | Where-Object { $_.Kind -ne 'Agent' } | ForEach-Object { $_.Agent } | Get-Distinct).Count
+        Connectors = @($used | Where-Object { -not $_.Granted -and $_.Via -like '*Power Platform connector*' } | ForEach-Object { $_.Agent } | Get-Distinct).Count
+    }
+}
+
+# One line per server: how many agents hold it, how many called it, the calls, and how many are blocked.
+function Get-McpAccessByServer {
+    param([object[]]$Rows, [int]$Days = 30)
+    $since = (Get-Date).AddDays(-$Days)
+    @($Rows | Where-Object { $_.ServerKey -ne 'agenttools' } | Group-Object ServerKey | ForEach-Object {
+        $g = @($_.Group)
+        [pscustomobject]@{
+            Server = $g[0].Server; WithPermission = @($g | Where-Object { $_.Granted }).Count; SetUp = @($g | Where-Object { $_.Declared }).Count
+            Called = @($g | Where-Object { $_.LastSeen -and $_.LastSeen -ge $since }).Count; Calls = [int](@($g | ForEach-Object { $_.Calls }) | Measure-Object -Sum).Sum
+            Blocked = @($g | Where-Object { $_.Block }).Count
+        }
+    } | Sort-Object @{ e = { -$_.WithPermission } }, @{ e = { -$_.Called } }, Server)
+}
+
+function Get-McpAccessDetailRows {
+    param([object]$Row)
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $add = { param([string]$Section, [string]$Item, [string]$Info) if ($Info) { $out.Add([pscustomobject]@{ Section = $Section; Item = $Item; Info = $Info }) } }
+    & $add 'Agent' 'Agent' $Row.Agent
+    & $add 'Agent' 'Kind' $(if ($Row.Kind -eq 'Agent') { "Catalog agent ($($Row.Platform))" } else { $Row.Kind })
+    & $add 'Agent' $(if ($Row.IdentityKind -eq 'Blueprint') { 'Blueprint principal' } else { 'Agent identity' }) $(if ($Row.IdentityKind -eq 'Blueprint') { "$($Row.IdentityId) (a block on it covers every agent identity made from the blueprint)" } else { $Row.IdentityId })
+    & $add 'Agent' 'Agent user accounts' $(if (@($Row.AgentUserIds).Count) { @($Row.AgentUserIds) -join ', ' } elseif ($Row.IdentityId) { 'None' } else { '' })
+    & $add 'Server' 'MCP server' $Row.Server
+    & $add 'Server' 'Entra application' $(if ($Row.ResourceAppId) { '{0} ({1})' -f $Row.ResourceName, $Row.ResourceAppId } else { 'Not known in this tenant' })
+    & $add 'Server' 'Covers' $Row.Covers
+    & $add 'Server' 'Names seen' ((@($Row.Names) | Get-Distinct) -join '; ')
+    if ($Row.PermParts.Count) { foreach ($p in $Row.PermParts) { & $add 'Permission' 'Entra' $p } }
+    else { & $add 'Permission' 'Entra' 'No delegated permission for this server was found for the agent, its identity or its blueprint.' }
+    & $add 'Set up' 'Defender inventory' $(if ($Row.Declared) { $Row.DeclaredAs } else { 'Not listed among the agent''s MCP servers' })
+    & $add 'Calls' 'Tool calls' ('{0} in 7 days, {1} in 14 days, {2} in 30 days{3}' -f $Row.Calls7, $Row.Calls14, $Row.Calls30, $(if ($Row.Connects) { "; $($Row.Connects) connection handshake(s)" } else { '' }))
+    & $add 'Calls' 'Errors' $(if ($Row.Errors) { [string]$Row.Errors } else { '' })
+    & $add 'Calls' 'Last call' $(if ($Row.LastCall) { ([datetime]$Row.LastCall).ToString('yyyy-MM-dd HH:mm') } elseif ($Row.LastSeen) { 'No tool call; last connection ' + ([datetime]$Row.LastSeen).ToString('yyyy-MM-dd HH:mm') } else { 'None in 30 days' })
+    & $add 'Calls' $(if ($Row.ServerKey -eq 'agenttools') { 'Servers' } else { 'Tools called' }) $Row.Tools
+    & $add 'Calls' 'Through' $Row.Via
+    & $add 'Block' 'Conditional Access' $(if ($Row.Block) { "$($Row.Block). $($Row.BlockText)" } else { 'Not blocked by a policy that names this server.' })
+    & $add 'Block' 'Policies' $Row.BlockPolicies
+    & $add 'Block' 'Can this tool block it' $(if ($Row.CanBlock) { "No. $($Row.CanBlock)" } else { 'Yes: a Conditional Access policy for this agent and this server only.' })
+    $out.ToArray()
+}
+
+# A block item for one row. Target is On or Report-only to block in that mode, or empty to remove the block.
+function ConvertTo-McpBlockItem {
+    param([object]$Row, [string]$Target)
+    [pscustomobject]@{ Agent = $Row.Agent; AgentId = $Row.AgentId; IdentityId = $Row.IdentityId; AgentUserIds = @($Row.AgentUserIds | Where-Object { $_ })
+                       Server = $Row.Server; ResourceAppId = $Row.ResourceAppId; ResourceName = $Row.ResourceName; Target = $Target }
+}
+
+# The rows for chosen agents and server names, so a block can be set up before an agent ever uses the server. A pair the report
+# has no row for gets one from what is known about the agent and the server.
+function Resolve-McpBlockRows {
+    param([object]$Report, [object[]]$Packages, [string[]]$Servers)
+    foreach ($p in @($Packages)) {
+        foreach ($name in @($Servers | Where-Object { $_ })) {
+            $key = if ($name -match '^(?i)(agent\s*tools|shared)') { 'agenttools' } else { ConvertTo-McpServerKey $name }
+            $row = @($Report.Rows | Where-Object { $_.AgentId -eq $p.id -and $_.ServerKey -eq $key })[0]
+            if (-not $row) {
+                $info = $Report.Agents[([string]$p.id).ToLowerInvariant()]
+                if (-not $info) { continue }
+                $row = New-McpAccessRow -AgentInfo $info -ServerKey $key
+                $app = $Report.ServerApps[$key]
+                if ($app) { $row.ResourceAppId = $app.AppId; $row.ResourceName = $app.Name; $row.Server = if ($key -eq 'agenttools') { $script:McpLabels['agenttools'] } else { $app.Name } }
+                else { $row.Server = $name }
+                $row.CanBlock = Get-McpBlockReason $row
+                if (-not $app -and -not $row.CanBlock) { $row.CanBlock = "No MCP server called '$name' is known in this tenant." }
+                Set-McpBlockState -Row $row -Policies $Report.Policies
+            }
+            $row
+        }
+    }
+}
+
+# The ids a block policy of this tool holds for its kind of subject.
+function Get-McpBlockSubjectIds {
+    param([object]$Policy, [ValidateSet('Identities', 'Users')][string]$Subject)
+    if ($Subject -eq 'Identities') { @($Policy.conditions.clientApplications.includeAgentIdServicePrincipals | Where-Object { $_ -and $_ -ne 'All' } | ForEach-Object { [string]$_ }) }
+    else { @($Policy.conditions.users.includeUsers | Where-Object { $_ -and $_ -notin 'None', 'All', 'AllAgentIdUsers' } | ForEach-Object { [string]$_ }) }
+}
+
+# The policy this tool keeps for one server, one kind of subject and one mode, or $null.
+function Find-McpBlockPolicy {
+    param([object[]]$Policies, [string]$AppId, [ValidateSet('Identities', 'Users')][string]$Subject, [ValidateSet('On', 'Report-only')][string]$Mode)
+    $state = if ($Mode -eq 'On') { 'enabled' } else { 'enabledForReportingButNotEnforced' }
+    foreach ($p in @($Policies)) {
+        if (-not ([string]$p.displayName).StartsWith($script:McpBlockPrefix) -or [string]$p.state -ne $state) { continue }
+        $apps = @($p.conditions.applications.includeApplications)
+        if ($apps.Count -ne 1 -or [string]$apps[0] -ne $AppId) { continue }
+        $forIdentities = @($p.conditions.clientApplications.includeAgentIdServicePrincipals | Where-Object { $_ }).Count -gt 0
+        if ($forIdentities -eq ($Subject -eq 'Identities')) { return $p }
+    }
+    $null
+}
+
+function New-McpBlockPolicyBody {
+    param([string]$AppId, [string]$ResourceName, [ValidateSet('Identities', 'Users')][string]$Subject, [string[]]$Ids, [ValidateSet('On', 'Report-only')][string]$Mode, [switch]$ConditionsOnly)
+    $conditions = if ($Subject -eq 'Identities') {
+        @{ users = @{ includeUsers = @('None') }; clientApplications = @{ includeAgentIdServicePrincipals = @($Ids) }; applications = @{ includeApplications = @($AppId) } }
+    } else { @{ users = @{ includeUsers = @($Ids) }; applications = @{ includeApplications = @($AppId) } } }
+    if ($ConditionsOnly) { return @{ conditions = $conditions } }
+    @{
+        displayName   = '{0}{1} for {2}{3}' -f $script:McpBlockPrefix, $ResourceName, $(if ($Subject -eq 'Identities') { 'agent identities' } else { 'agent user accounts' }), $(if ($Mode -eq 'Report-only') { ' (report-only)' } else { '' })
+        state         = $(if ($Mode -eq 'On') { 'enabled' } else { 'enabledForReportingButNotEnforced' })
+        conditions    = $conditions
+        grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+    }
+}
+
+# Put agents into, or take them out of, this tool's block policies. Items come from ConvertTo-McpBlockItem. Each policy is written
+# once however many agents change in it, and a policy left with nobody in it is deleted. An agent moves between the on and the
+# report-only policy of a server rather than sitting in both.
+function Invoke-McpBlockChange {
+    param([object[]]$Items, [switch]$PassThru)
+    $who = (Get-MgContext).Account
+    $policies = @(Get-CaPoliciesRaw)
+    $sets = @{}
+    $slot = {
+        param([string]$App, [string]$Name, [string]$Subject, [string]$Mode)
+        $k = '{0}|{1}|{2}' -f $App.ToLowerInvariant(), $Subject, $Mode
+        if (-not $sets.ContainsKey($k)) {
+            $p = Find-McpBlockPolicy -Policies $policies -AppId $App -Subject $Subject -Mode $Mode
+            $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            if ($p) { foreach ($i in (Get-McpBlockSubjectIds -Policy $p -Subject $Subject)) { [void]$ids.Add($i) } }
+            $sets[$k] = [pscustomobject]@{ AppId = $App; Name = $Name; Subject = $Subject; Mode = $Mode; Policy = $p; Ids = $ids; Changed = $false; Error = '' }
+        }
+        $sets[$k]
+    }
+    $log = New-Object 'System.Collections.Generic.List[object]'; $touched = @{}
+    Write-Host ("`nMCP block changes for {0} agent and server pair(s):" -f @($Items).Count) -ForegroundColor Cyan
+    foreach ($it in @($Items)) {
+        $users = @($it.AgentUserIds | Where-Object { $_ })
+        $target = [string]$it.Target
+        $rec = [ordered]@{
+            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $(if ($target) { 'blockmcp' } else { 'unblockmcp' })
+            Agent = $it.Agent; AgentId = $it.AgentId; IdentityId = $it.IdentityId; AgentUserIds = ($users -join ';'); Server = $it.Server
+            ResourceAppId = $it.ResourceAppId; ResourceName = $it.ResourceName; Mode = $(if ($target) { $target } else { 'Removed' }); WasMode = ''; Policies = ''; Result = ''; Error = ''
+        }
+        $label = '{0} -> {1}' -f $it.Agent, $it.Server
+        if (-not $it.IdentityId -or -not $it.ResourceAppId) {
+            $rec.Result = 'Skipped'; $rec.Error = 'No agent identity, or no Entra application for the server.'
+            Write-Host ("  SKIP {0}: {1}" -f $label, $rec.Error) -ForegroundColor DarkGray; $log.Add([pscustomobject]$rec); continue
+        }
+        $subjects = @([pscustomobject]@{ Subject = 'Identities'; Ids = @([string]$it.IdentityId) }) + @(if ($users.Count) { [pscustomobject]@{ Subject = 'Users'; Ids = $users } })
+        $mine = [ordered]@{}
+        foreach ($s in $subjects) { foreach ($m in 'On', 'Report-only') { $mine["$($s.Subject)|$m"] = & $slot $it.ResourceAppId $it.ResourceName $s.Subject $m } }
+        $rec.WasMode = if ($mine['Identities|On'].Ids.Contains([string]$it.IdentityId)) { 'On' } elseif ($mine['Identities|Report-only'].Ids.Contains([string]$it.IdentityId)) { 'Report-only' } else { '' }
+        $inPlace = $true
+        foreach ($s in $subjects) { foreach ($id in $s.Ids) { foreach ($m in 'On', 'Report-only') { if (($m -eq $target) -ne $mine["$($s.Subject)|$m"].Ids.Contains($id)) { $inPlace = $false } } } }
+        if ($inPlace) {
+            $rec.Result = 'Skipped'
+            $rec.Error = switch ($target) { 'On' { 'Already blocked.' } 'Report-only' { 'Already in report-only.' } default { 'Not in a block policy made by this tool (a policy made by hand is left alone).' } }
+            Write-Host ("  SKIP {0}: {1}" -f $label, $rec.Error) -ForegroundColor DarkGray
+        }
+        elseif (-not (Test-Proceed $label $(switch ($target) { 'On' { 'Block MCP server' } 'Report-only' { 'Block MCP server in report-only mode' } default { 'Remove MCP server block' } }))) { $rec.Result = 'WhatIf' }
+        else {
+            foreach ($s in $subjects) {
+                foreach ($m in 'On', 'Report-only') {
+                    $set = $mine["$($s.Subject)|$m"]
+                    foreach ($id in $s.Ids) { if ($m -eq $target) { if ($set.Ids.Add($id)) { $set.Changed = $true } } elseif ($set.Ids.Remove($id)) { $set.Changed = $true } }
+                }
+            }
+            $rec.Result = 'Pending'; $touched[$log.Count] = @($mine.Values)
+        }
+        $log.Add([pscustomobject]$rec)
+    }
+    foreach ($set in @($sets.Values | Where-Object { $_.Changed })) {
+        try {
+            if ($set.Ids.Count -eq 0) {
+                if ($set.Policy) { Invoke-Graph -Method DELETE -Uri ('{0}/{1}' -f $script:CaPolicyBase, $set.Policy.id) | Out-Null }
+            } elseif ($set.Policy) {
+                $body = New-McpBlockPolicyBody -AppId $set.AppId -ResourceName $set.Name -Subject $set.Subject -Ids @($set.Ids) -Mode $set.Mode -ConditionsOnly
+                Invoke-Graph -Method PATCH -Uri ('{0}/{1}' -f $script:CaPolicyBase, $set.Policy.id) -Body ($body | ConvertTo-Json -Depth 8) -ContentType 'application/json' | Out-Null
+            } else {
+                $body = New-McpBlockPolicyBody -AppId $set.AppId -ResourceName $set.Name -Subject $set.Subject -Ids @($set.Ids) -Mode $set.Mode
+                $set.Policy = Invoke-Graph -Method POST -Uri $script:CaPolicyBase -Body ($body | ConvertTo-Json -Depth 8) -ContentType 'application/json'
+            }
+        } catch {
+            $msg = $_.Exception.Message
+            if ($msg -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $msg += ' (this needs the Policy.ReadWrite.ConditionalAccess permission and the Conditional Access Administrator role)' }
+            $set.Error = $msg
+        }
+    }
+    $ok = 0; $fail = 0; $skip = 0
+    for ($i = 0; $i -lt $log.Count; $i++) {
+        $rec = $log[$i]
+        if ($rec.Result -eq 'Skipped') { $skip++ }
+        if ($rec.Result -ne 'Pending') { continue }
+        $mine = @($touched[$i])
+        $bad = @($mine | Where-Object { $_.Changed -and $_.Error })
+        $rec.Policies = (@($mine | Where-Object { $_.Mode -eq $rec.Mode } | ForEach-Object {
+            if ($_.Policy -and $_.Policy.displayName) { [string]$_.Policy.displayName } else { [string](New-McpBlockPolicyBody -AppId $_.AppId -ResourceName $_.Name -Subject $_.Subject -Ids @('x') -Mode $_.Mode).displayName } }) -join '; ')
+        $label = '{0} -> {1}' -f $rec.Agent, $rec.Server
+        if ($bad.Count) {
+            $rec.Result = 'Failed'; $rec.Error = (@($bad | ForEach-Object { $_.Error }) | Get-Distinct) -join '; '; $fail++
+            Write-Host ("  FAIL {0}: {1}" -f $label, $rec.Error) -ForegroundColor Red
+        } else {
+            $rec.Result = 'Done'; $ok++
+            Write-Host ("  OK   {0}: {1}" -f $label, $(switch ($rec.Mode) { 'On' { 'blocked' } 'Report-only' { 'report-only' } default { 'block removed' } })) -ForegroundColor Green
+        }
+    }
+    Write-Host ("Done: {0} changed, {1} skipped, {2} failed." -f $ok, $skip, $fail) -ForegroundColor Cyan
+    if ($ok) { Write-Host 'Conditional Access applies at the agent''s next token request; a token already issued stays valid for up to an hour. Report-only blocks nothing and records what would have been blocked in the Entra sign-in logs.' -ForegroundColor Yellow }
+    Export-ActionLog -Records $log.ToArray()
+    if ($PassThru) { $log.ToArray() }
+}
+
+# Undo items from a log of MCP block changes: each pair goes back to the mode it was in before.
+function ConvertTo-McpUndoItems {
+    param([object[]]$Records)
+    @($Records | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'blockmcp', 'unblockmcp' } | ForEach-Object {
+        [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; IdentityId = $_.IdentityId; AgentUserIds = @(([string]$_.AgentUserIds).Split(';', [StringSplitOptions]::RemoveEmptyEntries))
+                           Server = $_.Server; ResourceAppId = $_.ResourceAppId; ResourceName = $_.ResourceName; Target = [string]$_.WasMode }
+    })
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4565,6 +5333,7 @@ $GuiXaml = @'
               </ContextMenu>
             </Button.ContextMenu>
           </Button>
+          <Button x:Name="BtnMcp" Content="MCP access..." Style="{StaticResource Btn}" Margin="8,0,0,0" ToolTip="Which MCP servers each agent may reach, sets up and calls, and a Conditional Access block for chosen agents and one server. Uses the ticked agents, or every agent when none is ticked."/>
         </StackPanel>
         <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
           <CheckBox x:Name="IdentityBox" Content="Verify identity state" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="Checks that the agent's Entra identity ends up disabled after a block (enabled after an unblock). The platform normally does this itself within seconds; the tool only forces it if that did not happen."/>
@@ -5854,6 +6623,220 @@ function New-AgentAlertsWindow {
     $d
 }
 
+$McpAccessXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MCP access" Width="1320" Height="800" MinWidth="980" MinHeight="540" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="#F3F4F6" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,6"/></Style>
+    <Style x:Key="Grid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/><Setter Property="HorizontalGridLinesBrush" Value="#F0F1F3"/><Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Background" Value="White"/><Setter Property="RowHeaderWidth" Value="0"/><Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="SelectionMode" Value="Single"/>
+    </Style>
+  </Window.Resources>
+  <Grid>
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="220"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Border Background="White" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1" Padding="24,14">
+      <StackPanel>
+        <TextBlock FontSize="20" FontWeight="SemiBold" Foreground="#1F2937" Text="MCP servers and tools used by agents"/>
+        <TextBlock x:Name="McSummary" Foreground="#4B5563" Margin="0,2,0,0" TextWrapping="Wrap" Text="Loading..."/>
+      </StackPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="16,10" Background="#F9FAFB" BorderBrush="#E5E7EB" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <Button x:Name="BtnMcExport" Content="Export" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Save the rows shown as CSV or JSON."/>
+        <Button x:Name="BtnMcLoad" Content="Refresh" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="12,0,0,0" ToolTip="Read the permissions, the agents' MCP servers, the tool calls and the Conditional Access policies again."/>
+        <TextBox x:Name="McSearch" DockPanel.Dock="Right" Width="180" Height="30" Margin="12,0,0,0" VerticalContentAlignment="Center" ToolTip="Show only rows whose agent, server, tools, permission or block contains this text."/>
+        <ComboBox x:Name="McShowBox" DockPanel.Dock="Right" SelectedIndex="0" Width="210" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="Which rows to show.">
+          <ComboBoxItem Content="Everything" Tag="All"/><ComboBoxItem Content="Permission, but not used" Tag="Unused"/><ComboBoxItem Content="Used in this period" Tag="Used"/><ComboBoxItem Content="Blocked or report-only" Tag="Blocked"/>
+        </ComboBox>
+        <ComboBox x:Name="McDaysBox" DockPanel.Dock="Right" SelectedIndex="2" Width="120" VerticalAlignment="Center" Margin="12,0,0,0" ToolTip="The period for calls and for 'not used'. Defender keeps about 30 days.">
+          <ComboBoxItem Content="Last 7 days" Tag="7"/><ComboBoxItem Content="Last 14 days" Tag="14"/><ComboBoxItem Content="Last 30 days" Tag="30"/>
+        </ComboBox>
+        <TextBlock x:Name="McNote" TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#4B5563"/>
+      </DockPanel>
+    </Border>
+    <DataGrid x:Name="McGrid" Grid.Row="2" Style="{StaticResource Grid}" SelectionMode="Extended">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Agent" Binding="{Binding Agent}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="MCP server" Binding="{Binding Server}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Permission" Binding="{Binding Permission}" Width="105" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridCheckBoxColumn Header="Set up" Binding="{Binding Declared, Mode=OneWay}" Width="66"/>
+        <DataGridTextColumn Header="Calls" Binding="{Binding Calls}" Width="58" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Last call" Binding="{Binding LastCall, StringFormat=yyyy-MM-dd HH:mm}" Width="125" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Tools called" Binding="{Binding Tools}" Width="1.6*" ElementStyle="{StaticResource Wrap}"/>
+        <DataGridTextColumn Header="Block" Binding="{Binding Block}" Width="105">
+          <DataGridTextColumn.ElementStyle>
+            <Style TargetType="TextBlock">
+              <Setter Property="FontWeight" Value="SemiBold"/><Setter Property="Foreground" Value="#6B7280"/><Setter Property="VerticalAlignment" Value="Top"/><Setter Property="Padding" Value="0,6"/><Setter Property="TextWrapping" Value="Wrap"/>
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding Block}" Value="Blocked"><Setter Property="Foreground" Value="#B91C1C"/></DataTrigger>
+                <DataTrigger Binding="{Binding Block}" Value="Partly blocked"><Setter Property="Foreground" Value="#B45309"/></DataTrigger>
+                <DataTrigger Binding="{Binding Block}" Value="Report-only"><Setter Property="Foreground" Value="#1D4ED8"/></DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </DataGridTextColumn.ElementStyle>
+        </DataGridTextColumn>
+        <DataGridTextColumn Header="Note" Binding="{Binding Note}" Width="1.8*" ElementStyle="{StaticResource Wrap}"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Grid.Row="3" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0">
+      <DataGrid x:Name="McDetailGrid" Style="{StaticResource Grid}">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Section" Binding="{Binding Section}" Width="100" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Item" Binding="{Binding Item}" Width="1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Info" Binding="{Binding Info}" Width="3.5*" ElementStyle="{StaticResource Wrap}"/>
+        </DataGrid.Columns>
+      </DataGrid>
+    </Border>
+    <Border Grid.Row="4" Background="White" BorderBrush="#E5E7EB" BorderThickness="0,1,0,0" Padding="16,10">
+      <DockPanel>
+        <Button x:Name="BtnMcBlock" Content="Block..." DockPanel.Dock="Right" Style="{DynamicResource BtnDanger}" MinWidth="110" Margin="10,0,0,0" IsEnabled="False" ToolTip="Block the selected agents from the selected MCP servers with a Conditional Access policy for each server."/>
+        <Button x:Name="BtnMcReport" Content="Block in report-only..." DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Set the same block in report-only mode: nothing is blocked, and Entra's sign-in logs record what would have been."/>
+        <Button x:Name="BtnMcUnblock" Content="Remove block" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Take the selected agents out of the block policies this tool made for those servers."/>
+        <TextBlock TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#6B7280" Text="The Agent 365 Tools registry and its Block for every agent have no public API, so registry status is not shown. A block here is a Conditional Access policy for the chosen agents and that server only. It applies when an agent asks for a token, and does not cover an agent acting on behalf of a signed-in person, or Copilot Studio agents, which reach MCP servers through Power Platform connectors."/>
+      </DockPanel>
+    </Border>
+  </Grid>
+</Window>
+'@
+
+# Fill the window from the report it holds, or read it first (-Load). The period, the filter and the search only change what is shown.
+function Update-McpAccessWindow {
+    param([System.Windows.Window]$Window, [switch]$Load)
+    $note = $Window.FindName('McNote'); $grid = $Window.FindName('McGrid'); $btn = $Window.FindName('BtnMcLoad'); $summary = $Window.FindName('McSummary'); $detail = $Window.FindName('McDetailGrid')
+    if ($Load) {
+        try {
+            $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
+            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
+            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            foreach ($s in 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'Policy.Read.All') {
+                if (-not (Test-GraphScope $s)) { & $pump "Granting $s`: finish the sign-in window..."; Request-GraphScope $s }
+            }
+            $Window.Tag = Get-McpAccessReport -Packages $script:mcpState.Packages -OnlyIds $script:mcpState.OnlyIds -OnStatus $pump
+        } catch {
+            $note.Text = 'Could not read MCP access: ' + $_.Exception.Message
+            return
+        } finally { $btn.IsEnabled = $true; $Window.Cursor = $null }
+    }
+    $report = $Window.Tag
+    if (-not $report) { $grid.ItemsSource = @(); $detail.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; Update-McpButtons -Window $Window; return }
+    $days = [int]$Window.FindName('McDaysBox').SelectedItem.Tag
+    $all = @(Select-McpAccessRows -Rows $report.Rows -Days $days)
+    $shown = @(Select-McpAccessRows -Rows $report.Rows -Days $days -Show ([string]$Window.FindName('McShowBox').SelectedItem.Tag) -Text $Window.FindName('McSearch').Text)
+    $grid.ItemsSource = $shown
+    $s = Get-McpAccessSummary -Rows $all -Days $days
+    $scope = if ($script:mcpState.OnlyIds.Count) { "the $($script:mcpState.OnlyIds.Count) ticked agent(s)" } else { 'all agents' }
+    $summary.Text = ("Last {0} days, {1}: {2} MCP server(s) across {3} agent(s). {4} agent and server pair(s) hold a permission: {5} used, {6} not used. {7} tool call(s). {8} pair(s) blocked by Conditional Access, {9} in report-only.{10}{11}" -f
+        $days, $scope, $s.Servers, $s.Agents, $s.Granted, $s.GrantedUsed, $s.Unused, $s.Calls, $s.Blocked, $s.ReportOnly,
+        $(if ($s.Others) { " $($s.Others) blueprint(s) or application(s) that are not catalog agents also hold MCP permissions." } else { '' }),
+        $(if ($s.Connectors) { " $($s.Connectors) agent(s) reach MCP servers through Power Platform connectors." } else { '' }))
+    $note.Text = if ($shown.Count) { "{0} row(s). Select one or more to block or unblock; the pane below explains the highlighted one." -f $shown.Count } else { 'Nothing to show for this period and filter.' }
+    if ($shown.Count) { $grid.SelectedIndex = 0 }
+    $detail.ItemsSource = @(if ($grid.SelectedItem) { Get-McpAccessDetailRows $grid.SelectedItem })
+    Update-McpButtons -Window $Window
+}
+
+# Which of the block buttons apply to the selected rows.
+function Update-McpButtons {
+    param([System.Windows.Window]$Window)
+    $sel = @($Window.FindName('McGrid').SelectedItems)
+    $ok = @($sel | Where-Object { -not $_.CanBlock })
+    $block = $Window.FindName('BtnMcBlock'); $report = $Window.FindName('BtnMcReport'); $unblock = $Window.FindName('BtnMcUnblock')
+    $block.IsEnabled = @($ok | Where-Object { $_.Block -ne 'Blocked' }).Count -gt 0
+    $report.IsEnabled = @($ok | Where-Object { $_.Block -ne 'Report-only' }).Count -gt 0
+    $unblock.IsEnabled = @($ok | Where-Object { $_.Block }).Count -gt 0
+    $why = @($sel | Where-Object { $_.CanBlock })
+    $block.ToolTip = if ($sel.Count -and -not $ok.Count -and $why.Count) { "Cannot be blocked: $($why[0].CanBlock)" } else { 'Block the selected agents from the selected MCP servers with a Conditional Access policy for each server.' }
+}
+
+# Block the selected rows, in either mode, or remove their block. Asks first, naming every agent and server.
+function Invoke-McpWindowBlock {
+    param([System.Windows.Window]$Window, [ValidateSet('On', 'Report-only', 'Remove')][string]$Mode)
+    $grid = $Window.FindName('McGrid'); $note = $Window.FindName('McNote')
+    $sel = @($grid.SelectedItems)
+    $ready = @($sel | Where-Object { -not $_.CanBlock -and ($Mode -ne 'Remove' -or $_.Block) })
+    if ($ready.Count -eq 0) {
+        $why = @($sel | Where-Object { $_.CanBlock } | Select-Object -First 3 | ForEach-Object { "$($_.Agent) -> $($_.Server): $($_.CanBlock)" })
+        [void][Windows.MessageBox]::Show($(if ($why.Count) { $why -join "`n`n" } else { 'None of the selected rows has a block to remove.' }), 'MCP access', 'OK', 'Information')
+        return
+    }
+    $pump = { $Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
+    try {
+        if (-not (Test-GraphScope 'Policy.ReadWrite.ConditionalAccess')) {
+            $note.Text = 'Granting write access to Conditional Access: finish the sign-in window...'; & $pump
+            Request-GraphScope 'Policy.ReadWrite.ConditionalAccess'
+        }
+    } catch { $note.Text = 'Sign-in failed: ' + $_.Exception.Message; return }
+    $list = (($ready | Select-Object -First 12 | ForEach-Object { "  - {0}  ->  {1}" -f $_.Agent, $_.Server }) -join "`n") + $(if ($ready.Count -gt 12) { "`n  ... and $($ready.Count - 12) more" } else { '' })
+    $text = switch ($Mode) {
+        'On' { "Block $($ready.Count) agent and MCP server pair(s)?`n`n$list`n`nConditional Access will refuse each agent a token for that server, for its own identity and its agent user accounts. A token already issued stays valid for up to an hour. It does not cover an agent acting on behalf of a signed-in person. Undo last run removes the block." }
+        'Report-only' { "Block $($ready.Count) agent and MCP server pair(s) in report-only mode?`n`n$list`n`nReport-only blocks nothing. Entra's sign-in logs record what would have been blocked, so you can check the effect first. Undo last run removes it." }
+        default { "Remove the block of $($ready.Count) agent and MCP server pair(s)?`n`n$list`n`nOnly the policies this tool made change; a policy made by hand is left alone." }
+    }
+    if ($Mode -ne 'Remove' -and @($ready | Where-Object { $_.ServerKey -eq 'agenttools' }).Count) { $text += "`n`nAgent Tools (shared permission) covers every MCP server the shared permission reaches, so those agents lose all of them." }
+    if ($sel.Count -gt $ready.Count) { $text += "`n`n$($sel.Count - $ready.Count) selected row(s) cannot be changed and are left out." }
+    if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', $(if ($Mode -eq 'On') { 'Warning' } else { 'Question' }), 'No') -ne 'Yes') { return }
+    if ($script:ctx) { & $script:ctx.NewLogPath $(if ($Mode -eq 'Remove') { 'mcp-unblock' } else { 'mcp-block' }) }
+    $note.Text = 'Updating Conditional Access...'; & $pump
+    $target = if ($Mode -eq 'Remove') { '' } else { $Mode }
+    $recs = @(Invoke-McpBlockChange -Items @($ready | ForEach-Object { ConvertTo-McpBlockItem -Row $_ -Target $target }) -PassThru)
+    try {
+        $policies = @(Get-CaPoliciesRaw)
+        $Window.Tag.Policies = $policies
+        foreach ($r in $Window.Tag.Rows) { Set-McpBlockState -Row $r -Policies $policies }
+    } catch { $null = $_ }
+    $done = @($recs | Where-Object { $_.Result -eq 'Done' })
+    if ($done.Count) { $script:mcpState.LastRun = $done }
+    $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+    $grid.Items.Refresh()
+    $Window.FindName('McDetailGrid').ItemsSource = @(if ($grid.SelectedItem) { Get-McpAccessDetailRows $grid.SelectedItem })
+    Update-McpButtons -Window $Window
+    $note.Text = ("{0} changed, {1} skipped, {2} failed.{3}" -f $done.Count, @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count, $failed.Count, $(if ($script:OutFile) { " Log: $script:OutFile" } else { '' }))
+    if ($failed.Count) {
+        $why = (@($failed | Select-Object -First 5 | ForEach-Object { "$($_.Agent) -> $($_.Server): $($_.Error)" }) -join "`n")
+        [void][Windows.MessageBox]::Show("$($failed.Count) change(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
+    }
+}
+
+function New-McpAccessWindow {
+    param([System.Windows.Window]$Owner, [object[]]$Packages, [string[]]$OnlyIds, [int]$Days = 30)
+    $d = [Windows.Markup.XamlReader]::Parse($McpAccessXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:mcWindow = $d
+    $script:mcpState = @{ Packages = @($Packages); OnlyIds = @($OnlyIds | Where-Object { $_ }); LastRun = @() }
+    $box = $d.FindName('McDaysBox')
+    for ($i = 0; $i -lt $box.Items.Count; $i++) { if ([int]$box.Items[$i].Tag -eq $Days) { $box.SelectedIndex = $i } }
+    $d.FindName('BtnMcLoad').Add_Click({ Update-McpAccessWindow -Window $script:mcWindow -Load })
+    $d.FindName('McDaysBox').Add_SelectionChanged({ Update-McpAccessWindow -Window $script:mcWindow })
+    $d.FindName('McShowBox').Add_SelectionChanged({ Update-McpAccessWindow -Window $script:mcWindow })
+    $d.FindName('McSearch').Add_TextChanged({ Update-McpAccessWindow -Window $script:mcWindow })
+    $d.FindName('McGrid').Add_SelectionChanged({
+        $item = $script:mcWindow.FindName('McGrid').SelectedItem
+        $script:mcWindow.FindName('McDetailGrid').ItemsSource = @(if ($item) { Get-McpAccessDetailRows $item })
+        Update-McpButtons -Window $script:mcWindow
+    })
+    $d.FindName('BtnMcBlock').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode On })
+    $d.FindName('BtnMcReport').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode Report-only })
+    $d.FindName('BtnMcUnblock').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode Remove })
+    $d.FindName('BtnMcExport').Add_Click({
+        $shown = @($script:mcWindow.FindName('McGrid').ItemsSource)
+        if ($shown.Count -eq 0) { return }
+        $dlg = New-Object Microsoft.Win32.SaveFileDialog
+        $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'mcp-access.csv'
+        if (-not $dlg.ShowDialog()) { return }
+        $out = @($shown | Select-Object Agent, AgentId, Kind, Platform, Server, @{ n = 'EntraApplication'; e = { $_.ResourceAppId } }, Permission, @{ n = 'PermissionDetail'; e = { $_.PermParts -join ' | ' } },
+            @{ n = 'SetUp'; e = { $_.Declared } }, Calls, Calls7, Calls14, Calls30, Connects, Errors, LastCall, Tools, Via, Block, BlockText, BlockPolicies, @{ n = 'CannotBlockBecause'; e = { $_.CanBlock } }, Note)
+        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
+        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+    })
+    $d.Add_ContentRendered({ if (-not $script:mcWindow.Tag) { Update-McpAccessWindow -Window $script:mcWindow -Load } })
+    $d
+}
+
 function New-DetailWindow {
     param([object]$Row, [System.Windows.Window]$Owner)
     $d = [Windows.Markup.XamlReader]::Parse($DetailXaml)
@@ -5992,7 +6975,7 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnDefenderAlerts', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'BtnMcp', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnAgentUsers', 'BtnPolicyHits', 'BtnDefenderAlerts', 'BtnEndpointAi', 'BtnRestrict', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
@@ -6522,6 +7505,11 @@ function New-ConsoleWindow {
         $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
         (New-AgentAlertsWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked -Days 30).ShowDialog() | Out-Null
     })
+    $script:ui.BtnMcp.Add_Click({
+        $ticked = @($script:ctx.Rows | Where-Object { $_.Checked } | ForEach-Object { $_.Id })
+        (New-McpAccessWindow -Owner $script:w -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnlyIds $ticked).ShowDialog() | Out-Null
+        if (@($script:mcpState.LastRun).Count) { $script:ctx.LastRun = @($script:mcpState.LastRun); & $script:ctx.Summary }
+    })
     $script:ui.BtnDetails.Add_Click({ & $script:ctx.ShowDetails })
     $script:ui.Grid.Add_MouseDoubleClick({ param($s, $e) if ($e.OriginalSource -is [Windows.Controls.TextBlock] -or $e.OriginalSource -is [Windows.Controls.Border]) { & $script:ctx.ShowDetails } })
     $script:ui.Grid.Add_SelectionChanged({ $script:ui.BtnDetails.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem); $script:ui.BtnAi.IsEnabled = ($null -ne $script:ui.Grid.SelectedItem) })
@@ -6698,6 +7686,18 @@ function New-ConsoleWindow {
             & $script:ctx.Idle ("Restored access for {0} agent(s)." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count)
             return
         }
+        if ($done.Count -gt 0 -and $done[0].Action -in 'blockmcp', 'unblockmcp') {
+            if ([Windows.MessageBox]::Show("Put $($done.Count) agent and MCP server pair(s) back the way they were before (blocked, report-only or not blocked)?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            try { if (-not (Test-GraphScope 'Policy.ReadWrite.ConditionalAccess')) { & $script:ctx.Busy 'Granting write access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.ReadWrite.ConditionalAccess' } }
+            catch { & $script:ctx.Idle 'Sign-in failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Undo last run', 'OK', 'Error'); return }
+            & $script:ctx.NewLogPath 'mcp-undo'
+            & $script:ctx.Busy 'Restoring the MCP blocks...'
+            $recs = @(Invoke-McpBlockChange -Items @(ConvertTo-McpUndoItems $done) -PassThru)
+            $script:ctx.LastRun = @()
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("MCP blocks restored for {0} pair(s), {1} failed. Log: {2}" -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, @($recs | Where-Object { $_.Result -eq 'Failed' }).Count, $script:OutFile)
+            return
+        }
         if ($done.Count -gt 0 -and $done[0].Action -eq 'confirmcompromised') {
             $note = Get-DismissNote $done
             $ask = "Dismiss the compromised flag of $($done.Count) agent$(if ($done.Count -ne 1) { 's' }) in Microsoft Entra?" + $(if ($note) { "`n`n$note" } else { '' })
@@ -6707,7 +7707,8 @@ function New-ConsoleWindow {
             & $script:ctx.Refilter
             & $script:ctx.Idle ("Dismissal accepted for {0} agent(s), {1} had no Entra risk to dismiss. Entra shows it within a few minutes." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count)
             return
-        }        if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
+        }
+        if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
             if ([Windows.MessageBox]::Show("Remove the sponsor or owner added to $($done.Count) agent identit$(if ($done.Count -eq 1) { 'y' } else { 'ies' })?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
             Invoke-AccountabilityRemove -Records $done
             $script:ctx.LastRun = @()
@@ -6881,7 +7882,8 @@ switch ($PSCmdlet.ParameterSetName) {
                                    App = (@($g | ForEach-Object { $_.App } | Where-Object { $_ } | Get-Distinct) -join '; ')
                                    Hits = [int](@($g | ForEach-Object { $_.Hits }) | Measure-Object -Sum).Sum
                                    Last = (@($g | ForEach-Object { $_.Last } | Where-Object { $_ }) | Sort-Object -Descending | Select-Object -First 1) } } | Sort-Object Hits -Descending)
-            foreach ($r in $loose) { Format-PolicyHitLines $r | ForEach-Object { Write-Host $_ } }            Write-Host 'An application id that no agent in Defender''s inventory carries may belong to an agent Defender does not list. The item and the person can hint at the agent.' -ForegroundColor DarkGray
+            foreach ($r in $loose) { Format-PolicyHitLines $r | ForEach-Object { Write-Host $_ } }
+            Write-Host 'An application id that no agent in Defender''s inventory carries may belong to an agent Defender does not list. The item and the person can hint at the agent.' -ForegroundColor DarkGray
         }
         if ($s.InsiderRisk -eq 0) { Write-Host 'No Insider Risk alert in this period. Insider Risk alerts reach this tool through the Microsoft Graph alerts API; a risky-agents policy that raised none shows nothing here.' -ForegroundColor DarkGray }
         Write-Host 'This shows what fired, not which policies are configured for agents. Communication Compliance has no alert or event source here. A hit is tied to an agent through the application id it names or through an agent user account; the rest stays unattributed.' -ForegroundColor DarkGray
@@ -6889,6 +7891,56 @@ switch ($PSCmdlet.ParameterSetName) {
             [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; ApplicationId = $_.App; TiedBy = $_.Tied; Source = $_.Source; Policy = $_.Policy; Rule = $_.Rule; WhatItDid = $_.Did; Actions = $_.Actions; Severity = $_.Severity
                                Where = $_.Where; Item = $_.Item; ItemPath = $_.ItemPath; Person = $_.User; Hits = $_.Hits; Last7Days = $_.N7; Last14Days = $_.N14; Last30Days = $_.N30
                                LastHit = $(if ($_.Last) { $_.Last.ToString('o') } else { '' }); Link = $_.Link } })
+    }
+    'McpAccess' {
+        $ForAgent = ConvertTo-NameList $ForAgent
+        $pk = @(Get-Packages)
+        $only = @(if ($ForAgent) { Resolve-Packages $ForAgent -Catalog $pk | ForEach-Object { $_.id } })
+        $report = Get-McpAccessReport -Packages $pk -OnlyIds $only -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        $all = @(Select-McpAccessRows -Rows $report.Rows -Days $McpDays)
+        $rows = @(Select-McpAccessRows -Rows $report.Rows -Days $McpDays -Show $(if ($Unused) { 'Unused' } else { 'All' }))
+        $s = Get-McpAccessSummary -Rows $all -Days $McpDays
+        if ($all.Count -eq 0) { Write-Host ("No MCP permission, MCP server set-up or MCP tool call found{0}." -f $(if ($ForAgent) { ' for those agents' } else { '' })) -ForegroundColor Yellow; break }
+        Write-Host ("`nLast {0} days: {1} MCP server(s) across {2} agent(s). {3} agent and server pair(s) hold a permission: {4} used, {5} not used. {6} tool call(s). {7} pair(s) blocked by Conditional Access, {8} in report-only." -f
+            $McpDays, $s.Servers, $s.Agents, $s.Granted, $s.GrantedUsed, $s.Unused, $s.Calls, $s.Blocked, $s.ReportOnly) -ForegroundColor Cyan
+        if ($s.Others) { Write-Host ("{0} blueprint(s) or application(s) that are not catalog agents also hold MCP permissions; they are listed with their kind." -f $s.Others) -ForegroundColor Yellow }
+        Write-Host "`nBy server:" -ForegroundColor Cyan
+        Get-McpAccessByServer -Rows $all -Days $McpDays | Select-Object @{ n = 'server'; e = { $_.Server } }, @{ n = 'agents with permission'; e = { $_.WithPermission } }, @{ n = 'set up'; e = { $_.SetUp } },
+            @{ n = 'agents that called it'; e = { $_.Called } }, @{ n = 'calls'; e = { $_.Calls } }, @{ n = 'blocked'; e = { $_.Blocked } } | Format-Table -AutoSize | Out-Host
+        if ($rows.Count) {
+            Write-Host $(if ($Unused) { 'Permissions with no call in this period:' } else { 'By agent:' }) -ForegroundColor Cyan
+            $rows | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'server'; e = { $_.Server } }, @{ n = 'permission'; e = { $_.Permission } }, @{ n = 'set up'; e = { if ($_.Declared) { 'Yes' } else { '' } } },
+                @{ n = 'calls'; e = { $_.Calls } }, @{ n = 'last call'; e = { if ($_.LastCall) { ([datetime]$_.LastCall).ToString('yyyy-MM-dd') } } }, @{ n = 'block'; e = { $_.Block } }, @{ n = 'note'; e = { $_.Note } } | Format-Table -AutoSize -Wrap | Out-Host
+        } elseif ($Unused) { Write-Host 'Every MCP permission was used in this period.' -ForegroundColor Green }
+        if ($s.Connectors) { Write-Host ("{0} agent(s) reach MCP servers through Power Platform connectors (Copilot Studio). Conditional Access for agents does not cover those; use a Power Platform data policy." -f $s.Connectors) -ForegroundColor DarkGray }
+        Write-Host 'The Agent 365 Tools registry and its Block for every agent have no public API, so registry status is not shown. -BlockMcp <server> -ForAgent <agent> blocks one server for chosen agents with Conditional Access.' -ForegroundColor DarkGray
+        Export-ActionLog -Records @($rows | ForEach-Object {
+            [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; Kind = $_.Kind; Platform = $_.Platform; Server = $_.Server; EntraApplication = $_.ResourceAppId; Permission = $_.Permission
+                               PermissionDetail = ($_.PermParts -join ' | '); SetUp = $_.Declared; SetUpAs = $_.DeclaredAs; Calls = $_.Calls; Last7Days = $_.Calls7; Last14Days = $_.Calls14; Last30Days = $_.Calls30
+                               Connections = $_.Connects; Errors = $_.Errors; LastCall = $(if ($_.LastCall) { ([datetime]$_.LastCall).ToString('o') } else { '' }); Tools = $_.Tools; Through = $_.Via
+                               Block = $_.Block; BlockDetail = $_.BlockText; BlockPolicies = $_.BlockPolicies; CannotBlockBecause = $_.CanBlock; Note = $_.Note } })
+    }
+    { $_ -in 'BlockMcp', 'UnblockMcp' } {
+        $blocking = $_ -eq 'BlockMcp'
+        $ForAgent = ConvertTo-NameList $ForAgent
+        $servers = ConvertTo-NameList $(if ($blocking) { $BlockMcp } else { $UnblockMcp })
+        $pk = @(Get-Packages)
+        $targets = @(Resolve-Packages $ForAgent -Catalog $pk)
+        $report = Get-McpAccessReport -Packages $pk -OnlyIds @($targets | ForEach-Object { $_.id }) -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        $rows = @(Resolve-McpBlockRows -Report $report -Packages $targets -Servers $servers)
+        if ($rows.Count -eq 0) { Write-Host 'Nothing matches those agents and servers.' -ForegroundColor Yellow; break }
+        $rows | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'server'; e = { $_.Server } }, @{ n = 'permission'; e = { $_.Permission } }, @{ n = 'block now'; e = { $_.Block } },
+            @{ n = 'cannot change because'; e = { $_.CanBlock } } | Format-Table -AutoSize -Wrap | Out-Host
+        $mode = if (-not $blocking) { '' } elseif ($ReportOnly) { 'Report-only' } else { 'On' }
+        $ready = @($rows | Where-Object { -not $_.CanBlock })
+        if ($ready.Count -eq 0) { Write-Host 'None of them can be changed by this tool; the reasons are above.' -ForegroundColor Yellow; break }
+        if ($blocking) {
+            Write-Host ("Conditional Access will refuse {0} a token for these servers, for the agent identity and its agent user accounts{1}. It does not cover an agent acting on behalf of a signed-in person. -UnblockMcp or -Undo removes it." -f
+                $(if (@($ready | ForEach-Object { $_.AgentId } | Get-Distinct).Count -eq 1) { 'this agent' } else { 'these agents' }), $(if ($ReportOnly) { ', in report-only mode, which blocks nothing and records what would have been blocked' } else { '' })) -ForegroundColor Yellow
+            if (@($ready | Where-Object { $_.ServerKey -eq 'agenttools' }).Count) { Write-Warning 'Agent Tools (shared permission) covers every MCP server the shared permission reaches, so those agents lose all of them.' }
+        }
+        if (-not (Confirm-Batch -Count $ready.Count -Action $(if ($blocking) { 'block MCP access for' } else { 'remove the MCP block of' }))) { Write-Host 'Cancelled.'; break }
+        Invoke-McpBlockChange -Items @($ready | ForEach-Object { ConvertTo-McpBlockItem -Row $_ -Target $mode })
     }
     'BlockLocalAgent' {
         $BlockLocalAgent = ConvertTo-NameList $BlockLocalAgent; $ForDevice = ConvertTo-NameList $ForDevice
@@ -7123,6 +8175,11 @@ switch ($PSCmdlet.ParameterSetName) {
         $accountChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'addsponsor', 'addowner' })
         $riskChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'confirmcompromised' })
         $blockRules = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'blocklocalagent' })
+        $mcpChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'blockmcp', 'unblockmcp' })
+        if ($mcpChanges.Count -gt 0) {
+            $mcpChanges | Select-Object Agent, Server, @{ n = 'now'; e = { $_.Mode } }, @{ n = 'restoreTo'; e = { if ($_.WasMode) { $_.WasMode } else { 'Not blocked' } } } | Format-Table -AutoSize | Out-Host
+            if (Confirm-Batch -Count $mcpChanges.Count -Action 'restore the MCP block state of') { Invoke-McpBlockChange -Items @(ConvertTo-McpUndoItems $mcpChanges) }
+        }
         if ($accessChanges.Count -gt 0) {
             $accessChanges | Select-Object DisplayName, @{ n = 'now'; e = { Get-AccessLabel $_.NewAvailableTo } }, @{ n = 'restoreTo'; e = { Get-AccessLabel $_.WasAvailableTo } } | Format-Table -AutoSize | Out-Host
             if (Confirm-Batch -Count $accessChanges.Count -Action 'restore access for') { Invoke-AccessRestore -Records $accessChanges }
@@ -7137,7 +8194,8 @@ switch ($PSCmdlet.ParameterSetName) {
             if (Confirm-Batch -Count $blockRules.Count -Action 'remove the block rule of') {
                 Invoke-LocalAgentUnblock -Rules @($blockRules | ForEach-Object { [pscustomobject]@{ id = $_.RuleId; displayName = ('Agent365 Bulk Actions: block {0} on {1}' -f $_.Tool, $_.Device) } })
             }
-        }        if ($riskChanges.Count -gt 0) {
+        }
+        if ($riskChanges.Count -gt 0) {
             $riskChanges | Select-Object DisplayName, @{ n = 'before'; e = { $_.WasRiskState } }, @{ n = 'now'; e = { $_.NowRiskState } } | Format-Table -AutoSize | Out-Host
             $note = Get-DismissNote $riskChanges
             if ($note) { Write-Warning $note }
@@ -7153,7 +8211,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $back = @($back)
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
-        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0 -and $mcpChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $byId = @{}
         foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
         $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
