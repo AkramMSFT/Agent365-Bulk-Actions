@@ -5,35 +5,48 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install test tooling
         shell: pwsh
         run: |
-          Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module Pester -RequiredVersion 6.2.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+
+      - name: ASCII only
+        shell: pwsh
+        run: |
+          $bad = @(git ls-files '*.ps1' '*.psd1' '*.md' '*.json' '*.yml' | Where-Object { Select-String -LiteralPath $_ -Pattern '[^\x00-\x7F]' -Quiet })
+          if ($bad) { "Non-ASCII characters in: $($bad -join ', ')"; exit 1 }
 
       - name: Syntax check
         shell: pwsh
         run: |
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/Agent365-Bulk-Actions.ps1", [ref]$null, [ref]$errors)
-          if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          foreach ($file in './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1') {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
+            if ($errors) { $errors | ForEach-Object { Write-Error "$file $($_.Message)" }; exit 1 }
+          }
 
       - name: Lint
         shell: pwsh
         run: |
-          $findings = Invoke-ScriptAnalyzer -Path ./Agent365-Bulk-Actions.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+          $findings = './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1' | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }
           $findings | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap
           if ($findings) { exit 1 }
 
       - name: Tests
         shell: pwsh
         run: |
-          Import-Module Pester -MinimumVersion 5.5.0
+          Import-Module Pester -RequiredVersion 6.2.0
           $result = Invoke-Pester -Path ./tests -Output Detailed -PassThru
           if ($result.FailedCount -gt 0) { exit 1 }

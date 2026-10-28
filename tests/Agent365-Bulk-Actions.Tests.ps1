@@ -482,8 +482,8 @@ Describe 'Permission and risk helpers' {
         $script:BlueprintPermCache = @{}
         Mock Get-IdentityPermissions { param($ServicePrincipalId, $Source) @([pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = 'R'; Permission = "p-$ServicePrincipalId"; Consent = 'x' }) }
         Mock Invoke-Graph { $script:script_bpCalls++; [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-sp'; displayName = 'BP' }) } }
-        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'bp-app')
-        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'bp-app')
+        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
+        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
         $first.Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
         $second.Count | Should -Be 2
         $script:script_bpCalls | Should -Be 1
@@ -652,7 +652,7 @@ Describe 'Bulk permission, detail and identity-state reads' {
             }
             $h
         }
-        $items = 1..30 | ForEach-Object { @{ Key = "k$_"; ServicePrincipalId = "sp$_"; BlueprintAppId = 'bp-app' } }
+        $items = 1..30 | ForEach-Object { @{ Key = "k$_"; ServicePrincipalId = ('00000000-0000-0000-0000-{0:d12}' -f $_); BlueprintAppId = 'b0000000-0000-0000-0000-0000000000b1' } }
         $got = Get-PermissionsBulk -Items $items
         $got.Count | Should -Be 30
         $got['k7'].Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
@@ -739,7 +739,9 @@ Describe 'Batch pacing stays bounded under heavy throttling' {
         }
         $reqs = 1..200 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
         Invoke-GraphBatch -Requests $reqs -ChunkSize 10 -PaceSeconds 0.3 | Out-Null
-        $perRequest = ($script:sleepMs | Measure-Object -Maximum).Maximum / 10
+        $paceMs = @($script:sleepMs | Where-Object { $_ -lt 10000 })   # the 424 back-off between rounds waits 10 s or more
+        $paceMs.Count | Should -BeGreaterThan 0
+        $perRequest = ($paceMs | Measure-Object -Maximum).Maximum / 10
         $perRequest | Should -BeLessOrEqual 2100   # ms per request, capped at 2 seconds
     }
 }
@@ -1288,6 +1290,7 @@ Describe 'Policy: AI activity and restrict' {
     }
     It 'applies a restrict step through the availability routine' {
         Mock Write-Host { }
+        Mock Out-Host { }
         Mock Confirm-Batch { $true }
         Mock Invoke-AvailabilityChange { }
         $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 3 } }, "then": { "action": "restrict", "availableTo": "none", "includeDeployment": true } } ] }'
@@ -1356,5 +1359,2051 @@ Describe 'Format-GraphError with a real response dump' {
         $m = Format-GraphError -Summary 'Response status code does not indicate success: FailedDependency (Failed Dependency).' -Detail $detail
         $m | Should -BeLike '*UnknownError: *An error occurred while reassigning the agent.*'
         $m | Should -BeLike '*`[POST /beta/copilot/admin/catalog/packages/T_1/reassign`]'
+    }
+}
+Describe 'Lookups and helpers' {
+    It 'Get-Distinct keeps first-seen order and treats case as different, like Select-Object -Unique' {
+        @('b', 'a', 'b', 'A', 'a' | Get-Distinct) | Should -Be @('b', 'a', 'A')
+        @($null, 'x', $null | Get-Distinct).Count | Should -Be 2
+    }
+    It 'Resolve-Packages finds ids and names case-insensitively, rejects duplicates and unknowns, and accepts a supplied catalog' {
+        $cat = @((New-Pkg 'T_abc' 'Alpha'), (New-Pkg 'P_def' 'Beta'), (New-Pkg 'T_g1' 'Dup'), (New-Pkg 'T_g2' 'Dup'))
+        (Resolve-Packages @('t_ABC', 'beta') -Catalog $cat).id | Should -Be @('P_def', 'T_abc')
+        { Resolve-Packages @('Dup') -Catalog $cat } | Should -Throw '*Multiple packages named*'
+        { Resolve-Packages @('Nope') -Catalog $cat } | Should -Throw '*No package matching*'
+        { Resolve-Packages @('T_missing') -Catalog $cat } | Should -Throw '*No package matching*'
+    }
+    It 'Resolve-Packages indexes a large catalog once instead of scanning it per name' {
+        $cat = 1..5000 | ForEach-Object { New-Pkg ('T_{0:D6}' -f $_) "Agent $_" }
+        $names = 1..500 | ForEach-Object { "Agent $($_ * 9)" }
+        $time = Measure-Command { $r = @(Resolve-Packages $names -Catalog $cat) }
+        $r.Count | Should -Be 500
+        $time.TotalSeconds | Should -BeLessThan 3
+    }
+    It 'Select-PackageSet uses the supplied list (filtering Copilot agents on request) and reads the catalog otherwise' {
+        Mock Get-Packages { @((New-Pkg 'T_live' 'Live')) }
+        $a = New-Pkg 'T_a' 'A'; $b = New-Pkg 'T_b' 'B'; $b.supportedHosts = @('Outlook')
+        @(Select-PackageSet -Packages @($a, $b) -Supplied).Count | Should -Be 2
+        (Select-PackageSet -Packages @($a, $b) -Supplied -AgentsOnly).id | Should -Be @('T_a')
+        (Select-PackageSet).id | Should -Be @('T_live')
+        @(Select-PackageSet -Packages @() -Supplied).Count | Should -Be 0
+    }
+    It 'Get-StalePackages reads the supplied catalog and does not call the service' {
+        Mock Get-Packages { throw 'must not read the catalog' }
+        $old = New-Pkg 'T_old' 'Old'; $old | Add-Member -NotePropertyName lastModifiedDateTime -NotePropertyValue '2020-01-01T00:00:00Z'
+        $new = New-Pkg 'T_new' 'New'; $new | Add-Member -NotePropertyName lastModifiedDateTime -NotePropertyValue ((Get-Date).ToUniversalTime().ToString('o'))
+        (Get-StalePackages -Days 30 -By modified -Packages @($old, $new)).id | Should -Be @('T_old')
+    }
+    It 'Select-ActionTargets drops what is already in the target state' {
+        $on = New-Pkg 'T_1' 'On' -Blocked $true; $off = New-Pkg 'T_2' 'Off'
+        (Select-ActionTargets @($on, $off) 'block').id | Should -Be @('T_2')
+        (Select-ActionTargets @($on, $off) 'unblock').id | Should -Be @('T_1')
+        @(Select-ActionTargets @($on, $off) 'list').Count | Should -Be 2
+    }
+    It 'New-UserInfo gives found and missing users the same shape' {
+        $f = New-UserInfo 'x' ([pscustomobject]@{ id = 'u1'; userPrincipalName = 'a@x.com'; displayName = 'A'; accountEnabled = $true })
+        $m = New-UserInfo 'u2' $null
+        $f.Exists | Should -BeTrue; $f.IsAgent | Should -BeFalse; $m.Exists | Should -BeFalse; $m.IsAgent | Should -BeFalse
+        ($f.PSObject.Properties.Name -join ',') | Should -Be ($m.PSObject.Properties.Name -join ',')
+        (New-UserInfo 'x' ([pscustomobject]@{ id = 'a1'; '@odata.type' = '#microsoft.graph.agentUser' })).IsAgent | Should -BeTrue
+    }
+    It 'Get-FailureSummary lists the first five failures only' {
+        $recs = 1..7 | ForEach-Object { [pscustomobject]@{ Result = 'Failed'; DisplayName = "A$_"; Error = 'boom' } }
+        $recs += [pscustomobject]@{ Result = 'Done'; DisplayName = 'ok'; Error = '' }
+        ((Get-FailureSummary $recs) -split "`n").Count | Should -Be 5
+        (Get-FailureSummary $recs) | Should -BeLike 'A1: boom*'
+    }
+    It 'Test-PermissionMatch treats a missing list as no permissions' {
+        Test-PermissionMatch -Perms $null -Mode 'any' | Should -BeFalse
+        Test-PermissionMatch -Perms @([pscustomobject]@{ Kind = 'Application'; Resource = 'Microsoft Graph'; Permission = 'X' }) -Mode 'graphapp' | Should -BeTrue
+    }
+    It 'Get-AccessLabel names both availability and deployment values and passes unknown ones through' {
+        Get-AccessLabel 'allowedForAll' | Should -Be 'Everyone'
+        Get-AccessLabel 'allowedForNone' | Should -Be 'Nobody'
+        Get-AccessLabel 'acquiredForNone' | Should -Be 'Nobody'
+        Get-AccessLabel 'acquiredForSome' | Should -Be 'Some users or groups'
+        Get-AccessLabel 'acquiredForAll' | Should -Be 'Everyone'
+        Get-AccessLabel '' | Should -Be ''
+        Get-AccessLabel 'somethingNew' | Should -Be 'somethingNew'
+    }
+    It 'ConvertTo-FieldRows returns an array even for a single row, so a grid can bind to it' {
+        $one = ConvertTo-FieldRows ([ordered]@{ Field = 'only' })
+        $one -is [array] | Should -BeTrue
+        @($one).Count | Should -Be 1
+        (ConvertTo-FieldRows ([ordered]@{})) -is [array] | Should -BeTrue
+        $rows = ConvertTo-FieldRows ([ordered]@{ a = '1'; b = ''; c = '3' })
+        @($rows).Count | Should -Be 2
+    }
+}
+
+Describe 'Output files and logs' {
+    It 'Export-ActionLog writes to a path that contains square brackets' {
+        Mock Write-Host { }
+        foreach ($name in 'run[1].csv', 'run[1].json') {
+            $OutFile = Join-Path $TestDrive $name
+            Export-ActionLog -Records @([pscustomobject]@{ Id = 'T_1'; Result = 'Done' })
+            Test-Path -LiteralPath $OutFile | Should -BeTrue
+        }
+    }
+    It 'Save-Snapshot writes to a path that contains square brackets' {
+        $path = Join-Path $TestDrive 'snap[1].json'
+        Save-Snapshot -Path $path -Packages @((New-Pkg 'T_1' 'One'))
+        (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json).count | Should -Be 1
+    }
+}
+
+Describe 'Audit conversion' {
+    It 'matches a policy signal name literally, including text that looks like a wildcard' {
+        Mock Get-AgentInfoTable { @{} }
+        $script:catalog = @((New-Pkg 'T_Abc' 'Alpha'))
+        Mock Get-Packages { $script:catalog }
+        $now = Get-Date
+        $acts = @([pscustomobject]@{ TitleId = 't_abc'; Risk = 'High'; Signals = 'Odd [name]'; Time = $now; Kind = 'Interaction'; User = 'u'; AgentName = '' })
+        Mock Get-AiActivityData { [pscustomobject]@{ Days = 7; Activities = $acts; Names = @{}; Unmapped = 0 } }
+        $doc = '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1, "signals": ["Odd [name]"] } }, "then": { "action": "report" } } ] }' | ConvertFrom-Json
+        (Get-PolicyPlan $doc).Matched.id | Should -Be @('T_Abc')
+        $doc2 = '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 1, "signals": ["Odd *"] } }, "then": { "action": "report" } } ] }' | ConvertFrom-Json
+        @((Get-PolicyPlan $doc2).Matched).Count | Should -Be 0
+    }
+    It 'does not fail on an event whose time could not be parsed' {
+        $a = [pscustomobject]@{ Time = $null; Kind = 'Interaction'; User = 'u'; Agent = ''; AgentName = ''; App = ''; Conversation = ''; RecordId = 'r'; Model = ''; Prompts = 0; Responses = 0
+                                Extra = [pscustomobject]@{ Resources = @() } }
+        { Get-AiActivityDetailRows $a } | Should -Not -Throw
+    }
+    It 'counts prompts and responses and flags a jailbreak seen only in a message' {
+        $r = [pscustomobject]@{ id = 'r'; operation = 'CopilotInteraction'; createdDateTime = '2026-09-20T10:00:00Z'; userPrincipalName = 'u@x.com'
+            auditData = [pscustomobject]@{ AgentId = 'bot'; CopilotEventData = [pscustomobject]@{
+                Messages = @([pscustomobject]@{ isPrompt = $true; JailbreakDetected = $true }, [pscustomobject]@{ isPrompt = $false; JailbreakDetected = $false }, [pscustomobject]@{ isPrompt = $false }) } } }
+        $a = ConvertTo-AiActivity $r
+        $a.Prompts | Should -Be 1; $a.Responses | Should -Be 2
+        $a.Risk | Should -Be 'High'; $a.Signals | Should -Be 'Jailbreak attempt'
+    }
+    It 'checks an audit search before sleeping, so a finished search is not delayed' {
+        $script:slept = 0
+        Mock Wait-AuditPoll { $script:slept++ }
+        Mock Invoke-Graph { if ($Method -eq 'DELETE') { return $null }; if ($Uri -like '*/records*') { return @{ value = @(@{ id = 'a' }) } }; @{ status = 'succeeded' } }
+        @(Complete-AuditSearch -Id 'q1').Count | Should -Be 1
+        $script:slept | Should -Be 0
+    }
+}
+
+Describe 'Graph version per catalog call' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:uris = @()
+        $OutFile = $null
+        $DisableIdentity = $false
+    }
+    It 'reads the catalog from v1.0' {
+        Mock Invoke-Graph { $script:uris += $Uri; @{ value = @() } }
+        $null = Get-Packages
+        $null = Get-Packages -AgentsOnly
+        $script:uris.Count | Should -Be 2
+        $script:uris | ForEach-Object { $_ | Should -BeLike 'https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages*' }
+    }
+    It 'sends block and unblock to beta, the only version that has them' {
+        Mock Invoke-Graph { $script:uris += $Uri }
+        $null = Invoke-PackageAction -Packages @(New-Pkg 'P_1' 'Alpha') -Action block -PassThru
+        $null = Invoke-PackageAction -Packages @(New-Pkg 'P_2' 'Beta' -Blocked $true) -Action unblock -PassThru
+        $script:uris | Should -Be @('https://graph.microsoft.com/beta/copilot/admin/catalog/packages/P_1/block', 'https://graph.microsoft.com/beta/copilot/admin/catalog/packages/P_2/unblock')
+    }
+    It 'sends reassign to beta' {
+        Mock Invoke-Graph { $script:uris += $Uri }
+        $item = [pscustomobject]@{ Id = 'T_1'; DisplayName = 'Alpha'; CurrentOwnerId = 'o1'; NewOwnerId = 'o2'; NewOwnerUpn = 'new@x.com'; Source = 'test' }
+        $null = Invoke-OwnerReassign -Items @($item) -PassThru
+        $script:uris | Should -Be @('https://graph.microsoft.com/beta/copilot/admin/catalog/packages/T_1/reassign')
+    }
+    It 'reads and changes who can use an agent on v1.0' {
+        Mock Invoke-Graph { $script:uris += '{0} {1}' -f $(if ($Method) { $Method } else { 'GET' }), $Uri; if ($Method -ne 'PATCH') { @{ availableTo = 'allowedForAll'; deployedTo = 'acquiredForAll'; allowedUsersAndGroups = @(); acquireUsersAndGroups = @() } } }
+        $null = Invoke-AvailabilityChange -Packages @(New-Pkg 'T_a' 'Alpha') -To None -PassThru
+        $script:uris | Should -Be @('GET https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a', 'PATCH https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages/T_a')
+    }
+}
+
+Describe 'Entra agent risk' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        Mock Start-Sleep { }
+        $script:posts = @()
+        $script:pkg = [pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'id1'; platform = 'Foundry' }
+        $script:clean = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = '' }
+        $script:confirmed = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = 'adminConfirmedAgentCompromised' }
+    }
+    It 'reads every identity in one beta batch: a missing record means not flagged, other errors mean unknown' {
+        Mock Invoke-GraphBatch {
+            @{ 'a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ riskLevel = 'high'; riskState = 'atRisk'; riskDetail = 'none' } }
+               'b' = [pscustomobject]@{ Status = 404; Body = $null }
+               'c' = [pscustomobject]@{ Status = 403; Body = $null } }
+        }
+        $s = Get-AgentRiskStates @('a', 'b', 'c', 'a', '')
+        Should -Invoke Invoke-GraphBatch -Times 1 -ParameterFilter { @($Requests).Count -eq 3 -and $Version -eq 'beta' }
+        $s['a'].Level | Should -Be 'high'; $s['a'].State | Should -Be 'atRisk'
+        $s['b'].State | Should -Be 'none'
+        $s['c'] | Should -BeNullOrEmpty
+        (Get-AgentRiskStates @()).Count | Should -Be 0
+    }
+    It 'describes a state in words' {
+        Format-AgentRisk $null | Should -Be 'unknown'
+        Format-AgentRisk $script:clean | Should -Be 'not flagged'
+        Format-AgentRisk $script:confirmed | Should -Be 'high (confirmedCompromised)'
+    }
+    It 'confirms an identity as compromised and logs the state before and after' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; if ($script:reads -eq 1) { @{ 'id1' = $script:clean } } else { @{ 'id1' = $script:confirmed } } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Action | Should -Be 'confirmcompromised'
+        $log[0].WasRiskState | Should -Be 'none'
+        $log[0].NowRiskState | Should -Be 'confirmedCompromised'; $log[0].NowRiskLevel | Should -Be 'high'
+        $script:posts.Count | Should -Be 1
+        $script:posts[0].Uri | Should -Be 'https://graph.microsoft.com/beta/identityProtection/riskyAgents/confirmCompromised'
+        @(($script:posts[0].Body | ConvertFrom-Json).agentIds) | Should -Be @('id1')
+    }
+    It 'sends a single identity as a one-item list' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Body = $Body } }
+        $null = Invoke-AgentRiskAction -Packages @($script:pkg)
+        $script:posts[0].Body | Should -Be '{"agentIds":["id1"]}'
+    }
+    It 'skips an identity that is already confirmed and sends nothing' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Skipped'
+        $script:posts.Count | Should -Be 0
+    }
+    It 'changes nothing when the proceed check says no (-WhatIf)' {
+        Mock Test-Proceed { $false }
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'WhatIf'
+        $script:posts.Count | Should -Be 0
+    }
+    It 'records a failure with the role that is needed, and keeps going' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean; 'id2' = $script:clean } }
+        Mock Invoke-Graph { if ($Body -match 'id1') { throw 'Forbidden' } }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $log = @(Invoke-AgentRiskAction -Packages $two -PassThru)
+        ($log | Where-Object Id -eq 'T_1').Result | Should -Be 'Failed'
+        ($log | Where-Object Id -eq 'T_1').Error | Should -BeLike '*Security Administrator*'
+        ($log | Where-Object Id -eq 'T_2').Result | Should -Be 'Done'
+    }
+    It 'leaves out agents that have no Entra identity' {
+        Mock Get-AgentRiskStates { throw 'must not read' }
+        Mock Invoke-Graph { throw 'must not call' }
+        $none = [pscustomobject]@{ id = 'T_9'; displayName = 'NoIdentity'; agentIdentityId = ''; platform = '' }
+        Invoke-AgentRiskAction -Packages @($none) -PassThru | Should -BeNullOrEmpty
+    }
+    It 'dismisses only an identity that has an active risk' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed; 'id2' = $script:clean } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $log = @(Invoke-AgentRiskAction -Packages $two -Action dismiss -PassThru)
+        ($log | Where-Object Id -eq 'T_1').Result | Should -Be 'Done'
+        ($log | Where-Object Id -eq 'T_2').Result | Should -Be 'Skipped'
+        $script:posts.Count | Should -Be 1
+        $script:posts[0].Uri | Should -Be 'https://graph.microsoft.com/beta/identityProtection/riskyAgents/dismiss'
+    }
+    It 'undoes a logged confirmation by dismissing the risk of the same identities' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:confirmed } }
+        Mock Invoke-Graph { $script:posts += , @{ Uri = $Uri; Body = $Body } }
+        $rec = [pscustomobject]@{ Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = 'id1'; WasRiskState = 'none' }
+        $log = @(Invoke-AgentRiskDismiss -Records @($rec) -PassThru)
+        $log[0].Action | Should -Be 'dismiss'
+        $script:posts[0].Uri | Should -BeLike '*/riskyAgents/dismiss'
+        @(($script:posts[0].Body | ConvertFrom-Json).agentIds) | Should -Be @('id1')
+    }
+    It 'warns that dismissing also clears a risk Entra had already raised' {
+        Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'none' }) | Should -Be ''
+        $note = Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'atRisk' }, [pscustomobject]@{ DisplayName = 'Beta'; WasRiskState = 'none' })
+        $note | Should -BeLike '*Alpha*'
+        $note | Should -Not -BeLike '*Beta*'
+    }
+}
+
+Describe 'Entra agent risk: waiting for Entra to apply a change' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        Mock Start-Sleep { }
+        Mock Invoke-Graph { }
+        $script:pkg = [pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'id1'; platform = 'Foundry' }
+        $script:clean = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = '' }
+        $script:confirmed = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = 'adminConfirmedAgentCompromised' }
+    }
+    It 'keeps checking until Entra shows the new state, then marks it verified' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; if ($script:reads -le 4) { @{ 'id1' = $script:clean } } else { @{ 'id1' = $script:confirmed } } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeTrue
+        $log[0].NowRiskState | Should -Be 'confirmedCompromised'
+        Should -Invoke Start-Sleep -Times 3
+    }
+    It 'logs a request Entra accepted but never showed as done and not verified, instead of claiming success' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -WaitSeconds 30 -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeFalse
+        $log[0].NowRiskState | Should -Be 'none'
+        Should -Invoke Start-Sleep -Times 3
+    }
+    It 'does not read the state back at all with -WaitSeconds 0' {
+        Mock Get-AgentRiskStates { @{ 'id1' = $script:clean } }
+        $log = @(Invoke-AgentRiskAction -Packages @($script:pkg) -WaitSeconds 0 -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Verified | Should -BeFalse
+        Should -Invoke Get-AgentRiskStates -Times 1
+        Should -Invoke Start-Sleep -Times 0
+    }
+    It 'checks all pending identities together rather than one read each' {
+        $script:reads = 0
+        Mock Get-AgentRiskStates { $script:reads++; $h = @{}; foreach ($i in $IdentityIds) { $h[$i] = $(if ($script:reads -eq 1) { $script:clean } else { $script:confirmed }) }; $h }
+        $two = @($script:pkg, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = 'id2'; platform = '' })
+        $null = Invoke-AgentRiskAction -Packages $two -PassThru
+        Should -Invoke Get-AgentRiskStates -Times 1 -ParameterFilter { @($IdentityIds).Count -eq 2 }
+        Should -Invoke Get-AgentRiskStates -Times 2
+    }
+    It 'tells the person to dismiss again when a confirmation was not yet visible' {
+        $note = Get-DismissNote @([pscustomobject]@{ DisplayName = 'Alpha'; WasRiskState = 'none'; Verified = 'False' }, [pscustomobject]@{ DisplayName = 'Beta'; WasRiskState = 'none'; Verified = 'True' })
+        $note | Should -BeLike '*Alpha*dismiss it again*'
+        $note | Should -Not -BeLike '*Beta*'
+    }
+}
+
+Describe 'Sign-in help' {
+    It 'turns the window-handle error of a non-interactive session into instructions' {
+        $msg = "InteractiveBrowserCredential authentication failed: A window handle must be configured. See`nhttps://aka.ms/msal-net-wam#parent-window-handles"
+        $help = Get-SignInHelp $msg
+        $help | Should -BeLike '*-SignIn*'
+        $help | Should -BeLike '*no saved sign-in*'
+        $help | Should -BeLike '*A window handle must be configured*'
+        $help | Should -Not -BeLike '*aka.ms*'
+    }
+    It 'explains the two-minute device code limit' {
+        Get-SignInHelp 'Authentication timed out after 120 seconds due to inactivity. Please try again.' | Should -BeLike '*two minutes*-SignIn*'
+    }
+    It 'leaves any other error as it is' {
+        Get-SignInHelp 'AADSTS50076: multi-factor authentication is required' | Should -Be 'AADSTS50076: multi-factor authentication is required'
+    }
+    It 'asks -SignIn for every permission the modes use, including the newest' {
+        foreach ($scope in 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'AgentIdentity.ReadWrite.All', 'AuditLogsQuery.Read.All', 'Group.Read.All', 'IdentityRiskyAgent.ReadWrite.All') {
+            $script:AllScopes | Should -Contain $scope
+        }
+        @($script:AllScopes | Select-Object -Unique).Count | Should -Be @($script:AllScopes).Count
+    }
+}
+
+Describe 'Endpoint AI: recognising tools and hiding secrets' {
+    It 'recognises a tool by the name Defender gave it, or by its process' {
+        (Resolve-EndpointAiTool -DefenderName 'Ollama Desktop').Key | Should -Be 'ollama'
+        (Resolve-EndpointAiTool -DefenderName 'GitHub Copilot CLI').Key | Should -Be 'copilot-cli'
+        (Resolve-EndpointAiTool -Process 'OLLAMA APP.EXE').Key | Should -Be 'ollama'
+        (Resolve-EndpointAiTool -Process 'codex').Key | Should -Be 'codex-cli'
+        Resolve-EndpointAiTool -Process 'notepad.exe' | Should -BeNullOrEmpty
+        Resolve-EndpointAiTool -DefenderName 'Some Internal Bot' | Should -BeNullOrEmpty
+    }
+    It 'tells Claude Desktop from Claude Code by where claude.exe runs from' {
+        (Resolve-EndpointAiTool -Process 'claude.exe' -Path 'C:\Program Files\WindowsApps\Claude_1.5.0_x64__abc\app\claude.exe').Key | Should -Be 'claude-desktop'
+        (Resolve-EndpointAiTool -Process 'claude.exe' -Path 'C:\Users\a\.local\bin\claude.exe').Key | Should -Be 'claude-code'
+        (Resolve-EndpointAiTool -DefenderName 'Claude Code').Key | Should -Be 'claude-code'
+    }
+    It 'hides a prompt, an api key and a bearer token, and shortens a long command' {
+        Protect-CommandLine 'copilot.exe -p "summarise my payroll file"' | Should -Be 'copilot.exe -p "<prompt hidden>"'
+        Protect-CommandLine 'tool --api-key abc123secret --model x' | Should -Be 'tool --api-key *** --model x'
+        Protect-CommandLine 'curl -H Authorization: Bearer eyJhbGciOi.payload' | Should -Not -BeLike '*eyJhbGciOi*'
+        Protect-CommandLine 'run sk-abcdefghijklmnop1234' | Should -Be 'run sk-***'
+        (Protect-CommandLine ('x' * 500)).Length | Should -BeLessThan 240
+        Protect-CommandLine '' | Should -Be ''
+    }
+    It 'builds queries from the catalog and the number of days' {
+        $q = Get-EndpointAiQueries -Days 14
+        $q.Agents | Should -BeLike '*Platform == "LocalAgents"*'
+        $q.Processes | Should -BeLike '*ago(14d)*'
+        $q.Processes | Should -BeLike '*"ollama.exe"*'
+        $q.Outbound | Should -BeLike '*"anthropic.com"*'
+        $q.Listening | Should -BeLike '*11434*'
+        $alerts = Get-EndpointAiAlertQuery -Days 7 -DeviceNames @('lab', 'we"ird')
+        $alerts | Should -BeLike '*"lab", "we\"ird"*'
+        (Get-EndpointAiDeviceQuery -DeviceIds @('d1', 'd2')) | Should -BeLike '*"d1", "d2"*'
+    }
+}
+
+Describe 'Endpoint AI: building rows and scoring risk' {
+    BeforeAll {
+        function New-EpData {
+            @{
+                Agents = @(
+                    @{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice'; McpServers = $null; LocalMcps = $null }
+                    @{ AgentId = 'a2'; Name = 'Claude Desktop'; Version = '2.0'; LifecycleStatus = 'Deleted'; LastSeen = '2026-09-23T16:06:59Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Anthropic'; Process = 'claude.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' }
+                    @{ AgentId = 'a3'; Name = 'Acme Helper'; Version = '3'; LifecycleStatus = ''; LastSeen = '2026-10-01T10:00:00Z'; FirstSeen = '2026-10-01T10:00:00Z'; Vendor = 'Acme'; Process = 'acme.exe'; Trusted = 'false'; AutoApprove = 'true'; Device = 'lab'; DeviceId = 'dev1'; Account = 'bob' }
+                )
+                Processes = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'ollama.exe'; FolderPath = 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'; Runs = 5; FirstSeen = '2026-09-22T14:09:00Z'; LastSeen = '2026-09-22T14:09:50Z'; Accounts = @('alice'); Parents = @('ollama app.exe'); ActiveAt = @('2026-09-22T14:00:00Z'); Command = 'ollama.exe serve'; FlagCommand = $null }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'llama-server.exe'; FolderPath = 'C:\Ollama\lib\llama-server.exe'; Runs = 8; FirstSeen = '2026-09-22T14:09:00Z'; LastSeen = '2026-09-22T14:09:50Z'; Accounts = @('alice'); Parents = @('ollama.exe'); ActiveAt = @('2026-09-22T14:00:00Z'); Command = 'llama-server.exe --port 5 --host 127.0.0.1'; FlagCommand = $null }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'copilot.exe'; FolderPath = 'C:\Users\alice\AppData\Local\GitHub CLI\copilot\copilot.exe'; Runs = 6; FirstSeen = '2026-09-10T13:14:00Z'; LastSeen = '2026-09-25T08:05:00Z'; Accounts = @('alice'); Parents = @('gh.exe'); ActiveAt = @('2026-09-25T08:00:00Z'); Command = 'copilot.exe -p "review the payroll export"'; FlagCommand = 'copilot.exe --yolo -p "x"' }
+                )
+                Mcp = @(); Files = @()
+                Outbound = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = 'ollama.com'; Hits = 17; LastSeen = '2026-10-05T16:47:00Z' }
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'chrome.exe'; Host = 'chatgpt.com'; Hits = 3; LastSeen = '2026-10-05T16:47:00Z' }
+                )
+                Listening = @(
+                    @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; LocalIP = '127.0.0.1'; LocalPort = 11434; Hits = 1; LastSeen = '2026-09-22T14:09:13Z' }
+                )
+                Software = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; SoftwareName = 'ollama_version_0.34.1'; SoftwareVendor = 'ollama'; SoftwareVersion = '0.34.1.0' })
+                Vulnerabilities = @()
+                Alerts = @(
+                    @{ DeviceName = 'LAB'; AlertId = 'x1'; Timestamp = '2026-09-22T14:10:23Z'; Title = "An active 'SuspPrompt' malware was detected"; Severity = 'Low'; DetectionSource = 'Antivirus' }
+                    @{ DeviceName = 'LAB'; AlertId = 'x2'; Timestamp = '2026-08-01T09:00:00Z'; Title = "'SuspPrompt' malware was prevented"; Severity = 'Informational'; DetectionSource = 'Antivirus' }
+                    @{ DeviceName = 'LAB'; AlertId = 'x3'; Timestamp = '2026-09-22T14:11:00Z'; Title = 'Suspicious service created'; Severity = 'Medium'; DetectionSource = 'EDR' }
+                )
+                Devices = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; OSPlatform = 'Windows10'; OnboardingStatus = 'Onboarded'; DeviceType = 'Workstation'; ExposureLevel = 'High'; AssetValue = 'Normal' })
+            }
+        }
+    }
+    It 'makes one row per tool and device, merges every source, and leaves out removed agents' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        ($rows.Tool | Sort-Object) | Should -Be @('Acme Helper', 'GitHub Copilot CLI', 'Ollama')
+        $ollama = $rows | Where-Object Tool -eq 'Ollama'
+        $ollama.Sources | Should -Be 'Defender discovery, Process telemetry, Software inventory'
+        $ollama.Version | Should -Be '0.34.1.0'
+        $ollama.Runs | Should -Be 13
+        $ollama.User | Should -Be 'alice'
+        $ollama.Evidence.Processes.Count | Should -Be 2
+    }
+    It 'counts an alert only for a tool that was active within 15 minutes of it, and only if it is about AI' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $ollama = $rows | Where-Object Tool -eq 'Ollama'
+        $copilot = $rows | Where-Object Tool -eq 'GitHub Copilot CLI'
+        @($ollama.Evidence.Alerts | Where-Object { $_.AiRelated -and $_.Near }).Count | Should -Be 1
+        @($copilot.Evidence.Alerts | Where-Object { $_.Near }).Count | Should -Be 0
+        @($ollama.Evidence.Alerts | Where-Object { $_.Title -like 'Suspicious service*' -and $_.AiRelated }).Count | Should -Be 0
+        $ollama.Risk | Should -Be 'Medium'
+        $ollama.Why | Should -BeLike '*1 AI-related alert near its activity*'
+    }
+    It 'rates auto-approve and an approval-skipping flag as high, and an untrusted process as medium' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $acme = $rows | Where-Object Tool -eq 'Acme Helper'
+        $acme.Risk | Should -Be 'High'
+        $acme.Why | Should -BeLike '*Approves its own actions*'
+        ($acme.Reasons | Where-Object Level -eq 'Medium').Text | Should -BeLike '*not trusted*'
+        $copilot = $rows | Where-Object Tool -eq 'GitHub Copilot CLI'
+        $copilot.Risk | Should -Be 'High'
+        $copilot.Evidence.Flag | Should -Be '--yolo'
+        $copilot.Evidence.Processes[0].Command | Should -Be 'copilot.exe -p "<prompt hidden>"'
+    }
+    It 'rates a model server reachable from the network as high, but not one on the loopback address' {
+        $loop = @(New-EndpointAiRows -Data (New-EpData)) | Where-Object Tool -eq 'Ollama'
+        $loop.Evidence.Listeners.Count | Should -Be 1
+        @($loop.Evidence.Listeners | Where-Object Exposed).Count | Should -Be 0
+        $d = New-EpData
+        $d.Listening = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; LocalIP = '0.0.0.0'; LocalPort = 11434; Hits = 2; LastSeen = '2026-09-22T14:09:13Z' })
+        $open = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $open.Risk | Should -Be 'High'
+        ($open.Reasons | Where-Object Level -eq 'High').Short | Should -BeLike '*0.0.0.0:11434*'
+    }
+    It 'rates a critical vulnerability as high and a high one as medium' {
+        $d = New-EpData
+        $d.Vulnerabilities = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; SoftwareName = 'ollama_version_0.34.1'; SoftwareVersion = '0.34.1.0'; Cves = 3; Critical = 1; High = 2; Example = 'CVE-2026-0001' })
+        $o = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $o.Risk | Should -Be 'High'
+        $o.Why | Should -BeLike '*1 critical CVE*'
+        $d.Vulnerabilities[0].Critical = 0
+        (@(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama').Reasons.Short | Should -Contain '2 high CVEs in 0.34.1.0'
+    }
+    It 'flags a local MCP server that is fetched by a package runner' {
+        $d = New-EpData
+        $d.Mcp = @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'node.exe'; Runs = 4; FirstSeen = '2026-09-30T10:00:00Z'; LastSeen = '2026-10-01T10:00:00Z'; Accounts = @('alice'); Parent = 'cursor.exe'; Command = 'npx -y @modelcontextprotocol/server-filesystem C:\' })
+        $mcp = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'MCP server (local)'
+        $mcp.Category | Should -Be 'MCP server'
+        $mcp.Risk | Should -Be 'Medium'
+        $mcp.Why | Should -BeLike '*Local MCP server fetched at start*'
+    }
+    It 'marks tools as unreviewed, sanctioned or unsanctioned depending on the approved list' {
+        (@(New-EndpointAiRows -Data (New-EpData)) | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unreviewed'
+        (@(New-EndpointAiRows -Data (New-EpData) -Sanctioned $null) | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unreviewed'
+        $rows = @(New-EndpointAiRows -Data (New-EpData) -Sanctioned @('github'))
+        ($rows | Where-Object Tool -eq 'GitHub Copilot CLI').Status | Should -Be 'Sanctioned'
+        ($rows | Where-Object Tool -eq 'Ollama').Status | Should -Be 'Unsanctioned'
+        ($rows | Where-Object Tool -eq 'Ollama').Why | Should -BeLike '*Not sanctioned*'
+    }
+    It 'sorts the highest risk first' {
+        $rows = @(New-EndpointAiRows -Data (New-EpData))
+        $rows[0].Risk | Should -Be 'High'
+        $rows[-1].Risk | Should -Be 'Medium'
+    }
+    It 'gives a row with no evidence at all the level None' {
+        $row = [pscustomobject]@{ AutoApprove = ''; Trusted = ''; Status = 'Unreviewed'; Reasons = @()
+            Evidence = [pscustomobject]@{ Flag = ''; Listeners = @(); Software = @(); Alerts = @(); LocalMcps = (New-Object 'System.Collections.Generic.List[object]'); RemoteMcps = (New-Object 'System.Collections.Generic.List[object]')
+                                          Files = (New-Object 'System.Collections.Generic.List[object]'); AssetValue = ''; ExposureLevel = '' } }
+        (Get-EndpointAiRisk $row).Level | Should -Be 'None'
+    }
+    It 'lists named hosts first and sums the bare addresses into one line in the evidence' {
+        $d = New-EpData
+        $d.Outbound = @(
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = 'ollama.com'; Hits = 17; LastSeen = '2026-10-05T16:47:00Z' }
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = '140.82.112.22'; Hits = 3; LastSeen = '2026-10-05T16:47:00Z' }
+            @{ DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = '140.82.113.6'; Hits = 2; LastSeen = '2026-10-05T16:47:00Z' })
+        $o = @(New-EndpointAiRows -Data $d) | Where-Object Tool -eq 'Ollama'
+        $net = @(Get-EndpointAiDetailRows $o | Where-Object Section -eq 'Network')
+        $net.Count | Should -Be 2
+        $net[0].Item | Should -Be 'ollama.com'
+        $net[1].Item | Should -Be 'IP addresses without a name'
+        $net[1].Info | Should -BeLike '2 addresses, 5 connections*'
+    }
+}
+
+Describe 'Endpoint AI: reading the data' {
+    It 'runs the queries, reports progress, and returns rows with coverage' {
+        $script:said = @()
+        Mock Invoke-HuntingQuery {
+            if ($Query -like '*summarize Devices = count() by OnboardingStatus*') { @(@{ OnboardingStatus = 'Onboarded'; Devices = 3 }, @{ OnboardingStatus = 'Can be onboarded'; Devices = 8 }) }
+            elseif ($Query -like '*Platform == "LocalAgents"*') { @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' }, @{ AgentId = 'a2'; Name = 'Claude Desktop'; LifecycleStatus = 'Deleted'; Device = 'lab'; DeviceId = 'dev1' }) }
+            elseif ($Query -like 'DeviceInfo*') { @(@{ DeviceId = 'dev1'; DeviceName = 'lab'; OSPlatform = 'Windows10'; OnboardingStatus = 'Onboarded'; DeviceType = 'Workstation'; ExposureLevel = 'Low'; AssetValue = 'Normal' }) }
+            else { @() }
+        }
+        $data = Get-EndpointAiData -Days 7 -OnStatus { param($m) $script:said += $m }
+        $data.Rows.Count | Should -Be 1
+        $data.Rows[0].Tool | Should -Be 'Ollama'
+        $data.Rows[0].Risk | Should -Be 'None'
+        $data.Coverage['Onboarded'] | Should -Be 3
+        $data.RemovedAgents | Should -Be 1
+        Should -Invoke Invoke-HuntingQuery -Times 11
+        $script:said.Count | Should -Be 11
+        $script:said[0] | Should -BeLike 'Reading Defender local agent discovery*'
+    }
+    It 'says what is needed when Advanced Hunting is not available' {
+        Mock Invoke-HuntingQuery { throw 'Advanced Hunting query failed (403). Endpoint AI needs Advanced Hunting' }
+        { Get-EndpointAiData -Days 7 } | Should -Throw '*Advanced Hunting*'
+    }
+}
+
+Describe 'Endpoint AI: lists given on the command line' {
+    It 'splits a comma or semicolon separated value, so a scheduled task can pass a list' {
+        ConvertTo-NameList @('GitHub,Microsoft') | Should -Be @('GitHub', 'Microsoft')
+        ConvertTo-NameList @('lab-* ; vm-1') | Should -Be @('lab-*', 'vm-1')
+        ConvertTo-NameList @('GitHub', 'Microsoft') | Should -Be @('GitHub', 'Microsoft')
+        @(ConvertTo-NameList $null).Count | Should -Be 0
+        @(ConvertTo-NameList @('', ' ,')).Count | Should -Be 0
+    }
+}
+
+Describe 'Local AI agent block: the rule' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe', 'C:\Users\alice\AppData\Local\Programs\Ollama\lib\ollama\llama-server.exe'), [string]$DeviceId = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+    }
+    It 'names a rule after the tool and the first 12 characters of the device id, with safe characters only' {
+        Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c' | Should -Be 'a365ba-block-ollama-0f1e2d3c4b5a'
+        Get-LocalAgentBlockId -ToolKey 'defender:Acme Helper' -DeviceId 'AB-12' | Should -Be 'a365ba-block-defender-acme-helper-ab12'
+    }
+    It 'turns a path into a pattern that ignores the version folder but nothing else' {
+        $rx = { param($p) '(?i)^(' + (ConvertTo-PathRegex $p) + ')$' }
+        $claude = 'C:\Program Files\WindowsApps\Claude_1.52386.3.0_x64__pzs8sxrjxfjjc\app\claude.exe'
+        [regex]::IsMatch($claude, (& $rx $claude)) | Should -BeTrue
+        [regex]::IsMatch('C:\Program Files\WindowsApps\Claude_1.60000.1.0_x64__pzs8sxrjxfjjc\app\claude.exe', (& $rx $claude)) | Should -BeTrue
+        [regex]::IsMatch('C:\Users\bob\claude.exe', (& $rx $claude)) | Should -BeFalse
+        $rg = 'C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.87\ripgrep\bin\win32-x64\rg.exe'
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\ripgrep\bin\win32-x64\rg.exe', (& $rx $rg)) | Should -BeTrue
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\ripgrep\bin\win32-x64\rgXexe', (& $rx $rg)) | Should -BeFalse
+        [regex]::IsMatch('C:\Users\alice\AppData\Local\copilot\pkg\win32-x64\1.0.99\other\bin\win32-x64\rg.exe', (& $rx $rg)) | Should -BeFalse
+        (ConvertTo-PathRegex 'C:\Program Files\x\a.exe') | Should -Not -BeLike '*\ *'
+    }
+    It 'says why a row cannot be blocked' {
+        Test-LocalAgentBlockable (New-BlockRow) | Should -Be ''
+        Test-LocalAgentBlockable (New-BlockRow -DeviceId '') | Should -BeLike '*no device id*'
+        Test-LocalAgentBlockable (New-BlockRow -ToolKey 'mcp-server' -Tool 'MCP server (local)') | Should -BeLike '*not a program*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @()) | Should -BeLike '*nothing to match*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Windows\System32\tool.exe')) | Should -BeLike '*Windows folder*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Microsoft.MicrosoftOfficeHub_19.1.0.0_x64__8wekyb3d8bbwe\M365Copilot.exe')) | Should -BeLike '*Microsoft''s own app packages*'
+        Test-LocalAgentBlockable (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Claude_1.5.0.0_x64__abc\app\claude.exe')) | Should -Be ''
+        Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\Windows\System32\tool.exe', 'D:\apps\tool.exe', 'D:\apps\tool.exe')) | Should -Be @('D:\apps\tool.exe')
+        (Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\x\App_1.2.3\a.exe', 'C:\x\App_1.2.4\a.exe'))) | Should -Be @('C:\x\App_<version>\a.exe')
+        (Get-LocalAgentBlockPaths (New-BlockRow -Paths @('C:\x\App_1.2.3\a.exe', 'C:\x\App_1.2.4\a.exe')) -Raw).Count | Should -Be 2
+        Get-LocalAgentBlockWarning (New-BlockRow -Paths @('C:\Program Files\WindowsApps\Claude_1.5.0.0_x64__abc\app\claude.exe')) | Should -BeLike 'Installed from the Microsoft Store*'
+        Get-LocalAgentBlockWarning (New-BlockRow) | Should -Be ''
+    }
+    It 'limits the query to the one device and the files that tool ran from' {
+        $q = New-LocalAgentBlockQuery (New-BlockRow)
+        $q | Should -BeLike '*DeviceProcessEvents*'
+        $q | Should -BeLike '*DeviceId == "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c"*'
+        $q | Should -BeLike '*FolderPath matches regex @"(?i)^(C:\\Users\\alice\\AppData\\Local\\Programs\\Ollama\\ollama\.exe|C:\\Users\\alice*'
+        $q | Should -BeLike '*| project Timestamp, ReportId, DeviceId, DeviceName, FileName, FolderPath, SHA1, SHA256, ProcessCommandLine*'
+    }
+    It 'builds a rule that stops and quarantines on that device and carries the columns the action needs' {
+        $r = New-LocalAgentBlockRule -Row (New-BlockRow) -Operator 'admin@x.com'
+        $r.id | Should -Be 'a365ba-block-ollama-0f1e2d3c4b5a'
+        $r.displayName | Should -Be 'Agent365 Bulk Actions: block Ollama on lab'
+        $r.status | Should -Be 'enabled'
+        $r.schedule.frequency | Should -Be 'PT1H'
+        $r.description | Should -BeLike '*admin@x.com*'
+        $a = $r.detectionAction.automatedActions.stopAndQuarantineFiles
+        @($a).Count | Should -Be 1
+        $a[0].deviceIdColumn | Should -Be 'DeviceId'; $a[0].sha1Column | Should -Be 'SHA1'
+        $a[0].'@odata.type' | Should -Be '#microsoft.graph.security.stopAndQuarantineFileAction'
+        $r.detectionAction.alertTemplate.entityMappings.hosts[0].deviceIdColumn | Should -Be 'DeviceId'
+        $r.detectionAction.alertTemplate.severity | Should -Be 'informational'
+        ($r | ConvertTo-Json -Depth 12) | Should -Match '"stopAndQuarantineFiles":\s*\['
+    }
+}
+
+Describe 'Local AI agent block: creating and removing' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'), [string]$DeviceId = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+    }
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+    }
+    It 'lists only the rules this tool made, following the next link' {
+        Mock Invoke-Graph {
+            $script:calls += $Uri
+            if ($Uri -like '*skip=1') { @{ value = @(@{ id = 'a365ba-block-cursor-aaa'; displayName = 'c' }) } }
+            else { @{ value = @(@{ id = 'a365ba-block-ollama-bbb'; displayName = 'o' }, @{ id = 'someone-elses-rule'; displayName = 'x' }); '@odata.nextLink' = 'https://graph.microsoft.com/beta/security/rules/detectionRules?skip=1' } }
+        }
+        $b = Get-LocalAgentBlocks
+        ($b.Keys | Sort-Object) | Should -Be @('a365ba-block-cursor-aaa', 'a365ba-block-ollama-bbb')
+        $script:calls.Count | Should -Be 2
+    }
+    It 'creates the rule on the beta detection rules endpoint and logs the files and rule id' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri; Body = $Body } } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Action | Should -Be 'blocklocalagent'
+        $log[0].RuleId | Should -Be 'a365ba-block-ollama-0f1e2d3c4b5a'
+        $log[0].Files | Should -Be 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Uri | Should -Be 'https://graph.microsoft.com/beta/security/rules/detectionRules'
+        ($script:calls[0].Body | ConvertFrom-Json).id | Should -Be 'a365ba-block-ollama-0f1e2d3c4b5a'
+    }
+    It 'skips a row that is already blocked or cannot be blocked, and sends nothing' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri } } else { @{ value = @(@{ id = 'a365ba-block-ollama-0f1e2d3c4b5a'; displayName = 'o' }) } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @((New-BlockRow), (New-BlockRow -ToolKey 'mcp-server' -Tool 'MCP server (local)')) -PassThru)
+        ($log | Where-Object Tool -eq 'Ollama').Error | Should -BeLike 'Already blocked*'
+        ($log | Where-Object Tool -eq 'MCP server (local)').Error | Should -BeLike '*not a program*'
+        @($log | Where-Object Result -eq 'Skipped').Count | Should -Be 2
+        $script:calls.Count | Should -Be 0
+    }
+    It 'changes nothing when the proceed check says no (-WhatIf)' {
+        Mock Test-Proceed { $false }
+        Mock Invoke-Graph { if ($Method -eq 'POST') { $script:calls += , @{ Uri = $Uri } } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'WhatIf'
+        $script:calls.Count | Should -Be 0
+    }
+    It 'records a refusal with the permission and role that are needed' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { throw 'Forbidden' } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Failed'
+        $log[0].Error | Should -BeLike '*CustomDetection.ReadWrite.All*'
+    }
+    It 'removes a rule by id and reports a failure without stopping' {
+        Mock Invoke-Graph { $script:calls += , @{ Method = $Method; Uri = $Uri }; if ($Uri -like '*bad*') { throw 'boom' } }
+        $rules = @([pscustomobject]@{ id = 'a365ba-block-ollama-aaa'; displayName = 'Agent365 Bulk Actions: block Ollama on lab' }, [pscustomobject]@{ id = 'a365ba-block-bad-bbb'; displayName = 'Agent365 Bulk Actions: block Bad on lab' })
+        $log = @(Invoke-LocalAgentUnblock -Rules $rules -PassThru)
+        ($log | Where-Object RuleId -eq 'a365ba-block-ollama-aaa').Result | Should -Be 'Done'
+        ($log | Where-Object RuleId -eq 'a365ba-block-bad-bbb').Result | Should -Be 'Failed'
+        $script:calls[0].Method | Should -Be 'DELETE'
+        $script:calls[0].Uri | Should -Be 'https://graph.microsoft.com/beta/security/rules/detectionRules/a365ba-block-ollama-aaa'
+    }
+    It 'marks a row as blocked when its rule exists' {
+        $data = @{
+            Agents = @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' })
+            Processes = @(); Mcp = @(); Files = @(); Outbound = @(); Listening = @(); Software = @(); Vulnerabilities = @(); Alerts = @(); Devices = @()
+        }
+        (@(New-EndpointAiRows -Data $data) | Select-Object -First 1).Blocked | Should -Be ''
+        $blocks = @{ (Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId 'dev1') = @{ id = 'x' } }
+        $row = @(New-EndpointAiRows -Data $data -Blocks $blocks) | Select-Object -First 1
+        $row.Blocked | Should -Be 'Blocked'
+        $row.ToolKey | Should -Be 'ollama'
+    }
+}
+
+Describe 'Local AI agent block: how the service behaves' {
+    BeforeAll {
+        function New-BlockRow {
+            param([string]$ToolKey = 'ollama', [string]$Tool = 'Ollama', [string[]]$Paths = @('C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe'), [string]$DeviceId = '0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c')
+            [pscustomobject]@{ ToolKey = $ToolKey; Tool = $Tool; Device = 'lab'; DeviceId = $DeviceId; Blocked = ''
+                               Evidence = [pscustomobject]@{ Processes = @($Paths | ForEach-Object { [pscustomobject]@{ File = (Split-Path $_ -Leaf); Path = $_ } }) } }
+        }
+        $script:ruleId = 'a365ba-block-ollama-0f1e2d3c4b5a'
+    }
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+        $script:RecentlyUnblocked = @{}
+    }
+    It 'counts only an enabled rule that was not just removed as blocking' {
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'enabled' } } -RuleId $script:ruleId | Should -BeTrue
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'disabled' } } -RuleId $script:ruleId | Should -BeFalse
+        Test-LocalAgentBlockActive -Blocks @{} -RuleId $script:ruleId | Should -BeFalse
+        $script:RecentlyUnblocked[$script:ruleId] = Get-Date
+        Test-LocalAgentBlockActive -Blocks @{ $script:ruleId = @{ status = 'enabled' } } -RuleId $script:ruleId | Should -BeFalse
+    }
+    It 'treats a rule the service no longer knows as removed, not as a failure' {
+        Mock Invoke-Graph { throw 'Custom detection rule with ID x was not found. NotFound' }
+        $log = @(Invoke-LocalAgentUnblock -Rules @([pscustomobject]@{ id = $script:ruleId; displayName = 'r' }) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $log[0].Error | Should -BeLike '*no longer had the rule*'
+    }
+    It 'does not trust the list for a rule it just removed, so blocking again creates it afresh' {
+        Mock Invoke-Graph {
+            if ($Method -eq 'DELETE') { return }
+            if ($Method -in 'POST', 'PATCH') { $script:calls += , @{ Method = $Method; Uri = $Uri }; return }
+            @{ value = @(@{ id = $script:ruleId; status = 'enabled'; displayName = 'o' }) }
+        }
+        $null = Invoke-LocalAgentUnblock -Rules @([pscustomobject]@{ id = $script:ruleId; displayName = 'r' }) -PassThru
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Method | Should -Be 'POST'
+        $script:RecentlyUnblocked.ContainsKey($script:ruleId) | Should -BeFalse
+    }
+    It 'switches a disabled rule back on with a complete update that carries its id' {
+        Mock Invoke-Graph {
+            if ($Method -in 'POST', 'PATCH') { $script:calls += , @{ Method = $Method; Uri = $Uri; Body = $Body }; return }
+            @{ value = @(@{ id = $script:ruleId; status = 'disabled'; displayName = 'o' }) }
+        }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        $script:calls.Count | Should -Be 1
+        $script:calls[0].Method | Should -Be 'PATCH'
+        $script:calls[0].Uri | Should -Be "https://graph.microsoft.com/beta/security/rules/detectionRules/$script:ruleId"
+        $body = $script:calls[0].Body | ConvertFrom-Json
+        $body.id | Should -Be $script:ruleId
+        $body.status | Should -Be 'enabled'
+        $body.detectionAction.automatedActions.stopAndQuarantineFiles[0].sha1Column | Should -Be 'SHA1'
+    }
+    It 'updates the rule instead when creating it says it already exists' {
+        Mock Invoke-Graph {
+            if ($Method -eq 'POST') { $script:calls += , @{ Method = 'POST' }; throw 'A rule with this id already exists' }
+            if ($Method -eq 'PATCH') { $script:calls += , @{ Method = 'PATCH' }; return }
+            @{ value = @() }
+        }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Done'
+        ($script:calls | ForEach-Object { $_.Method }) | Should -Be @('POST', 'PATCH')
+    }
+    It 'still reports any other creation error' {
+        Mock Invoke-Graph { if ($Method -eq 'POST') { throw 'Bad request: query is invalid' } else { @{ value = @() } } }
+        $log = @(Invoke-LocalAgentBlock -Rows @(New-BlockRow) -PassThru)
+        $log[0].Result | Should -Be 'Failed'
+        $log[0].Error | Should -BeLike '*query is invalid*'
+    }
+    It 'marks a row as blocked only for an enabled rule' {
+        $data = @{
+            Agents = @(@{ AgentId = 'a1'; Name = 'Ollama Desktop'; Version = '1.0'; LifecycleStatus = ''; LastSeen = '2026-10-05T16:51:06Z'; FirstSeen = '2026-09-09T10:06:02Z'; Vendor = 'Ollama'; Process = 'ollama.exe'; Trusted = 'true'; AutoApprove = 'false'; Device = 'lab'; DeviceId = 'dev1'; Account = 'alice' })
+            Processes = @(); Mcp = @(); Files = @(); Outbound = @(); Listening = @(); Software = @(); Vulnerabilities = @(); Alerts = @(); Devices = @()
+        }
+        $rid = Get-LocalAgentBlockId -ToolKey 'ollama' -DeviceId 'dev1'
+        (@(New-EndpointAiRows -Data $data -Blocks @{ $rid = @{ id = $rid; status = 'disabled' } }) | Select-Object -First 1).Blocked | Should -Be ''
+        (@(New-EndpointAiRows -Data $data -Blocks @{ $rid = @{ id = $rid; status = 'enabled' } }) | Select-Object -First 1).Blocked | Should -Be 'Blocked'
+    }
+}
+
+Describe 'Conditional Access check for agents' {
+    BeforeAll {
+        # Policies shaped like the ones the service returns.
+        function New-RawCa {
+            param([string]$Name = 'p', [string]$State = 'enabled', [string[]]$Include = @(), $Filter = $null, [string[]]$Exclude = @(), [string[]]$Risk = @(),
+                  [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Grant = @('block'), $Agents = $null, [switch]$NoClientApps)
+            $ca = if ($NoClientApps) { $null } else { @{ includeServicePrincipals = @(); includeAgentIdServicePrincipals = $Include; excludeServicePrincipals = $Exclude } }
+            if ($ca -and $Filter) { $ca['agentIdServicePrincipalFilter'] = $Filter }
+            @{ id = "id-$Name"; displayName = $Name; state = $State
+               conditions = @{ clientApplications = $ca; agents = $Agents; agentIdRiskLevels = $Risk; users = @{ includeUsers = @('None') }
+                               applications = @{ includeApplications = $Resources; excludeApplications = @(); applicationFilter = $null } }
+               grantControls = @{ builtInControls = $Grant; operator = 'OR' } }
+        }
+        function New-Ca { param([hashtable]$Raw) ConvertTo-AgentCaPolicy $Raw }
+    }
+    It 'reads who a policy targets, what it protects and what it does' {
+        $all = New-Ca (New-RawCa -Name 'Contoso' -Include @('All') -Risk @('high'))
+        $all.TargetsAgentIdentities | Should -BeTrue; $all.AllAgents | Should -BeTrue
+        $all.RiskLevels | Should -Be @('high'); $all.ResourceScope | Should -Be 'Agent resources'; $all.Blocks | Should -BeTrue
+        (New-Ca (New-RawCa -Include @('a1', 'b2') -Resources @('All'))).ResourceScope | Should -Be 'All resources'
+        (New-Ca (New-RawCa -Include @('All') -Resources @('None'))).ResourceScope | Should -Be 'None'
+        (New-Ca (New-RawCa -Include @('All') -Resources @('00000000-0000-0000-0000-0000000000a1'))).ResourceScope | Should -Be 'Specific resources'
+        (New-Ca (New-RawCa -Include @('All') -Grant @('mfa'))).Blocks | Should -BeFalse
+        $byRule = New-Ca (New-RawCa -Filter @{ mode = 'include'; rule = 'CustomSecurityAttribute.X -contains "Y"' })
+        $byRule.TargetsAgentIdentities | Should -BeTrue; $byRule.FilterMode | Should -Be 'include'; $byRule.AllAgents | Should -BeFalse
+        (New-Ca (New-RawCa -NoClientApps -Resources @('All'))).TargetsAgentIdentities | Should -BeFalse
+        (New-Ca (New-RawCa -Include @('All') -Agents @{ includeAgentUsers = @('All') })).TargetsAgentUsers | Should -BeTrue
+    }
+    It 'decides whether an agent is among the agents a policy targets' {
+        $ids = @('agent-1', 'app-1', 'bp-app-1', 'bp-sp-1')
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('AGENT-1'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('bp-sp-1'))) $ids).Result | Should -Be 'Yes'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('other'))) $ids).Result | Should -Be 'No'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All') -Exclude @('bp-app-1'))) $ids).Result | Should -Be 'No'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Filter @{ mode = 'include'; rule = 'r' })) $ids).Result | Should -Be 'Maybe'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All') -Filter @{ mode = 'exclude'; rule = 'r' })) $ids).Result | Should -Be 'Maybe'
+        (Test-AgentCaTarget (New-Ca (New-RawCa -NoClientApps)) $ids).Result | Should -Be 'No'
+    }
+    It 'says an agent is protected when an enforced policy blocks High agent risk, and whether it is blocked now' {
+        $pol = @(New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Protected'; $c.BlockedNow | Should -BeTrue; $c.Verdict | Should -BeLike '*Block high*Blocked now*'
+        $m = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'medium'
+        $m.Kind | Should -Be 'Protected'; $m.BlockedNow | Should -BeFalse; $m.Verdict | Should -BeLike '*risk is medium*no enforced policy covers*'
+        $n = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
+        $n.Kind | Should -Be 'Protected'; $n.BlockedNow | Should -BeFalse; $n.Verdict | Should -BeLike '*Not blocked now: Entra has not flagged it*'
+    }
+    It 'blocks now at the current level when the policy covers medium and high' {
+        $pol = @(New-Ca (New-RawCa -Name 'Medium and up' -Include @('All') -Risk @('medium', 'high')))
+        (Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'medium').BlockedNow | Should -BeTrue
+    }
+    It 'does not count a policy that is only reporting' {
+        $pol = @(New-Ca (New-RawCa -Name 'Reporting' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Report-only'; $c.Verdict | Should -BeLike 'Not enforced*Reporting*'; $c.BlockedNow | Should -BeFalse
+    }
+    It 'spots an enabled policy that protects no resources' {
+        $pol = @(New-Ca (New-RawCa -Name 'Medium and above' -Include @('All') -Risk @('medium', 'high') -Resources @('None')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'No effect'; $c.Verdict | Should -BeLike '*Medium and above*protects no resources*'; $c.BlockedNow | Should -BeFalse
+    }
+    It 'only suggests protection from an attribute rule it cannot evaluate' {
+        $pol = @(New-Ca (New-RawCa -Name 'By attribute' -Filter @{ mode = 'include'; rule = 'CustomSecurityAttribute.A -contains "B"' } -Risk @('high')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Possible'; $c.Verdict | Should -BeLike '*attribute-based*By attribute*'
+    }
+    It 'says unprotected when no enforced policy blocks the agent at High, whatever else exists' {
+        $pol = @(
+            (New-Ca (New-RawCa -Name 'Other agents' -Include @('someone-else') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Off' -State 'disabled' -Include @('All') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))),
+            (New-Ca (New-RawCa -Name 'Low only' -Include @('All') -Risk @('low'))))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Unprotected'; $c.Verdict | Should -BeLike 'No enforced policy blocks it at High*'
+        @($c.Policies | ForEach-Object { $_.Policy }) | Should -Be @('Off', 'Low only')
+    }
+    It 'lets an enforced policy win over a report-only one and over one with no effect' {
+        $pol = @(
+            (New-Ca (New-RawCa -Name 'Reporting' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high'))),
+            (New-Ca (New-RawCa -Name 'Nothing' -Include @('All') -Risk @('high') -Resources @('None'))),
+            (New-Ca (New-RawCa -Name 'Real' -Include @('All') -Risk @('high'))))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
+        $c.Kind | Should -Be 'Protected'; $c.Verdict | Should -BeLike '*Real*'; $c.Verdict | Should -Not -BeLike '*Nothing*'
+    }
+    It 'reads the policies page by page' {
+        Mock Invoke-Graph {
+            if ($Uri -like '*skip=1') { @{ value = @((New-RawCa -Name 'two' -Include @('All'))) } }
+            else { @{ value = @((New-RawCa -Name 'one' -Include @('All'))); '@odata.nextLink' = 'https://graph.microsoft.com/beta/identity/conditionalAccess/policies?skip=1' } }
+        }
+        @(Get-AgentCaPolicies | ForEach-Object { $_.Name }) | Should -Be @('one', 'two')
+    }
+    It 'finds each agent identity''s app id, blueprint and blueprint principal in two batches' {
+        Mock Invoke-GraphBatch {
+            if ($Requests[0].url -match '\?\$filter') { @{ 'b0000000-0000-0000-0000-0000000000b1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-principal' }) } } } }
+            else { @{ 'ag1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ appId = 'ag1-app'; agentIdentityBlueprintId = 'b0000000-0000-0000-0000-0000000000b1' } }; 'ag2' = [pscustomobject]@{ Status = 404; Body = $null } } }
+        }
+        $m = Get-AgentIdentityIds @('ag1', 'ag2', 'ag1')
+        $m['ag1'].AppId | Should -Be 'ag1-app'; $m['ag1'].Blueprint | Should -Be 'b0000000-0000-0000-0000-0000000000b1'; $m['ag1'].Principal | Should -Be 'bp-principal'
+        $m['ag2'].Blueprint | Should -Be ''
+        Should -Invoke Invoke-GraphBatch -Times 2
+    }
+    It 'lists only the identities Entra rates at risk or confirmed compromised' {
+        $script:RiskBase = 'https://graph.microsoft.com/beta/identityProtection/riskyAgents'
+        Mock Invoke-Graph { @{ value = @(@{ id = 'a'; riskState = 'atRisk' }, @{ id = 'b'; riskState = 'dismissed' }, @{ id = 'c'; riskState = 'confirmedCompromised' }) } }
+        Get-EntraRiskyAgentIds | Should -Be @('a', 'c')
+    }
+    It 'builds a report for chosen agents and notes the ones with no Entra identity' {
+        Mock Get-AgentCaPolicies { @((New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))), (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))), (New-Ca (New-RawCa -Name 'Agent users' -Include @('All') -Agents @{ x = 1 } -NoClientApps))) }
+        Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = 'i1'; Blueprint = ''; Principal = '' } } }
+        Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = '' } } }
+        $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = '' })
+        $r = Get-AgentCaReport -Packages $pk
+        $r.Rows.Count | Should -Be 1
+        $r.Rows[0].Agent | Should -Be 'Alpha'; $r.Rows[0].Kind | Should -Be 'Protected'; $r.Rows[0].EntraRisk | Should -Be 'high (confirmedCompromised)'; $r.Rows[0].BlockedNow | Should -BeTrue
+        $r.NoIdentity | Should -Be @('Beta')
+        $r.PolicyCount | Should -Be 3; $r.AgentPolicies | Should -Be 1; $r.AgentUserPolicies | Should -Be 1
+    }
+    It 'lists the verdict, the Entra risk and each policy that could apply in the detail view' {
+        $pol = @((New-Ca (New-RawCa -Name 'Nothing' -Include @('All') -Risk @('high') -Resources @('None'))), (New-Ca (New-RawCa -Name 'Real' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high'))))
+        $row = Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies $pol -RiskLevel 'high'
+        $row | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'high (atRisk)'
+        $d = @(Get-AgentCaDetailRows $row)
+        ($d | Where-Object Section -eq 'Verdict').Item | Should -Be 'Report-only'
+        ($d | Where-Object Item -eq 'Entra risk now').Info | Should -Be 'high (atRisk)'
+        @($d | Where-Object Section -eq 'Policies').Count | Should -Be 2
+        (($d | Where-Object Item -eq 'Real').Info) | Should -BeLike 'Report-only. Applies: Yes*'
+        (($d | Where-Object Item -eq 'Nothing').Info) | Should -BeLike '*never applies*'
+        (@(Get-AgentCaDetailRows (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @() | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'unknown' -PassThru)) | Where-Object Item -eq '(none)').Info | Should -BeLike 'No Conditional Access policy targets this agent*'
+    }
+    It 'names the policies behind each verdict' {
+        $live = New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))
+        $report = New-Ca (New-RawCa -Name 'Pilot' -State 'enabledForReportingButNotEnforced' -Include @('p1') -Risk @('high'))
+        $none = New-Ca (New-RawCa -Name 'Nothing' -Include @('n1') -Risk @('high') -Resources @('None'))
+        $attr = New-Ca (New-RawCa -Name 'By attribute' -Filter @{ mode = 'include'; rule = 'r' } -Risk @('high'))
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @($live))) | Should -Be 'Block high'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('p1') -Policies @($report))) | Should -Be 'Pilot'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('n1') -Policies @($none))) | Should -Be 'Nothing'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @($attr))) | Should -Be 'By attribute'
+        (Get-AgentCaCovering (Get-AgentCaCoverage -Agent 'A' -Ids @('x') -Policies @())) | Should -Be ''
+    }
+    It 'counts agents with the same verdict and policies together, worst first' {
+        $live = New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))
+        $open = New-Ca (New-RawCa -Name 'Pilot only' -Include @('p1') -Risk @('high'))
+        $rows = @(
+            (Get-AgentCaCoverage -Agent 'A' -Ids @('a') -Policies @($live) -RiskLevel 'high'),
+            (Get-AgentCaCoverage -Agent 'B' -Ids @('b') -Policies @($live)),
+            (Get-AgentCaCoverage -Agent 'C' -Ids @('c') -Policies @($live)),
+            (Get-AgentCaCoverage -Agent 'D' -Ids @('d') -Policies @($open)))
+        $g = @(Get-AgentCaGroups $rows)
+        $g.Count | Should -Be 2
+        $g[0].Verdict | Should -Be 'Unprotected'; $g[0].Agents | Should -Be 1; $g[0].CoveredBy | Should -Be ''
+        $g[1].Verdict | Should -Be 'Protected'; $g[1].Agents | Should -Be 3; $g[1].BlockedNow | Should -Be 1; $g[1].CoveredBy | Should -Be 'Block high'
+    }
+}
+
+Describe 'Conditional Access check: tenant findings' {
+    It 'lists enabled policies that protect no resources, and agents covered but not blocked now' {
+        function New-RawCa2 { param([string]$Name, [string]$State = 'enabled', [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Risk = @('high'))
+            @{ id = "id-$Name"; displayName = $Name; state = $State
+               conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('All'); excludeServicePrincipals = @() }; agents = $null; agentIdRiskLevels = $Risk
+                               applications = @{ includeApplications = $Resources; applicationFilter = $null } }
+               grantControls = @{ builtInControls = @('block') } } }
+        Mock Get-AgentCaPolicies { @((ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Real')), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Nothing' -Resources @('None'))), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Off' -State 'disabled' -Resources @('None')))) }
+        Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = ''; Blueprint = ''; Principal = '' }; 'i2' = [pscustomobject]@{ Identity = 'i2'; AppId = ''; Blueprint = ''; Principal = '' } } }
+        Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'atRisk'; Detail = '' }; 'i2' = $null } }
+        $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Flagged'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Quiet'; agentIdentityId = 'i2' })
+        $r = Get-AgentCaReport -Packages $pk
+        $r.NeverApply | Should -Be @('Nothing')
+        $r.NotBlockedNow | Should -Be @('Quiet')
+        ($r.Rows | Where-Object Agent -eq 'Flagged').BlockedNow | Should -BeTrue
+        ($r.Rows | Where-Object Agent -eq 'Quiet').EntraRisk | Should -Be 'unknown'
+    }
+}
+Describe 'Agent users' {
+    BeforeAll {
+        function New-LicenseDetail {
+            param([string]$Part, [string]$Plan = 'AGENT_365', [string]$Status = 'Success')
+            [pscustomobject]@{ skuPartNumber = $Part; servicePlans = @([pscustomobject]@{ servicePlanName = $Plan; provisioningStatus = $Status }) }
+        }
+        function New-AuRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$User = 'Ann', [string]$UserId = 'u1', [string]$Upn = 'ann@contoso.com', [string]$Kind = 'User',
+                  [int]$N7 = 0, [int]$N14 = 0, [int]$N30 = 0, $Has = $true)
+            [pscustomobject]@{ Agent = $Agent; AgentId = $AgentId; User = $User; Upn = $Upn; UserId = $UserId; Kind = $Kind; Interactions = $N30; N7 = $N7; N14 = $N14; N30 = $N30
+                               Last = [datetime]'2026-10-06 10:00'; Licensed = $(if ($Has -eq $true) { 'Yes' } elseif ($Has -eq $false) { 'No' } else { 'n/a' }); HasLicense = $Has
+                               License = $(if ($Has) { 'Agent 365' } else { 'None' }); LicenseDetail = '' }
+        }
+    }
+    It 'recognises a standalone Agent 365 license, in either SKU' {
+        $a = Get-AgentLicenseState @(New-LicenseDetail 'AGENT_365')
+        $a.Has | Should -BeTrue; $a.Label | Should -Be 'Agent 365'; $a.Detail | Should -Be 'AGENT_365'
+        $t = Get-AgentLicenseState @(New-LicenseDetail 'MICROSOFT_AGENT_365_TIER_3')
+        $t.Has | Should -BeTrue; $t.Label | Should -Be 'Agent 365'
+    }
+    It 'recognises E7 by its name, and a bundle by the Agent 365 plan it holds' {
+        $e7 = Get-AgentLicenseState @(New-LicenseDetail 'Microsoft_365_E7' -Plan 'EXCHANGE_S_ENTERPRISE')
+        $e7.Has | Should -BeTrue; $e7.Label | Should -Be 'E7'
+        (Get-AgentLicenseState @(New-LicenseDetail 'M365_E7')).Label | Should -Be 'E7'
+        $b = Get-AgentLicenseState @(New-LicenseDetail 'SOME_SUITE')
+        $b.Has | Should -BeTrue; $b.Label | Should -Be 'Agent 365 (in SOME_SUITE)'
+    }
+    It 'does not take E5 or an unrelated license for either' {
+        $n = Get-AgentLicenseState @((New-LicenseDetail 'Microsoft_365_E5_(no_Teams)' -Plan 'EXCHANGE_S_ENTERPRISE'), (New-LicenseDetail 'FLOW_FREE' -Plan 'FLOW_FREE'))
+        $n.Has | Should -BeFalse; $n.Label | Should -Be 'None'
+        (Get-AgentLicenseState @()).Label | Should -Be 'None'
+        (Get-AgentLicenseState $null).Has | Should -BeFalse
+    }
+    It 'joins several licenses and does not count one whose Agent 365 plan is turned off' {
+        $both = Get-AgentLicenseState @((New-LicenseDetail 'Microsoft_365_E7' -Plan 'X'), (New-LicenseDetail 'AGENT_365'))
+        $both.Label | Should -Be 'E7 + Agent 365'; $both.Detail | Should -Be 'Microsoft_365_E7, AGENT_365'
+        $off = Get-AgentLicenseState @(New-LicenseDetail 'AGENT_365' -Status 'Disabled')
+        $off.Has | Should -BeFalse; $off.Label | Should -Be 'Agent 365 plan turned off'; $off.Detail | Should -Be 'AGENT_365'
+        (Get-AgentLicenseState @((New-LicenseDetail 'AGENT_365' -Status 'Disabled'), (New-LicenseDetail 'MICROSOFT_AGENT_365_TIER_3'))).Has | Should -BeTrue
+    }
+    It 'reads each account once, with its name, type and license, and copes with ids that are not users' {
+        Mock Invoke-GraphBatch {
+            $script:sent = @($Requests)
+            @{
+                'u:a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'Ann'; userPrincipalName = 'ann@contoso.com'; userType = 'Member' } }
+                'l:a' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @(New-LicenseDetail 'AGENT_365') } }
+                'u:b' = [pscustomobject]@{ Status = 404; Body = $null }
+                'l:b' = [pscustomobject]@{ Status = 404; Body = $null }
+                'u:c' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'Gus'; userPrincipalName = 'gus_x#EXT#@contoso.com'; userType = 'Guest' } }
+                'l:c' = [pscustomobject]@{ Status = 403; Body = $null }
+            }
+        }
+        $acc = Get-AgentUserAccounts -UserIds @('a', 'b', 'c', 'a', '')
+        @($script:sent).Count | Should -Be 6
+        @($script:sent | ForEach-Object { $_.id } | Get-Distinct).Count | Should -Be 6
+        $acc['a'].Found | Should -BeTrue; $acc['a'].Name | Should -Be 'Ann'; $acc['a'].Kind | Should -Be 'User'; $acc['a'].Has | Should -BeTrue; $acc['a'].License | Should -Be 'Agent 365'
+        $acc['b'].Found | Should -BeFalse; $acc['b'].Kind | Should -Be 'Not a directory user'; $acc['b'].Has | Should -BeNullOrEmpty; $acc['b'].License | Should -Be 'Not applicable'
+        $acc['c'].Kind | Should -Be 'Guest'; $acc['c'].Has | Should -BeNullOrEmpty; $acc['c'].License | Should -BeLike 'Unknown*'
+    }
+    It 'asks Defender for user-attributed agent events and returns counts for 7, 14 and 30 days' {
+        $script:AgentUserKql | Should -BeLike '*"InvokeAgent", "CopilotInteraction", "ConnectedAIAppInteraction"*'
+        $script:AgentUserKql | Should -BeLike '*isnotempty(AccountObjectId)*'
+        $script:AgentUserKql | Should -BeLike '*N7 = countif(Timestamp > ago(7d))*N14 = countif(Timestamp > ago(14d))*N30 = count()*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ CatalogId = 'T_ABC'; AccountObjectId = 'u1'; AccountName = 'Ann'; N7 = 2; N14 = 3; N30 = 5; Last = '2026-10-06T10:27:38.1234567Z' }) }
+        $r = @(Get-AgentUserInteractions)
+        $r.Count | Should -Be 1
+        $r[0].CatalogId | Should -Be 't_abc'; $r[0].UserId | Should -Be 'u1'; $r[0].N7 | Should -Be 2; $r[0].N14 | Should -Be 3; $r[0].N30 | Should -Be 5
+        $r[0].Last | Should -BeOfType ([datetime])
+    }
+    It 'names agents from the catalog, keeps unknown agents by id and limits to chosen agents' {
+        Mock Get-AgentUserInteractions {
+            @([pscustomobject]@{ CatalogId = 't_a'; UserId = 'u1'; Name = 'Ann (event)'; N7 = 1; N14 = 2; N30 = 3; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ CatalogId = 't_b'; UserId = 'u2'; Name = 'Agent Bot'; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-10-01' },
+              [pscustomobject]@{ CatalogId = 't_gone'; UserId = 'u1'; Name = 'Ann (event)'; N7 = 0; N14 = 1; N30 = 1; Last = [datetime]'2026-09-30' })
+        }
+        Mock Get-AgentUserAccounts {
+            @{ 'u1' = [pscustomobject]@{ Found = $true; Name = 'Ann'; Upn = 'ann@contoso.com'; Kind = 'User'; Has = $true; License = 'Agent 365'; Detail = 'AGENT_365' }
+               'u2' = [pscustomobject]@{ Found = $false; Name = ''; Upn = ''; Kind = 'Not a directory user'; Has = $null; License = 'Not applicable'; Detail = '' } }
+        }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $all = Get-AgentUsersReport -Packages $pk
+        $all.Rows.Count | Should -Be 3
+        $a = $all.Rows | Where-Object AgentId -eq 'T_A'
+        $a.Agent | Should -Be 'Alpha'; $a.User | Should -Be 'Ann'; $a.Upn | Should -Be 'ann@contoso.com'; $a.Licensed | Should -Be 'Yes'; $a.N7 | Should -Be 1; $a.N30 | Should -Be 3
+        $b = $all.Rows | Where-Object AgentId -eq 'T_B'
+        $b.User | Should -Be 'Agent Bot'; $b.Licensed | Should -Be 'n/a'; $b.Kind | Should -Be 'Not a directory user'
+        ($all.Rows | Where-Object AgentId -eq 't_gone').Agent | Should -Be 't_gone'
+        $some = Get-AgentUsersReport -Packages $pk -OnlyIds @('T_A')
+        @($some.Rows).Count | Should -Be 1; $some.Rows[0].Agent | Should -Be 'Alpha'
+    }
+    It 'selects the rows of one period, only the unlicensed, or those matching a text' {
+        $rows = @(
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Ann' -UserId 'u1' -N7 2 -N14 3 -N30 5),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bob' -UserId 'u2' -Upn 'bob@contoso.com' -N7 0 -N14 1 -N30 9 -Has $false),
+            (New-AuRow -Agent 'Beta' -AgentId 'T_B' -User 'Cy' -UserId 'u3' -Upn 'cy@contoso.com' -N7 0 -N14 0 -N30 2 -Has $null -Kind 'Not a directory user'))
+        $d7 = @(Select-AgentUserRows -Rows $rows -Days 7)
+        $d7.Count | Should -Be 1; $d7[0].User | Should -Be 'Ann'; $d7[0].Interactions | Should -Be 2
+        $d14 = @(Select-AgentUserRows -Rows $rows -Days 14)
+        $d14.Count | Should -Be 2; ($d14 | Where-Object User -eq 'Bob').Interactions | Should -Be 1
+        $d30 = @(Select-AgentUserRows -Rows $rows -Days 30)
+        $d30.Count | Should -Be 3
+        ($d30 | ForEach-Object { $_.User }) | Should -Be @('Bob', 'Ann', 'Cy')   # by agent, then the most interactions first
+        @(Select-AgentUserRows -Rows $rows -Days 30 -UnlicensedOnly).User | Should -Be @('Bob')
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text 'BOB').Count | Should -Be 1
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text 'beta').User | Should -Be @('Cy')
+        @(Select-AgentUserRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+        $rows[0].Interactions | Should -Be 5   # the report's own rows are left as they were
+    }
+    It 'counts users, agents, interactions and the users without a license, apart from accounts that are not users' {
+        $rows = @(
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Ann' -UserId 'u1' -N30 5),
+            (New-AuRow -Agent 'Beta' -AgentId 'T_B' -User 'Ann' -UserId 'u1' -N30 3),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bob' -UserId 'u2' -Upn 'bob@contoso.com' -N30 9 -Has $false),
+            (New-AuRow -Agent 'Alpha' -AgentId 'T_A' -User 'Bot' -UserId 'u3' -Upn '' -N30 2 -Has $null -Kind 'Not a directory user'))
+        $s = Get-AgentUserSummary $rows
+        $s.Users | Should -Be 2; $s.Agents | Should -Be 2; $s.Interactions | Should -Be 19; $s.OtherAccounts | Should -Be 1; $s.Unlicensed | Should -Be 1
+        $s.UnlicensedNames | Should -Be @('bob@contoso.com')
+        $by = @(Get-AgentUserByAgent $rows)
+        $by.Count | Should -Be 2
+        $by[0].Agent | Should -Be 'Alpha'; $by[0].Users | Should -Be 3; $by[0].Interactions | Should -Be 16; $by[0].Unlicensed | Should -Be 1
+        $by[1].Agent | Should -Be 'Beta'; $by[1].Unlicensed | Should -Be 0
+        (Get-AgentUserSummary @()).Interactions | Should -Be 0
+    }
+}
+
+Describe 'Sign-in fallback' {
+    BeforeAll {
+        function Connect-MgGraph { param([string[]]$Scopes, [switch]$NoWelcome, [switch]$UseDeviceCode, [string]$TenantId) }
+        $script:cn = @{ Scopes = @('CopilotPackages.Read.All'); NoWelcome = $true }
+    }
+    BeforeEach { Mock Write-Host {}; Mock Get-SignInMethod { '' }; Mock Set-SignInMethod {}; Mock Test-SavedSignIn { $false } }
+    It 'signs in with a device code at once when asked' {
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -DeviceCode
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'notes how the session was made, so the next run can reuse it' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -DeviceCode
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'devicecode' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'tries the window first at a terminal with a desktop, even when the saved session was made with a code' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Get-SignInMethod { 'devicecode' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'reuses a code session with a code, and no window attempt, when nobody can be shown a window' {
+        Mock Get-SignInMethod { 'devicecode' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Mock Test-SignInPromptPossible { $false }; Mock Get-NoWindowReason { '' }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 2 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Write-Host -Times 0 -Exactly
+    }
+    It 'starts over with the window when -Fresh is used, whatever the saved session was' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Get-SignInMethod { 'devicecode' }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn -Fresh
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'window' }
+    }
+    It 'gives an unattended run one try at a code, not three' {
+        Mock Test-SignInPromptPossible { $false }
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; throw 'Authentication timed out after 120 seconds due to inactivity.' }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*No code was entered in time*'
+        $script:codes | Should -Be 1
+    }
+    It 'uses the sign-in window when one can be shown' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Write-Host -Times 1 -Exactly -ParameterFilter { $Object -like '*press Ctrl+C and run again with -DeviceCode*' }
+    }
+    It 'says nothing extra when a saved sign-in makes the window unnecessary' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $true }
+        Mock Connect-MgGraph {}
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Write-Host -Times 0 -Exactly
+    }
+    It 'falls back to a device code when the window cannot be shown and a person is at the terminal' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured. See https://aka.ms/msal-net-wam#parent-window-handles' } }
+        { Connect-GraphSession -Connect $script:cn } | Should -Not -Throw
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'tells a session nobody can answer to run -SignIn, and offers no code' {
+        Mock Test-SignInPromptPossible { $false }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured.' } }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*-SignIn*'
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'does not fall back when the person cancels or the service refuses' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { '' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { throw 'InteractiveBrowserCredential authentication failed: User canceled authentication.' }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*cancelled before it finished*-DeviceCode*'
+        $said = try { Connect-GraphSession -Connect $script:cn; '' } catch { $_.Exception.Message }
+        $said | Should -Not -BeLike '*cannot show a sign-in window*'
+        Mock Connect-MgGraph { throw 'AADSTS65001: The user or administrator has not consented to use the application.' }
+        { Connect-GraphSession -Connect $script:cn } | Should -Throw '*AADSTS65001*'
+        Should -Invoke Connect-MgGraph -Times 0 -Exactly -ParameterFilter { $UseDeviceCode }
+    }
+    It 'tries the window first even in a remote shell, and uses a code only if the window fails' {
+        Mock Test-SignInPromptPossible { $true }; Mock Get-NoWindowReason { 'an SSH session' }; Mock Test-SavedSignIn { $false }
+        Mock Connect-MgGraph { if (-not $UseDeviceCode) { throw 'A window handle must be configured.' } }
+        Connect-GraphSession -Connect $script:cn
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { -not $UseDeviceCode }
+        Should -Invoke Connect-MgGraph -Times 1 -Exactly -ParameterFilter { $UseDeviceCode }
+        Should -Invoke Set-SignInMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'devicecode' }
+    }
+    It 'asks for a new code when one expires, up to three times' {
+        Mock Test-SignInPromptPossible { $true }
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; if ($script:codes -lt 3) { throw 'Authentication timed out. The device code expired.' } }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Not -Throw
+        $script:codes | Should -Be 3
+        $script:codes = 0
+        Mock Connect-MgGraph { $script:codes++; throw 'Authentication timed out. The device code expired.' }
+        { Connect-GraphSession -Connect $script:cn -DeviceCode } | Should -Throw '*No code was entered in time*'
+        $script:codes | Should -Be 3
+    }
+    It 'sees a remote shell and a session nobody can answer' {
+        $keep = @{ ACC = $env:ACC_CLOUD; SSH = $env:SSH_CONNECTION }
+        try {
+            $env:ACC_CLOUD = $null; $env:SSH_CONNECTION = '10.0.0.1 5000 10.0.0.2 22'; $env:SSH_CLIENT = $null; $env:SSH_TTY = $null
+            Get-NoWindowReason | Should -Be 'an SSH session'
+            $env:SSH_CONNECTION = $null; $env:ACC_CLOUD = '1'
+            Get-NoWindowReason | Should -Be 'Azure Cloud Shell'
+        } finally { $env:ACC_CLOUD = $keep.ACC; $env:SSH_CONNECTION = $keep.SSH }
+        Test-SignInPromptPossible | Should -BeOfType ([bool])
+    }
+}
+
+Describe 'Column filters' {
+    BeforeAll {
+        function New-CfRow { param([string]$Name, [string]$Kind, [string]$Platform = '', $Owner = $null) [pscustomobject]@{ Name = $Name; Kind = $Kind; Platform = $Platform; Owner = $Owner } }
+        $script:cfRows = @(
+            (New-CfRow 'Alpha Agent' 'Org-published' 'Copilot Studio' 'ann'),
+            (New-CfRow 'Beta bot' 'Org-published' 'Foundry'),
+            (New-CfRow 'Gamma Agent' 'Microsoft' 'Copilot Studio' 'bob'),
+            (New-CfRow 'Delta' 'Shared by a creator' '  '),
+            (New-CfRow 'Epsilon' 'Org-published' 'Copilot Studio' 'ann'))
+    }
+    It 'starts empty and is active once it holds text or values' {
+        $f = New-ColumnFilter
+        Test-ColumnFilterActive $f | Should -BeFalse
+        $f.Text = 'x'; Test-ColumnFilterActive $f | Should -BeTrue
+        $f.Text = ''; [void]$f.Values.Add('v'); Test-ColumnFilterActive $f | Should -BeTrue
+        $f.Values.Clear(); Test-ColumnFilterActive $f | Should -BeFalse
+        Test-ColumnFilterActive $null | Should -BeFalse
+    }
+    It 'reads an empty or missing cell as (blank)' {
+        Get-CellText $script:cfRows[1] 'Owner' | Should -Be '(blank)'
+        Get-CellText $script:cfRows[3] 'Platform' | Should -Be '(blank)'
+        Get-CellText $script:cfRows[0] 'Owner' | Should -Be 'ann'
+        Get-CellText $script:cfRows[0] 'NoSuchColumn' | Should -Be '(blank)'
+    }
+    It 'matches by part of the text, ignoring case' {
+        $f = New-ColumnFilter; $f.Text = 'AGENT'
+        Test-ColumnFilterMatch 'Alpha Agent' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Beta bot' $f | Should -BeFalse
+    }
+    It 'matches by the exact values ticked, and by both together' {
+        $f = New-ColumnFilter; [void]$f.Values.Add('Org-published'); [void]$f.Values.Add('Microsoft')
+        Test-ColumnFilterMatch 'Org-published' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Org' $f | Should -BeFalse
+        Test-ColumnFilterMatch 'Shared by a creator' $f | Should -BeFalse
+        $f.Text = 'micro'
+        Test-ColumnFilterMatch 'Microsoft' $f | Should -BeTrue
+        Test-ColumnFilterMatch 'Org-published' $f | Should -BeFalse
+    }
+    It 'lets a blank cell be picked' {
+        $f = New-ColumnFilter; [void]$f.Values.Add('(blank)')
+        @($script:cfRows | Where-Object { Test-ColumnFilterMatch (Get-CellText $_ 'Owner') $f }).Name | Should -Be @('Beta bot', 'Delta')
+    }
+    It 'lists the values of a column with counts, most common first' {
+        $c = Get-ColumnChoices -Rows $script:cfRows -Prop 'Kind'
+        $c.Total | Should -Be 3
+        ($c.Items | ForEach-Object { '{0}={1}' -f $_.Value, $_.Count }) | Should -Be @('Org-published=3', 'Microsoft=1', 'Shared by a creator=1')
+        $o = Get-ColumnChoices -Rows $script:cfRows -Prop 'Owner'
+        ($o.Items | ForEach-Object { '{0}={1}' -f $_.Value, $_.Count }) | Should -Be @('(blank)=2', 'ann=2', 'bob=1')   # a tie is broken by name
+    }
+    It 'narrows the list by text and caps it, reporting the full number of values' {
+        $n = Get-ColumnChoices -Rows $script:cfRows -Prop 'Platform' -Text 'copil'
+        $n.Total | Should -Be 1; $n.Items[0].Value | Should -Be 'Copilot Studio'; $n.Items[0].Count | Should -Be 3
+        (Get-ColumnChoices -Rows $script:cfRows -Prop 'Platform' -Text 'zzz').Total | Should -Be 0
+        $many = 1..30 | ForEach-Object { New-CfRow "Agent $_" 'k' }
+        $cap = Get-ColumnChoices -Rows $many -Prop 'Name' -Max 10
+        $cap.Total | Should -Be 30; @($cap.Items).Count | Should -Be 10
+    }
+}
+
+Describe 'Sign-in method note' {
+    It 'keeps the method in a file next to the saved session and clears it for a window sign-in' {
+        $f = Join-Path ([IO.Path]::GetTempPath()) ('a365-method-{0}.txt' -f [guid]::NewGuid())
+        try {
+            Mock Get-SignInMethodPath { $f }
+            Get-SignInMethod | Should -Be ''
+            Set-SignInMethod 'devicecode'; Get-SignInMethod | Should -Be 'devicecode'
+            Set-SignInMethod 'window'; Get-SignInMethod | Should -Be ''
+            Test-Path -LiteralPath $f | Should -BeFalse
+        } finally { Remove-Item -LiteralPath $f -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'Purview policy hits' {
+    BeforeAll {
+        function New-KeyMap {
+            param([hashtable]$Pairs)
+            $m = @{}
+            foreach ($k in $Pairs.Keys) { $m[$k] = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($c in @($Pairs[$k])) { [void]$m[$k].Add($c) } }
+            $m
+        }
+        function New-PhRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$Source = 'DLP match', [string]$Policy = 'P1', [string]$Rule = 'R1', [int]$N7 = 0, [int]$N14 = 0, [int]$N30 = 0, [string]$App = '')
+            New-PolicyHitRow -Agent $Agent -AgentId $AgentId -Via $(if ($AgentId) { 'application id' } else { '' }) -Source $Source -Policy $Policy -Rule $Rule -Severity 'low' -Actions '' -Workload 'W' -User 'u' -N7 $N7 -N14 $N14 -N30 $N30 -Last ([datetime]'2026-10-06 10:00') -App $App
+        }
+    }
+    It 'maps every id an agent appears under to its catalog agent, and treats a shared id as ambiguous' {
+        Mock Invoke-HuntingQuery {
+            @([pscustomobject]@{ CatalogId = 'T_A'; Key = 'K1' }, [pscustomobject]@{ CatalogId = 'T_A'; Key = 'k2' },
+              [pscustomobject]@{ CatalogId = 'T_B'; Key = 'BP' }, [pscustomobject]@{ CatalogId = 'T_C'; Key = 'bp' })
+        }
+        $m = Get-AgentKeyMap
+        Get-KeyAgent $m 'K1' | Should -Be 't_a'
+        Get-KeyAgent $m 'K2' | Should -Be 't_a'
+        Get-KeyAgent $m 'BP' | Should -Be ''
+        Get-KeyAgent $m 'unknown' | Should -Be ''
+        Get-KeyAgent $m '' | Should -Be ''
+    }
+    It 'ties a hit to an agent by the application id it names, or by an agent user account, and leaves the rest alone' {
+        $km = New-KeyMap @{ 'app-1' = 't_a'; 'bp-9' = 't_b'; 'shared' = @('t_a', 't_b') }
+        $um = @{ 'u-agent' = [pscustomobject]@{ Name = 'Agent user'; Keys = @('parent-1', 'shared', 'bp-9') }; 'u-lost' = [pscustomobject]@{ Name = 'Lost'; Keys = @('nothing') } }
+        $a = Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey 'APP-1' -UserIds @('u-agent')
+        $a.CatalogId | Should -Be 't_a'; $a.Via | Should -Be 'application id'
+        $b = Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey '' -UserIds @('someone', 'U-AGENT')
+        $b.CatalogId | Should -Be 't_b'; $b.Via | Should -Be 'agent user'
+        Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey 'shared' -UserIds @() | Should -BeNullOrEmpty
+        Resolve-HitAgent -KeyMap $km -UserMap $um -AppKey '' -UserIds @('u-lost', 'a-person') | Should -BeNullOrEmpty
+    }
+    It 'reads an alert: its source, the policy it names, and the accounts and applications it concerns' {
+        $raw = @{ title = 'DLP-Copilot Studio agent sensitive'; alertPolicyId = 'pol-1'; severity = 'low'; status = 'new'; serviceSource = 'dataLossPrevention'; createdDateTime = '2026-10-06T10:27:38.1234567Z'
+                  evidence = @(@{ '@odata.type' = '#microsoft.graph.security.userEvidence'; userAccount = @{ azureAdUserId = 'u-1'; userPrincipalName = 'ann@contoso.com'; accountName = 'ann' } },
+                               @{ '@odata.type' = '#microsoft.graph.security.cloudApplicationEvidence'; appId = 'app-1' },
+                               @{ '@odata.type' = '#microsoft.graph.security.fileEvidence' }) }
+        $a = ConvertTo-PurviewAlert $raw
+        $a.Source | Should -Be 'DLP alert'; $a.Title | Should -Be 'DLP-Copilot Studio agent sensitive'; $a.PolicyId | Should -Be 'pol-1'
+        $a.UserIds | Should -Be @('u-1'); $a.User | Should -Be 'ann@contoso.com'; $a.AppIds | Should -Be @('app-1'); $a.Created | Should -BeOfType ([datetime])
+        (ConvertTo-PurviewAlert @{ title = 'Risky agent'; serviceSource = 'microsoftInsiderRiskManagement'; evidence = @() }).Source | Should -Be 'Insider Risk alert'
+    }
+    It 'reads the agent user accounts with the ids that lead back to their agents' {
+        Mock Invoke-Graph { @{ value = @(@{ id = 'U-1'; displayName = 'Agent one'; identityParentId = 'P-1' }, @{ id = 'u-2'; displayName = 'Agent two'; identityParentId = 'p-2' }) } }
+        Mock Invoke-GraphBatch {
+            @{ 'P-1' = [pscustomobject]@{ Status = 200; Body = @{ appId = 'APP-1'; agentIdentityBlueprintId = 'BP-1' } }; 'p-2' = [pscustomobject]@{ Status = 404; Body = $null } }
+        }
+        $m = Get-AgentUserMap
+        $m['u-1'].Name | Should -Be 'Agent one'; $m['u-1'].Keys | Should -Be @('p-1', 'app-1', 'bp-1')
+        $m['u-2'].Keys | Should -Be @('p-2')
+    }
+    It 'reads the DLP matches Defender holds and tidies the action list' {
+        $script:DlpMatchKql | Should -BeLike '*DLPRuleMatch*N7 = countif(Timestamp > ago(7d))*N14 = countif(Timestamp > ago(14d))*N30 = count()*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Workload = 'ExtendedApplications'; App = 'app-1'; AccountObjectId = 'u-1'; User = 'Ann'; PolicyId = 'p'; Policy = 'Pol'; Rule = 'Rul'; Severity = 'Low'; Actions = '["GenerateAlert","RestrictAccess"]'; N7 = 1; N14 = 2; N30 = 3; Last = '2026-10-06T10:00:00Z' }) }
+        $h = @(Get-DlpMatchHits)
+        $h[0].Actions | Should -Be 'GenerateAlert, RestrictAccess'; $h[0].N30 | Should -Be 3; $h[0].Last | Should -BeOfType ([datetime]); $h[0].UserId | Should -Be 'u-1'
+    }
+    It 'builds the report: ties hits by application id and agent user, groups alerts, and keeps the rest unattributed' {
+        Mock Get-AgentKeyMap { New-KeyMap @{ 'app-1' = 't_a'; 'bp-9' = 't_b' } }
+        Mock Get-AgentUserMap { @{ 'u-agent' = [pscustomobject]@{ Name = 'Agent user'; Keys = @('p', 'bp-9') } } }
+        Mock Get-DlpMatchHits {
+            @([pscustomobject]@{ Workload = 'W'; App = 'app-1'; UserId = 'u-1'; User = 'Ann'; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'Block cards'; Severity = 'Low'; Actions = 'RestrictAccess'; N7 = 1; N14 = 2; N30 = 3; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ Workload = 'W'; App = 'unknown-app'; UserId = 'u-2'; User = 'Bob'; PolicyId = 'p2'; Policy = 'Generic DLP'; Rule = 'Generic'; Severity = 'Low'; Actions = ''; N7 = 0; N14 = 0; N30 = 5; Last = [datetime]'2026-09-20' })
+        }
+        $now = Get-Date
+        Mock Get-PurviewAlerts {
+            @([pscustomobject]@{ Source = 'DLP alert'; Title = 'DLP-Agent rule'; PolicyId = 'p3'; Severity = 'low'; Status = 'new'; Created = $now.AddDays(-2); UserIds = @('u-agent'); User = 'agent@x'; AppIds = @() },
+              [pscustomobject]@{ Source = 'DLP alert'; Title = 'DLP-Agent rule'; PolicyId = 'p3'; Severity = 'low'; Status = 'new'; Created = $now.AddDays(-20); UserIds = @('u-agent'); User = 'agent@x'; AppIds = @() },
+              [pscustomobject]@{ Source = 'Insider Risk alert'; Title = 'Risky agents'; PolicyId = 'p4'; Severity = 'high'; Status = 'new'; Created = $now.AddDays(-10); UserIds = @('a-person'); User = 'bob@x'; AppIds = @() })
+        }
+        $r = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $r.AlertCount | Should -Be 3; $r.Note | Should -Be ''
+        $a = $r.Rows | Where-Object { $_.Policy -eq 'Alpha DLP' }
+        $a.Agent | Should -Be 'Alpha'; $a.AgentId | Should -Be 'T_A'; $a.Via | Should -Be 'application id'; $a.App | Should -Be 'app-1'; $a.N30 | Should -Be 3
+        $u = $r.Rows | Where-Object { $_.Policy -eq 'Generic DLP' }
+        $u.AgentId | Should -Be ''; $u.Agent | Should -Be ''; $u.App | Should -Be 'unknown-app'
+        $d = $r.Rows | Where-Object { $_.Policy -eq 'DLP-Agent rule' }
+        @($d).Count | Should -Be 1
+        $d.Agent | Should -Be 'Beta'; $d.Via | Should -Be 'agent user'; $d.Source | Should -Be 'DLP alert'; $d.N7 | Should -Be 1; $d.N14 | Should -Be 1; $d.N30 | Should -Be 2
+        $i = $r.Rows | Where-Object { $_.Source -eq 'Insider Risk alert' }
+        $i.AgentId | Should -Be ''; $i.N7 | Should -Be 0; $i.N14 | Should -Be 1; $i.N30 | Should -Be 1
+        $only = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta')) -OnlyIds @('t_b')
+        @($only.Rows).Count | Should -Be 1; $only.Rows[0].Agent | Should -Be 'Beta'
+    }
+    It 'carries on and says so when the agent user accounts cannot be read' {
+        Mock Get-AgentKeyMap { New-KeyMap @{ 'app-1' = 't_a' } }
+        Mock Get-AgentUserMap { throw 'Insufficient privileges' }
+        Mock Get-DlpMatchHits { @([pscustomobject]@{ Workload = 'W'; App = 'app-1'; UserId = 'u'; User = 'U'; PolicyId = 'p'; Policy = 'P'; Rule = 'R'; Severity = 'Low'; Actions = ''; N7 = 1; N14 = 1; N30 = 1; Last = [datetime]'2026-10-06' }) }
+        Mock Get-PurviewAlerts { @() }
+        $r = Get-AgentPolicyHitsReport -Packages @((New-Pkg 'T_A' 'Alpha'))
+        $r.Note | Should -BeLike '*could not be read*Insufficient privileges*'
+        $r.Rows[0].Agent | Should -Be 'Alpha'
+    }
+    It 'selects one period, only the hits tied to an agent, or those matching a text' {
+        $rows = @((New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N7 2 -N14 3 -N30 5), (New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Source 'DLP alert' -Policy 'Cards alert' -N14 1 -N30 4),
+                  (New-PhRow -Agent '' -AgentId '' -Policy 'Generic' -N30 9), (New-PhRow -Agent 'Beta' -AgentId 'T_B' -Policy 'Other' -N30 1))
+        @(Select-PolicyHitRows -Rows $rows -Days 7).Count | Should -Be 1
+        (Select-PolicyHitRows -Rows $rows -Days 7)[0].Hits | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 14).Count | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 30).Count | Should -Be 4
+        (Select-PolicyHitRows -Rows $rows -Days 30)[-1].Policy | Should -Be 'Generic'   # hits with no agent come last
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -AttributedOnly).Count | Should -Be 3
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -Text 'CARDS').Count | Should -Be 2
+        @(Select-PolicyHitRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+        $rows[0].Hits | Should -Be 5
+    }
+    It 'totals hits by source and counts those that name only a person, then lists each agent' {
+        $rows = @((New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N30 5), (New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Source 'DLP alert' -Policy 'Cards alert' -N30 4),
+                  (New-PhRow -Agent '' -AgentId '' -Policy 'Generic' -N30 9), (New-PhRow -Agent 'Beta' -AgentId 'T_B' -Source 'Insider Risk alert' -Policy 'Risky' -N30 2))
+        $s = Get-PolicyHitSummary $rows
+        $s.DlpMatches | Should -Be 14; $s.DlpAlerts | Should -Be 4; $s.InsiderRisk | Should -Be 2; $s.Agents | Should -Be 2; $s.Unattributed | Should -Be 9; $s.Total | Should -Be 20
+        $by = @(Get-PolicyHitsByAgent $rows)
+        $by.Count | Should -Be 2
+        $by[0].Agent | Should -Be 'Alpha'; $by[0].DlpMatches | Should -Be 5; $by[0].DlpAlerts | Should -Be 4; $by[0].Policies | Should -Be 2
+        $by[1].Agent | Should -Be 'Beta'; $by[1].InsiderRisk | Should -Be 2
+        (Get-PolicyHitSummary @()).Total | Should -Be 0
+    }
+}
+
+Describe 'Policy hits: clarity and Defender alerts' {
+    BeforeAll {
+        function New-KeyMap2 { param([hashtable]$Pairs) $m = @{}; foreach ($k in $Pairs.Keys) { $m[$k] = New-Object 'System.Collections.Generic.HashSet[string]'; foreach ($c in @($Pairs[$k])) { [void]$m[$k].Add($c) } }; $m }
+        function New-AlertRow {
+            param([string]$Agent = 'Alpha', [string]$AgentId = 'T_A', [string]$Title = 'Alert', [string]$Severity = 'Low', [datetime]$Time = (Get-Date).AddDays(-1), [string]$Category = 'Exfiltration')
+            [pscustomobject]@{ Time = $Time; AlertId = "id-$Title"; Agent = $Agent; AgentId = $AgentId; InInventory = [bool]$AgentId; Title = $Title; Severity = $Severity; Category = $Category; Source = 'Security for AI'; Via = 'Agent entity'; Link = "https://security.microsoft.com/alerts/id-$Title" }
+        }
+    }
+    It 'says in words where a hit happened' {
+        Get-PolicyWhereText -Location 'Copilot.M365' -Workload 'ExtendedApplications' | Should -Be 'Microsoft 365 Copilot'
+        Get-PolicyWhereText -Location '' -Workload 'MicrosoftTeams' | Should -Be 'Microsoft Teams'
+        Get-PolicyWhereText -Location '' -Workload 'ExtendedApplications' | Should -Be 'AI application'
+        Get-PolicyWhereText -Location 'Something.New' -Workload 'X' | Should -Be 'Something.New'
+        Get-PolicyWhereText -Location '' -Workload '' | Should -BeNullOrEmpty
+    }
+    It 'says in words what a rule did, and treats an alert as the action itself' {
+        Get-PolicyActionText 'GenerateAlert, RestrictAccess' 'DLP match' | Should -Be 'Raised an alert, blocked access'
+        Get-PolicyActionText 'NotifyUser' 'DLP match' | Should -Be 'Notified the user'
+        Get-PolicyActionText 'SomethingNew' 'DLP match' | Should -Be 'SomethingNew'
+        Get-PolicyActionText '' 'DLP match' | Should -Be 'Matched, no action recorded'
+        Get-PolicyActionText '' 'DLP alert' | Should -Be 'Raised an alert'
+        Get-PolicyActionText '' 'Insider Risk alert' | Should -Be 'Raised an alert'
+    }
+    It 'says in words how a hit was tied to an agent' {
+        Get-PolicyHitTiedText 'application id' | Should -Be 'App id on the event'
+        Get-PolicyHitTiedText 'agent user' | Should -BeLike '*own user account'
+        Get-PolicyHitTiedText '' | Should -Be 'Not tied to an agent'
+    }
+    It 'carries the item, the place and the plain-language fields on a DLP match' {
+        $script:DlpMatchKql | Should -BeLike '*Items = make_set(Item, 3)*'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Workload = 'ExtendedApplications'; Loc = 'Copilot.M365'; App = 'app-1'; AccountObjectId = 'u-1'; User = 'Ann'; PolicyId = 'p'; Policy = 'Pol'; Rule = 'Rul'; Severity = ''
+                                                          Actions = '["GenerateAlert","RestrictAccess"]'; Items = @('Roster.docx', '', 'Roster.docx', 'Other.docx'); ItemPath = 'https://x/sites/s/Roster.docx'; N7 = 1; N14 = 2; N30 = 3; Last = '2026-10-06T10:00:00Z' }) }
+        $h = @(Get-DlpMatchHits)
+        $h[0].Where | Should -Be 'Microsoft 365 Copilot'; $h[0].Item | Should -Be 'Roster.docx; Other.docx'; $h[0].ItemPath | Should -Be 'https://x/sites/s/Roster.docx'
+        $row = New-PolicyHitRow -Agent 'A' -AgentId 'T_A' -Via 'application id' -Source 'DLP match' -Policy 'P' -Rule 'R' -Severity '' -Actions $h[0].Actions -Workload 'W' -User 'Ann' -N7 1 -N14 2 -N30 3 -Last (Get-Date) -Item $h[0].Item -Where $h[0].Where
+        $row.Did | Should -Be 'Raised an alert, blocked access'; $row.Tied | Should -Be 'App id on the event'; $row.Where | Should -Be 'Microsoft 365 Copilot'
+    }
+    It 'keeps an alert''s category and portal link' {
+        $a = ConvertTo-PurviewAlert @{ title = 'T'; serviceSource = 'dataLossPrevention'; category = 'Exfiltration'; alertWebUrl = 'https://security.microsoft.com/alerts/dl1?tid=t'; evidence = @() }
+        $a.Category | Should -Be 'Exfiltration'; $a.Link | Should -Be 'https://security.microsoft.com/alerts/dl1?tid=t'
+    }
+    It 'lists everything known about a hit, tied or not, and where to look' {
+        $tied = New-PolicyHitRow -Agent 'Alpha' -AgentId 'T_A' -Via 'application id' -Source 'DLP match' -Policy 'Alpha DLP' -Rule 'Block cards' -Severity '' -Actions 'RestrictAccess' -Workload 'W' -User 'Ann' -N7 1 -N14 2 -N30 3 -Last ([datetime]'2026-10-06 10:00') -App 'app-1' -Item 'Card.txt' -ItemPath 'https://x/Card.txt' -Where 'Microsoft Teams'
+        $d = @(Get-PolicyHitDetailRows $tied)
+        ($d | Where-Object Item -eq 'Catalog id').Info | Should -Be 'T_A'
+        ($d | Where-Object Item -eq 'How it is tied').Info | Should -BeLike '*application id app-1*'
+        ($d | Where-Object Item -eq 'What it did').Info | Should -Be 'Blocked access (RestrictAccess)'
+        ($d | Where-Object Item -eq 'Severity').Info | Should -Be 'Not recorded on this match'
+        ($d | Where-Object Item -eq 'Item').Info | Should -Be 'Card.txt  (https://x/Card.txt)'
+        ($d | Where-Object Item -eq 'Hits').Info | Should -Be '1 in the last 7 days, 2 in 14, 3 in 30'
+        ($d | Where-Object Section -eq 'Where to look').Info | Should -BeLike "*'Alpha DLP'*"
+        $loose = New-PolicyHitRow -Agent '' -AgentId '' -Via '' -Source 'DLP alert' -Policy 'DLP-X' -Rule '' -Severity 'low' -Actions '' -Workload '' -User 'ann@x' -N7 1 -N14 1 -N30 1 -Last (Get-Date) -App 'unknown-app' -Link 'https://security.microsoft.com/alerts/a1'
+        $l = @(Get-PolicyHitDetailRows $loose)
+        ($l | Where-Object { $_.Section -eq 'Agent' -and $_.Item -eq 'Agent' }).Info | Should -Be '(not tied to an agent)'
+        ($l | Where-Object Item -eq 'Why').Info | Should -BeLike '*names only a person (ann@x)*'
+        ($l | Where-Object Item -eq 'Application id').Info | Should -BeLike 'unknown-app*inventory*'
+        ($l | Where-Object Section -eq 'Where to look').Info | Should -Be 'Open the newest alert: https://security.microsoft.com/alerts/a1'
+        @($l | Where-Object Item -eq 'Catalog id').Count | Should -Be 0
+    }
+    It 'keeps every hit in AllRows for the tenant-wide context while Rows holds only the chosen agents' {
+        Mock Get-AgentKeyMap { New-KeyMap2 @{ 'app-1' = 't_a' } }
+        Mock Get-AgentUserMap { @{} }
+        Mock Get-DlpMatchHits {
+            @([pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = 'app-1'; UserId = 'u-1'; User = 'Ann'; Item = 'Card.txt'; ItemPath = ''; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'R'; Severity = ''; Actions = 'RestrictAccess'; N7 = 1; N14 = 1; N30 = 1; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = ''; UserId = 'u-2'; User = 'Bob'; Item = ''; ItemPath = ''; PolicyId = 'p2'; Policy = 'Generic DLP'; Rule = 'G'; Severity = ''; Actions = ''; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-09-20' })
+        }
+        Mock Get-PurviewAlerts { @() }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $all = Get-AgentPolicyHitsReport -Packages $pk
+        @($all.Rows).Count | Should -Be 2; @($all.AllRows).Count | Should -Be 2
+        $some = Get-AgentPolicyHitsReport -Packages $pk -OnlyIds @('T_B')
+        @($some.Rows).Count | Should -Be 0
+        @($some.AllRows).Count | Should -Be 2
+        (Get-PolicyHitSummary $some.AllRows).Unattributed | Should -Be 4
+        $mine = (Get-AgentPolicyHitsReport -Packages $pk -OnlyIds @('t_a')).Rows
+        $mine[0].Item | Should -Be 'Card.txt'; $mine[0].Did | Should -Be 'Blocked access'
+    }
+    It 'reads the Defender alerts that concern agents, with the portal link, naming agents the inventory lacks' {
+        $script:AgentAlertKql | Should -BeLike '*EntityType == "AIAgent"*EntityType == "CloudResource"*'
+        Mock Get-MgContext { [pscustomobject]@{ Account = 'a@b'; TenantId = 'ten-1' } }
+        Mock Invoke-HuntingQuery {
+            @([pscustomobject]@{ Timestamp = '2026-10-06T10:00:00Z'; AlertId = 'al1'; CatalogId = 'T_A'; Label = ''; Title = 'Jailbreak attempt'; Severity = 'High'; Category = 'InitialAccess'; ServiceSource = 'Microsoft Defender for Cloud'; DetectionSource = 'Microsoft Defender for AI Services'; Via = 'Agent entity' },
+              [pscustomobject]@{ Timestamp = '2026-10-05T10:00:00Z'; AlertId = 'al2'; CatalogId = ''; Label = 'Ghost agent'; Title = 'Odd tool call'; Severity = 'Low'; Category = 'Execution'; ServiceSource = 'Security for AI'; DetectionSource = 'Security for AI'; Via = 'Agent entity' })
+        }
+        $r = @(Get-AgentDefenderAlerts -Packages @((New-Pkg 'T_A' 'Alpha')))
+        $r.Count | Should -Be 2
+        $a = $r | Where-Object AlertId -eq 'al1'
+        $a.Agent | Should -Be 'Alpha'; $a.AgentId | Should -Be 'T_A'; $a.InInventory | Should -BeTrue; $a.Source | Should -Be 'Microsoft Defender for Cloud / Microsoft Defender for AI Services'
+        $a.Link | Should -Be 'https://security.microsoft.com/alerts/al1?tid=ten-1'; $a.Time | Should -BeOfType ([datetime])
+        $g = $r | Where-Object AlertId -eq 'al2'
+        $g.Agent | Should -Be 'Ghost agent'; $g.AgentId | Should -Be ''; $g.InInventory | Should -BeFalse; $g.Source | Should -Be 'Security for AI'
+    }
+    It 'selects the alerts of a period, at or above a severity, for chosen agents or a text, worst and newest first' {
+        $now = Get-Date
+        $rows = @((New-AlertRow -Title 'Old high' -Severity 'High' -Time $now.AddDays(-20)), (New-AlertRow -Title 'New low' -Severity 'Low' -Time $now.AddDays(-1)),
+                  (New-AlertRow -Title 'New high' -Severity 'High' -Time $now.AddDays(-2)), (New-AlertRow -Title 'Beta medium' -Agent 'Beta' -AgentId 'T_B' -Severity 'Medium' -Time $now.AddDays(-3)),
+                  (New-AlertRow -Title 'Unknown' -Agent 'Ghost' -AgentId '' -Severity 'Medium' -Time $now.AddDays(-4)))
+        (Select-AgentAlertRows -Rows $rows -Days 30 | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Old high', 'Beta medium', 'Unknown', 'New low')
+        (Select-AgentAlertRows -Rows $rows -Days 7 | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Beta medium', 'Unknown', 'New low')
+        (Select-AgentAlertRows -Rows $rows -Days 7 -MinSeverity 'Medium' | ForEach-Object { $_.Title }) | Should -Be @('New high', 'Beta medium', 'Unknown')
+        (Select-AgentAlertRows -Rows $rows -Days 30 -OnlyIds @('t_b') | ForEach-Object { $_.Title }) | Should -Be @('Beta medium')
+        (Select-AgentAlertRows -Rows $rows -Days 30 -Text 'GHOST' | ForEach-Object { $_.Title }) | Should -Be @('Unknown')
+        @(Select-AgentAlertRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
+    }
+    It 'lists everything known about a Defender alert' {
+        $d = @(Get-AgentAlertDetailRows (New-AlertRow -Title 'Jailbreak' -Severity 'High'))
+        ($d | Where-Object Item -eq 'Title').Info | Should -Be 'Jailbreak'
+        ($d | Where-Object Item -eq 'How it is tied').Info | Should -BeLike '*carries this agent*'
+        ($d | Where-Object Item -eq 'In the inventory').Info | Should -Be 'Yes'
+        ($d | Where-Object Section -eq 'Where to look').Info | Should -BeLike 'https://security.microsoft.com/alerts/*'
+        $g = @(Get-AgentAlertDetailRows (New-AlertRow -Title 'Odd' -Agent 'Ghost' -AgentId ''))
+        ($g | Where-Object Item -eq 'In the inventory').Info | Should -BeLike 'No:*'
+    }
+}
+
+Describe 'MCP access' {
+    BeforeAll {
+        $script:mail = 'app-mail'; $script:teams = 'app-teams'
+        function New-McpScenario {
+            param([switch]$IncludeOthers)
+            $now = Get-Date
+            $pk = @(
+                [pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = 'id-a'; platform = 'Not Available'; manifestId = $null; elementTypes = @('AgentMetadatas') },
+                [pscustomobject]@{ id = 'P_C'; displayName = 'Studio'; agentIdentityId = 'id-c'; platform = 'Copilot Studio'; manifestId = $null; elementTypes = @() },
+                [pscustomobject]@{ id = 'T_B'; displayName = 'Beta Blueprint'; agentIdentityId = $null; platform = 'Not Available'; manifestId = 'bp-b'; elementTypes = @('AgenticUserTemplates') })
+            $ids = @{ 'id-a' = [pscustomobject]@{ AppId = 'app-a'; Blueprint = 'bp-a'; Principal = 'bpsp-a' }; 'id-c' = [pscustomobject]@{ AppId = 'app-c'; Blueprint = ''; Principal = '' } }
+            $bps = @{ 'T_B' = [pscustomobject]@{ AppId = 'bp-b'; Principal = 'bpsp-b'; Identities = @('id-b1') } }
+            $users = @{ 'id-a' = @('u-a'); 'id-b1' = @('u-b1') }
+            $clients = @{
+                'bpsp-a' = [pscustomobject]@{ Id = 'bpsp-a'; Name = 'Alpha Blueprint'; AppId = 'bp-a'; Type = 'blueprint' }
+                'bpsp-b' = [pscustomobject]@{ Id = 'bpsp-b'; Name = 'Beta Blueprint'; AppId = 'bp-b'; Type = 'blueprint' }
+                'bpsp-x' = [pscustomobject]@{ Id = 'bpsp-x'; Name = 'Lonely Blueprint'; AppId = 'bp-x'; Type = 'blueprint' }
+                'cli'    = [pscustomobject]@{ Id = 'cli'; Name = 'Some CLI'; AppId = 'app-cli'; Type = 'app' }
+            }
+            $g = { param($c, $app, $name, [string[]]$s, $consent = 'AllPrincipals') [pscustomobject]@{ ClientId = $c; ResourceAppId = $app; ResourceName = $name; Scopes = $s; Consent = $consent } }
+            $grants = @(
+                (& $g 'bpsp-a' $script:mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')),
+                (& $g 'bpsp-a' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Calendar.All')),
+                (& $g 'bpsp-a' $script:teams 'Work IQ Teams MCP' @('Tools.ListInvoke.All')),
+                (& $g 'bpsp-b' $script:mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')),
+                (& $g 'cli' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Mail.All') 'Principal'),
+                (& $g 'bpsp-x' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Excel.All')))
+            $inherit = @{
+                'bp-a' = @(@{ resourceAppId = $script:mail; inheritableScopes = @{ kind = 'allAllowed' } }, @{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'enumerated'; scopes = @('McpServers.Calendar.All') } })
+                'bp-b' = @(@{ resourceAppId = $script:mail; inheritableScopes = @{ kind = 'allAllowed' } })
+            }
+            $declared = @([pscustomobject]@{ CatalogId = 'p_c'; Agent = 'Studio'; Platform = 'Copilot Studio'; Server = 'Work IQ Mail (Preview)'; Endpoint = '' },
+                          [pscustomobject]@{ CatalogId = 'p_a'; Agent = 'Alpha'; Platform = 'Other'; Server = 'Work IQ Word (Preview)'; Endpoint = '' })
+            $u = { param($agent, $server, $calls, $c7, $c14, $connects, $daysAgo, [string[]]$tools, [string]$via, $bp = '')
+                   [pscustomobject]@{ AgentId = $agent; PlatformAgentId = ''; BlueprintId = $bp; AgentName = ''; Server = $server; Calls = $calls; Calls7 = $c7; Calls14 = $c14; Connects = $connects; Errors = 0
+                                      Last = $now.AddDays(-$daysAgo).ToString('o'); LastCall = $(if ($calls) { $now.AddDays(-$daysAgo).ToString('o') }); Tools = $tools; Via = @($via) } }
+            $usage = @((& $u 'id-a' 'mcp_MailTools' 4 1 2 0 1 @('SendEmail') 'Agent 365 gateway'),
+                       (& $u 'bot-c' 'a365outlookmailmcp' 0 0 0 2 2 @() 'Power Platform connector'),
+                       (& $u 'id-b1' 'mcp_MailTools' 1 0 1 0 10 @('CreateDraft') 'Agent 365 gateway' 'bp-b'))
+            $apps = @{ mail = [pscustomobject]@{ AppId = $script:mail; Name = 'Work IQ Mail MCP' }; teams = [pscustomobject]@{ AppId = $script:teams; Name = 'Work IQ Teams MCP' }
+                       agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } }
+            New-McpAccessRows -Packages $pk -IdentityIds $ids -AgentUsers $users -Grants $grants -Clients $clients -Inherit $inherit -Declared $declared -Usage $usage `
+                -KeyMap @{ 'bot-c' = @('p_c') } -ServerApps $apps -Blueprints $bps -IncludeOthers:$IncludeOthers
+        }
+        function Get-Row { param($Built, $Agent, $Key) @($Built.Rows | Where-Object { $_.Agent -eq $Agent -and $_.ServerKey -eq $Key })[0] }
+        function New-RawMcpPolicy {
+            param([string]$Name, [string]$State = 'enabled', [string]$App = 'app-mail', [string[]]$Identities = @(), [string[]]$Users = @('None'), [string[]]$Risk = @())
+            @{ id = "id-$Name"; displayName = $Name; state = $State; grantControls = @{ builtInControls = @('block') }
+               conditions = @{ agentIdRiskLevels = $Risk; users = @{ includeUsers = $Users; excludeUsers = @() }; applications = @{ includeApplications = @($App); excludeApplications = @() }
+                               clientApplications = $(if ($Identities.Count) { @{ includeAgentIdServicePrincipals = $Identities } } else { $null }) } }
+        }
+        function New-McpItem { param([string]$Target = 'On', [string[]]$Users = @('u-a')) [pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = $Users; Server = 'Work IQ Mail MCP'; ResourceAppId = 'app-mail'; ResourceName = 'Work IQ Mail MCP'; Target = $Target } }
+    }
+
+    It 'gives one key to every name a server goes by' {
+        foreach ($n in 'Work IQ Mail MCP', 'McpServers.Mail.All', 'mcp_MailTools', 'a365outlookmailmcp', 'Work IQ Mail (Preview)', 'WorkIQMail', 'Microsoft Outlook Mail MCP') { ConvertTo-McpServerKey $n | Should -Be 'mail' -Because $n }
+        foreach ($n in 'McpServers.CopilotMCP.All', 'a365copilotchatmcp', 'mcp_M365Copilot', 'Work IQ Copilot MCP') { ConvertTo-McpServerKey $n | Should -Be 'copilot' -Because $n }
+        foreach ($n in 'a365memcp', 'Work IQ User (Preview)', 'McpServers.Me.All', 'mcp_MeServer') { ConvertTo-McpServerKey $n | Should -Be 'me' -Because $n }
+        ConvertTo-McpServerKey 'Work IQ Calendar MCP Connector' | Should -Be 'calendar'
+        ConvertTo-McpServerKey 'McpServers.M365Admin.All' | Should -Be 'admin'
+        ConvertTo-McpServerKey 'mcp_ODSPRemoteServer' | Should -Be 'onedrivesharepoint'
+        ConvertTo-McpServerKey 'McpServers.OneDriveSharepoint.All' | Should -Be 'onedrivesharepoint'
+        ConvertTo-McpServerKey 'JokesMCPServer' | Should -Be 'jokes'
+        ConvertTo-McpServerKey 'ext_Learn1 - BYO' | Should -Be 'extlearn1'
+        ConvertTo-McpServerKey 'MCP' | Should -Be 'mcp'
+    }
+    It 'keeps only the MCP scopes of a grant, not the metadata scope' {
+        Get-McpScopes 'openid McpServersMetadata.Read.All McpServers.Mail.All Tools.ListInvoke.All User.Read' | Should -Be @('McpServers.Mail.All', 'Tools.ListInvoke.All')
+        @(Get-McpScopes 'User.Read McpServersMetadata.Read.All').Count | Should -Be 0
+    }
+    It 'knows whether a blueprint passes a scope on to its agent identities' {
+        $inh = @(@{ resourceAppId = 'app-1'; inheritableScopes = @{ kind = 'allAllowed' } }, @{ resourceAppId = 'app-2'; inheritableScopes = @{ kind = 'enumerated'; scopes = @('A.All') } }, @{ resourceAppId = 'app-3'; inheritableScopes = @{ kind = 'none' } })
+        Test-McpInherited -Inherit $inh -ResourceAppId 'APP-1' -Scope 'Any' | Should -BeTrue
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-2' -Scope 'A.All' | Should -BeTrue
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-2' -Scope 'B.All' | Should -BeFalse
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-3' -Scope 'Any' | Should -BeFalse
+        Test-McpInherited -Inherit $inh -ResourceAppId 'app-4' -Scope 'Any' | Should -BeFalse
+        Test-McpInherited -Inherit $null -ResourceAppId 'app-1' -Scope 'Any' | Should -BeFalse
+    }
+    It 'joins permissions, set-up servers and calls into one row per agent and server' {
+        $b = New-McpScenario
+        $m = Get-Row $b 'Alpha' 'mail'
+        $m.Permission | Should -Be 'Own'; $m.Granted | Should -BeTrue; $m.Calls30 | Should -Be 4; $m.Calls7 | Should -Be 1; $m.Tools | Should -Be 'SendEmail'; $m.Via | Should -Be 'Agent 365 gateway'
+        $m.ResourceAppId | Should -Be 'app-mail'; $m.Server | Should -Be 'Work IQ Mail MCP'; $m.CanBlock | Should -Be ''
+        $m.CaKeys | Should -Be @('id-a', 'bpsp-a'); $m.AgentUserIds | Should -Be @('u-a'); $m.PermParts[0] | Should -BeLike 'Blueprint: Tools.ListInvoke.All on Work IQ Mail MCP (inherited)'
+        $c = Get-Row $b 'Alpha' 'calendar'
+        $c.Permission | Should -Be 'Shared'; $c.Granted | Should -BeTrue; $c.Server | Should -Be 'Calendar'; $c.CanBlock | Should -BeLike '*only through the shared permission*'
+        $t = Get-Row $b 'Alpha' 'teams'
+        $t.Permission | Should -Be 'Blueprint only'; $t.Granted | Should -BeFalse; $t.PermParts[0] | Should -BeLike '*not inherited*'
+        $s = Get-Row $b 'Alpha' 'agenttools'
+        $s.Server | Should -Be 'Agent Tools (shared permission)'; $s.Covers | Should -Be 'Calendar'; $s.ResourceAppId | Should -Be $script:AgentToolsAppId; $s.CanBlock | Should -Be ''
+        $w = Get-Row $b 'Alpha' 'word'
+        $w.Declared | Should -BeTrue; $w.Permission | Should -Be 'None found'
+    }
+    It 'counts a blueprint package and the identities made from it, and targets the blueprint principal' {
+        $r = Get-Row (New-McpScenario) 'Beta Blueprint' 'mail'
+        $r.Kind | Should -Be 'Agent'; $r.Platform | Should -Be 'A365 SDK blueprint'; $r.IdentityKind | Should -Be 'Blueprint'
+        $r.IdentityId | Should -Be 'bpsp-b'; $r.CaKeys | Should -Be @('bpsp-b'); $r.AgentUserIds | Should -Be @('u-b1')
+        $r.Granted | Should -BeTrue; $r.Calls30 | Should -Be 1; $r.CanBlock | Should -Be ''
+    }
+    It 'refuses Copilot Studio connectors, apps and blueprints that are not catalog agents, with the reason' {
+        $s = Get-Row (New-McpScenario) 'Studio' 'mail'
+        $s.Declared | Should -BeTrue; $s.Connects | Should -Be 2; $s.Calls30 | Should -Be 0; $s.CanBlock | Should -BeLike '*Power Platform connector*'
+        $o = New-McpScenario -IncludeOthers
+        $cli = Get-Row $o 'Some CLI' 'mail'
+        $cli.Kind | Should -Be 'App, not an agent'; $cli.CanBlock | Should -BeLike 'An application*'; $cli.PermParts[0] | Should -BeLike '*for one user*'
+        (Get-Row $o 'Lonely Blueprint' 'excel').Kind | Should -Be 'Blueprint, not in the catalog'
+        @((New-McpScenario).Rows | Where-Object { $_.Kind -ne 'Agent' }).Count | Should -Be 0
+    }
+    It 'filters a period: permissions not used, servers used, and blocked ones, with a note on each' {
+        $rows = @((New-McpScenario).Rows)
+        $unused = @(Select-McpAccessRows -Rows $rows -Days 30 -Show Unused | ForEach-Object { "$($_.Agent)|$($_.ServerKey)" })
+        $unused | Should -Contain 'Alpha|calendar'; $unused | Should -Not -Contain 'Alpha|mail'; $unused | Should -Not -Contain 'Alpha|teams'
+        $used7 = @(Select-McpAccessRows -Rows $rows -Days 7 -Show Used | ForEach-Object { "$($_.Agent)|$($_.ServerKey)" })
+        $used7 | Should -Contain 'Alpha|mail'; $used7 | Should -Contain 'Studio|mail'; $used7 | Should -Not -Contain 'Beta Blueprint|mail'
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Alpha' 'mail').Calls | Should -Be 1
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Studio' 'mail').Note | Should -BeLike '*Connected but called no tool*Power Platform connector*'
+        (Get-Row ([pscustomobject]@{ Rows = $rows }) 'Alpha' 'teams').Note | Should -BeLike '*does not pass it to the agent*'
+        @(Select-McpAccessRows -Rows $rows -Show Blocked).Count | Should -Be 0
+        @(Select-McpAccessRows -Rows $rows -Text 'TEAMS').Count | Should -Be 1
+        $s = Get-McpAccessSummary -Rows @(Select-McpAccessRows -Rows $rows -Days 30) -Days 30
+        $s.Agents | Should -Be 3; $s.Granted | Should -Be 3; $s.GrantedUsed | Should -Be 2; $s.Unused | Should -Be 1; $s.Connectors | Should -Be 1
+    }
+    It 'reads whether Conditional Access blocks an agent from a server, for its identity and its agent user accounts' {
+        $idOn = New-RawMcpPolicy -Name 'ids on' -Identities @('BPSP-A')
+        $usersReport = New-RawMcpPolicy -Name 'users report' -State 'enabledForReportingButNotEnforced' -Users @('u-a')
+        $usersOn = New-RawMcpPolicy -Name 'users on' -Users @('AllAgentIdUsers')
+        $state = { param($p, [string[]]$users = @('u-a')) Get-McpBlockState -Policies $p -AppId 'app-mail' -IdentityKeys @('id-a', 'bpsp-a') -AgentUserIds $users }
+        $s = & $state @($idOn, $usersReport)
+        $s.Kind | Should -Be 'Partly blocked'; $s.Identity | Should -Be 'On'; $s.Users | Should -Be 'Report-only'; $s.Policies.Count | Should -Be 2
+        (& $state @($idOn, $usersOn)).Kind | Should -Be 'Blocked'
+        (& $state @($idOn) @()).Kind | Should -Be 'Blocked'
+        (& $state @($usersReport)).Kind | Should -Be 'Report-only'
+        (& $state @((New-RawMcpPolicy -Name 'risk' -Identities @('id-a') -Risk @('high')), (New-RawMcpPolicy -Name 'other app' -App 'app-x' -Identities @('id-a')), (New-RawMcpPolicy -Name 'off' -State 'disabled' -Identities @('id-a')))).Kind | Should -Be ''
+        (& $state @($idOn) @('u-a', 'u-b')).Kind | Should -Be 'Partly blocked'
+    }
+    It 'builds the policy body for agent identities and for agent user accounts' {
+        $i = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Identities -Ids @('id-a') -Mode 'Report-only'
+        $i.displayName | Should -Be 'Agent365 Bulk Actions: block MCP server Work IQ Mail MCP for agent identities (report-only)'
+        $i.state | Should -Be 'enabledForReportingButNotEnforced'; $i.conditions.users.includeUsers | Should -Be @('None')
+        $i.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-a'); $i.conditions.applications.includeApplications | Should -Be @('app-mail')
+        $i.grantControls.builtInControls | Should -Be @('block')
+        $u = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Users -Ids @('u-a') -Mode On
+        $u.displayName | Should -Be 'Agent365 Bulk Actions: block MCP server Work IQ Mail MCP for agent user accounts'; $u.state | Should -Be 'enabled'
+        $u.conditions.Contains('clientApplications') | Should -BeFalse; $u.conditions.users.includeUsers | Should -Be @('u-a')
+        (New-McpBlockPolicyBody -AppId 'a' -ResourceName 'n' -Subject Users -Ids @('u') -Mode On -ConditionsOnly).Keys | Should -Be @('conditions')
+        $raw = @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent user accounts') -Users @('u-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a')))
+        (Find-McpBlockPolicy -Policies $raw -AppId 'APP-MAIL' -Subject Identities -Mode On).displayName | Should -BeLike '*identities'
+        (Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Users -Mode On).displayName | Should -BeLike '*user accounts'
+        Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Identities -Mode 'Report-only' | Should -BeNullOrEmpty
+    }
+    Context 'writing the block policies' {
+        BeforeEach {
+            Mock Write-Host { }
+            Mock Export-ActionLog { }
+            Mock Test-Proceed { $true }
+            $script:writes = @()
+            Mock Invoke-Graph { $script:writes += , [pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($Body) { $Body | ConvertFrom-Json }) }; if ($Method -eq 'POST') { @{ id = 'new'; displayName = ($Body | ConvertFrom-Json).displayName } } }
+        }
+        It 'creates one policy for the identity and one for its agent user accounts' {
+            Mock Get-CaPoliciesRaw { @() }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'blockmcp'; $r[0].Mode | Should -Be 'On'; $r[0].WasMode | Should -Be ''; $r[0].AgentUserIds | Should -Be 'u-a'
+            $r[0].Policies | Should -BeLike '*for agent identities*for agent user accounts*'
+            @($script:writes | Where-Object Method -eq 'POST').Count | Should -Be 2
+            ($script:writes | Where-Object { $_.Body.displayName -like '*identities' }).Body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-a')
+            ($script:writes | Where-Object { $_.Body.displayName -like '*user accounts' }).Body.conditions.users.includeUsers | Should -Be @('u-a')
+        }
+        It 'moves an agent from report-only to on, keeping the other agents and deleting a policy left empty' {
+            Mock Get-CaPoliciesRaw { @(
+                (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'Work IQ Mail MCP for agent identities (report-only)') -State 'enabledForReportingButNotEnforced' -Identities @('id-a', 'id-z')),
+                (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'Work IQ Mail MCP for agent user accounts (report-only)') -State 'enabledForReportingButNotEnforced' -Users @('u-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].WasMode | Should -Be 'Report-only'
+            @($script:writes | Where-Object Method -eq 'POST').Count | Should -Be 2
+            $patch = @($script:writes | Where-Object Method -eq 'PATCH')
+            $patch.Count | Should -Be 1; $patch[0].Body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-z')
+            @($script:writes | Where-Object Method -eq 'DELETE').Count | Should -Be 1
+        }
+        It 'skips an agent already blocked in that mode and writes nothing' {
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent identities') -Identities @('ID-A')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent user accounts') -Users @('u-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Skipped'; $r[0].Error | Should -Be 'Already blocked.'
+            $script:writes.Count | Should -Be 0
+        }
+        It 'removes a block by deleting a policy that no longer names anyone, and leaves policies made by hand alone' {
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'm for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a'))) }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem -Target '' -Users @()) -PassThru)
+            $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'unblockmcp'; $r[0].Mode | Should -Be 'Removed'; $r[0].WasMode | Should -Be 'On'
+            $script:writes.Count | Should -Be 1; $script:writes[0].Method | Should -Be 'DELETE'; $script:writes[0].Uri | Should -BeLike '*/id-Agent365 Bulk Actions*'
+            Mock Get-CaPoliciesRaw { @((New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a'))) }
+            $script:writes = @()
+            (@(Invoke-McpBlockChange -Items @(New-McpItem -Target '' -Users @()) -PassThru))[0].Error | Should -BeLike 'Not in a block policy made by this tool*'
+            $script:writes.Count | Should -Be 0
+        }
+        It 'records a refusal with the permission and role it needs, and changes nothing under -WhatIf' {
+            Mock Get-CaPoliciesRaw { @() }
+            Mock Invoke-Graph { throw 'Forbidden' }
+            $r = @(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru)
+            $r[0].Result | Should -Be 'Failed'; $r[0].Error | Should -BeLike '*Policy.ReadWrite.ConditionalAccess*Conditional Access Administrator*'
+            Mock Test-Proceed { $false }
+            (@(Invoke-McpBlockChange -Items @(New-McpItem) -PassThru))[0].Result | Should -Be 'WhatIf'
+        }
+        It 'skips an item with no identity or no application for the server' {
+            Mock Get-CaPoliciesRaw { @() }
+            $it = New-McpItem; $it.ResourceAppId = ''
+            (@(Invoke-McpBlockChange -Items @($it) -PassThru))[0].Result | Should -Be 'Skipped'
+            $script:writes.Count | Should -Be 0
+        }
+    }
+    It 'turns a log back into the changes that undo it' {
+        $log = @([pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a;u-b'; Server = 'Work IQ Mail MCP'; ResourceAppId = 'app-mail'; ResourceName = 'Work IQ Mail MCP'; Mode = 'On'; WasMode = 'Report-only' },
+                 [pscustomobject]@{ Result = 'Done'; Action = 'unblockmcp'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = ''; Server = 'Agent Tools'; ResourceAppId = 'x'; ResourceName = 'Agent Tools'; Mode = 'Removed'; WasMode = 'On' },
+                 [pscustomobject]@{ Result = 'Failed'; Action = 'blockmcp'; Agent = 'Beta' })
+        $u = @(ConvertTo-McpUndoItems $log)
+        $u.Count | Should -Be 2
+        $u[0].Target | Should -Be 'Report-only'; $u[0].AgentUserIds | Should -Be @('u-a', 'u-b')
+        $u[1].Target | Should -Be 'On'; @($u[1].AgentUserIds).Count | Should -Be 0
+    }
+    It 'prepares a block for a server the agent has not used yet' {
+        $b = New-McpScenario
+        $report = [pscustomobject]@{ Rows = $b.Rows; Agents = $b.Agents; Policies = @()
+                                     ServerApps = @{ teams = [pscustomobject]@{ AppId = 'app-teams'; Name = 'Work IQ Teams MCP' }; agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } } }
+        $pk = @([pscustomobject]@{ id = 'P_C'; displayName = 'Studio' })
+        $r = @(Resolve-McpBlockRows -Report $report -Packages $pk -Servers @('Teams', 'Agent Tools', 'Nowhere'))
+        $r.Count | Should -Be 3
+        $r[0].ResourceAppId | Should -Be 'app-teams'; $r[0].Server | Should -Be 'Work IQ Teams MCP'
+        $r[1].ServerKey | Should -Be 'agenttools'
+        $r[2].CanBlock | Should -Not -BeNullOrEmpty
+        $r[0].CanBlock | Should -BeLike '*Power Platform*'
+    }
+    It 'explains a row in the detail pane' {
+        $d = @(Get-McpAccessDetailRows (Get-Row (New-McpScenario) 'Beta Blueprint' 'mail'))
+        ($d | Where-Object Item -eq 'Blueprint principal').Info | Should -BeLike 'bpsp-b (a block on it covers every agent identity*'
+        ($d | Where-Object Item -eq 'Entra application').Info | Should -Be 'Work IQ Mail MCP (app-mail)'
+        ($d | Where-Object Item -eq 'Can this tool block it').Info | Should -BeLike 'Yes:*'
+    }
+}
+
+Describe 'Conditional Access check ignores MCP blocks' {
+    It 'does not count a policy that names specific resources as protection at High' {
+        $raw = @{ id = 'id-mcp'; displayName = 'Block Mail MCP'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }
+                  conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('agent-1') }; agentIdRiskLevels = @(); users = @{ includeUsers = @('None') }
+                                  applications = @{ includeApplications = @('16b1878d-62c7-4009-aa25-68989d63bbad'); excludeApplications = @() } } }
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies @(ConvertTo-AgentCaPolicy $raw) -RiskLevel 'high'
+        $c.Kind | Should -Be 'Unprotected'; $c.Policies[0].Partial | Should -BeTrue
+        (@(Get-AgentCaDetailRows $c) | Where-Object Item -eq 'Block Mail MCP').Info | Should -BeLike '*specific resources*not counted as protection*'
+    }
+}
+
+Describe 'Revoke sessions' {
+    BeforeEach {
+        Mock Write-Host { }
+        Mock Export-ActionLog { }
+        Mock Test-Proceed { $true }
+        $script:calls = @()
+    }
+    It 'finds the agent user accounts of an agent identity and of every identity made from a blueprint entry' {
+        Mock Get-AgentUserIdsByIdentity { @{ 'id-a' = @('u-a'); 'id-b1' = @('u-b1', 'u-b2'); 'id-b2' = @('u-b2') } }
+        Mock Get-McpBlueprintPackages { @{ 'T_B' = [pscustomobject]@{ AppId = 'bp-b'; Principal = 'bpsp-b'; Identities = @('ID-B1', 'id-b2') } } }
+        $pk = @([pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = 'id-a' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta Blueprint'; agentIdentityId = $null },
+                [pscustomobject]@{ id = 'P_N'; displayName = 'No identity'; agentIdentityId = $null })
+        $t = @(Get-AgentSessionTargets -Packages $pk)
+        $t.Count | Should -Be 3
+        $t[0].AgentUsers | Should -Be @('u-a')
+        $t[1].AgentUsers | Should -Be @('u-b1', 'u-b2'); $t[1].Identities.Count | Should -Be 2
+        @($t[2].AgentUsers).Count | Should -Be 0
+    }
+    It 'revokes each account on v1.0, reads back when sessions are valid from, and skips an agent with no account' {
+        Mock Invoke-Graph {
+            $script:calls += , [pscustomobject]@{ Method = $Method; Uri = $Uri }
+            if ($Method -eq 'POST') { @{ value = $true } } else { @{ userPrincipalName = 'agent@contoso.com'; signInSessionsValidFromDateTime = '2026-10-27T12:00:00Z' } }
+        }
+        $r = @(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }, [pscustomobject]@{ Agent = 'Bare'; AgentId = 'P_N'; AgentUsers = @() }) -PassThru)
+        $r.Count | Should -Be 2
+        $r[0].Result | Should -Be 'Done'; $r[0].Action | Should -Be 'revokesessions'; $r[0].Account | Should -Be 'agent@contoso.com'; $r[0].ValidFrom | Should -Not -BeNullOrEmpty; $r[0].DisplayName | Should -Be 'Alpha'
+        $r[1].Result | Should -Be 'Skipped'; $r[1].Error | Should -BeLike '*no agent user account*cannot be revoked*'
+        ($script:calls | Where-Object Method -eq 'POST').Uri | Should -Be 'https://graph.microsoft.com/v1.0/users/u-a/revokeSignInSessions'
+    }
+    It 'records a refusal with the permission and role it needs, and changes nothing under -WhatIf' {
+        Mock Invoke-Graph { throw 'Forbidden' }
+        $r = @(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }) -PassThru)
+        $r[0].Result | Should -Be 'Failed'; $r[0].Error | Should -BeLike '*User.RevokeSessions.All*'
+        Mock Test-Proceed { $false }
+        Mock Invoke-Graph { $script:calls += 'x' }
+        (@(Invoke-AgentSessionRevoke -Targets @([pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; AgentUsers = @('u-a') }) -PassThru))[0].Result | Should -Be 'WhatIf'
+        $script:calls.Count | Should -Be 0
+    }
+    It 'takes the agents of an enforced MCP block, not report-only or failed ones, for revoking straight after' {
+        $recs = @([pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = 'u-a;u-c' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'Report-only'; Agent = 'Beta'; AgentId = 'P_B'; IdentityId = 'id-b'; AgentUserIds = 'u-b' },
+                  [pscustomobject]@{ Result = 'Failed'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Gamma'; AgentId = 'P_G'; IdentityId = 'id-g'; AgentUserIds = 'u-g' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'unblockmcp'; Mode = 'Removed'; Agent = 'Delta'; AgentId = 'P_D'; IdentityId = 'id-d'; AgentUserIds = 'u-d' })
+        $t = @(ConvertTo-McpRevokeTargets $recs)
+        $t.Count | Should -Be 1
+        $t[0].Agent | Should -Be 'Alpha'; $t[0].AgentUsers | Should -Be @('u-a', 'u-c')
+    }
+    It 'revokes after a block or a compromise confirmation for the agents changed, in a log of its own, and keeps the action''s log path' {
+        Mock Get-AgentSessionTargets { @($Packages | ForEach-Object { [pscustomobject]@{ Agent = $_.displayName; AgentId = $_.id; Identities = @(); AgentUsers = @("u-$($_.id)") } }) }
+        Mock Invoke-AgentSessionRevoke { $script:revoked = @($Targets); $script:revokeLog = $script:OutFile }
+        $script:OutFile = 'C:\logs\block.csv'
+        $pk = @([pscustomobject]@{ id = 'P_1'; displayName = 'One' }, [pscustomobject]@{ id = 'P_2'; displayName = 'Two' }, [pscustomobject]@{ id = 'P_3'; displayName = 'Three' })
+        $recs = @([pscustomobject]@{ Result = 'Done'; Action = 'block'; Id = 'P_1' }, [pscustomobject]@{ Result = 'Skipped'; Action = 'block'; Id = 'P_2' },
+                  [pscustomobject]@{ Result = 'Done'; Action = 'confirmcompromised'; Id = 'P_3' })
+        Invoke-SessionRevokeAfter -Records $recs -Packages $pk
+        @($script:revoked | ForEach-Object { $_.AgentId }) | Should -Be @('P_1', 'P_3')
+        $script:revokeLog | Should -Be 'C:\logs\block-revoke.csv'
+        $script:OutFile | Should -Be 'C:\logs\block.csv'
+        $script:revoked = @()
+        Invoke-SessionRevokeAfter -Records @([pscustomobject]@{ Result = 'Failed'; Action = 'block'; Id = 'P_1' }) -Packages $pk
+        @($script:revoked).Count | Should -Be 0
+        $script:OutFile = $null
+    }
+}
+
+Describe 'Security pages' {
+    It 'ships a curated set of hunting queries, each with a category, a name, a description and a query' {
+        $q = @($script:HuntingQueries)
+        $q.Count | Should -Be 18
+        @($q | Where-Object { -not $_.Category -or -not $_.Name -or -not $_.Description -or -not $_.Query }).Count | Should -Be 0
+        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 18
+        @($q | ForEach-Object { $_.Category } | Get-Distinct) | Should -Be @('Inventory', 'Telemetry', 'Alerts', 'Runtime protection', 'Posture', 'Access', 'Tools and MCP', 'Data security', 'Network')
+        @($q | Where-Object { $_.Query -match '[^\x00-\x7F]' }).Count | Should -Be 0
+    }
+    It 'turns hunting results into a table in the column order the service reports, with objects as JSON' {
+        $rows = @(@{ Agent = 'Alpha'; Calls = 3; Tools = @('a', 'b'); Last = $null }, @{ Agent = 'Beta'; Calls = 0; Tools = @{ n = 1 }; Last = '2026-10-27T10:00:00Z' })
+        $t = ConvertTo-HuntingTable -Columns @('Agent', 'Calls', 'Tools', 'Last') -Rows $rows
+        $t.GetType().FullName | Should -Be 'System.Data.DataTable'
+        @($t.Columns | ForEach-Object { $_.ColumnName }) | Should -Be @('Agent', 'Calls', 'Tools', 'Last')
+        $t.Rows.Count | Should -Be 2
+        $t.Rows[0]['Calls'] | Should -Be '3'; $t.Rows[0]['Tools'] | Should -Be '["a","b"]'; $t.Rows[0]['Last'] | Should -Be ''
+        $t.Rows[1]['Tools'] | Should -Be '{"n":1}'
+        $o = ConvertTo-HuntingTable -Columns @() -Rows @([pscustomobject]@{ A = 1; B = 'x' })
+        @($o.Columns | ForEach-Object { $_.ColumnName }) | Should -Be @('A', 'B')
+        (ConvertTo-HuntingTable -Columns @('A') -Rows @()).Rows.Count | Should -Be 0
+    }
+    It 'runs a query and keeps the columns the service reports' {
+        Mock Invoke-Graph { @{ schema = @(@{ name = 'Server'; type = 'String' }, @{ name = 'Agents'; type = 'Int64' }); results = @(@{ Server = 'mail'; Agents = 2 }) } }
+        $r = Invoke-HuntingRun -Query 'AgentsInfo | take 1'
+        $r.Columns | Should -Be @('Server', 'Agents')
+        $r.Rows.Count | Should -Be 1
+        $r.Table.Rows[0]['Agents'] | Should -Be '2'
+        Should -Invoke Invoke-Graph -Times 1 -ParameterFilter { $Uri -like '*/security/runHuntingQuery' -and ($Body | ConvertFrom-Json).Query -eq 'AgentsInfo | take 1' }
+    }
+    It 'picks the audit activity of a period, for chosen agents, risky only when asked' {
+        $now = Get-Date
+        $a = @([pscustomobject]@{ TitleId = 'T_A'; Time = $now.AddDays(-1); Risk = 'High' }, [pscustomobject]@{ TitleId = 'T_A'; Time = $now.AddDays(-10); Risk = 'None' },
+               [pscustomobject]@{ TitleId = 'T_B'; Time = $now.AddDays(-2); Risk = 'None' }, [pscustomobject]@{ TitleId = ''; Time = $now; Risk = 'High' })
+        @(Select-PurviewAuditActivities -Activities $a -Days 7).Count | Should -Be 2
+        @(Select-PurviewAuditActivities -Activities $a -Days 30).Count | Should -Be 3
+        @(Select-PurviewAuditActivities -Activities $a -Days 30 -OnlyIds @('t_a')).Count | Should -Be 2
+        @(Select-PurviewAuditActivities -Activities $a -Days 30 -RiskyOnly).Count | Should -Be 1
+    }
+}
+
+Describe 'Security hardening' {
+    BeforeAll {
+        $script:idA = '11111111-1111-1111-1111-111111111111'
+        $script:idB = '22222222-2222-2222-2222-222222222222'
+        $script:user = '33333333-3333-3333-3333-333333333333'
+        $script:app = '44444444-4444-4444-4444-444444444444'
+        $script:catalog = @{ 'T_1' = (New-Pkg 'T_1' 'Alpha' -IdentityId $script:idA); 'T_2' = (New-Pkg 'T_2' 'Beta' -IdentityId $script:idB) }
+    }
+
+    Context 'undo logs' {
+        It 'accepts rows whose ids are well formed: <Action>' -ForEach @(
+            @{ Action = 'block'; Row = @{ Id = 'T_1' } }
+            @{ Action = 'reassign'; Row = @{ Id = 'T_1'; WasOwner = '55555555-5555-5555-5555-555555555555' } }
+            @{ Action = 'addowner'; Row = @{ Id = 'T_1'; IdentityId = '11111111-1111-1111-1111-111111111111'; UserId = '33333333-3333-3333-3333-333333333333' } }
+            @{ Action = 'confirmcompromised'; Row = @{ Id = 'T_2'; IdentityId = '22222222-2222-2222-2222-222222222222' } }
+            @{ Action = 'restrict'; Row = @{ Id = 'T_1'; WasAvailableTo = 'allowedForSome'; WasDeployedTo = ''; WasAllowed = '[{"resourceType":"user","resourceId":"33333333-3333-3333-3333-333333333333"}]' } }
+            @{ Action = 'blockmcp'; Row = @{ IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = '33333333-3333-3333-3333-333333333333'; WasMode = 'Report-only' } }
+            @{ Action = 'blocklocalagent'; Row = @{ RuleId = 'a365ba-block-ollama-abc' } }
+        ) {
+            $Row['Action'] = $Action
+            Get-UndoRowProblem -Row ([pscustomobject]$Row) -PackageById $script:catalog | Should -BeNullOrEmpty
+        }
+
+        It 'refuses an edited row: <Why>' -ForEach @(
+            @{ Why = 'a path in place of a user id'; Row = @{ Action = 'addowner'; Id = 'T_1'; IdentityId = '11111111-1111-1111-1111-111111111111'; UserId = '../../../identity/conditionalAccess/policies/x#' }; Expect = 'UserId' }
+            @{ Why = 'the identity of another agent'; Row = @{ Action = 'confirmcompromised'; Id = 'T_1'; IdentityId = '22222222-2222-2222-2222-222222222222' }; Expect = "not this agent's" }
+            @{ Why = 'an agent not in the catalog'; Row = @{ Action = 'reassign'; Id = 'T_9'; WasOwner = '55555555-5555-5555-5555-555555555555' }; Expect = 'catalog' }
+            @{ Why = 'All as the users of an MCP block'; Row = @{ Action = 'blockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = 'All'; WasMode = 'On' }; Expect = 'AgentUserIds' }
+            @{ Why = 'All as the MCP resource'; Row = @{ Action = 'blockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = 'All'; AgentUserIds = ''; WasMode = 'On' }; Expect = 'ResourceAppId' }
+            @{ Why = 'an unknown block mode'; Row = @{ Action = 'unblockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = ''; WasMode = 'Everything' }; Expect = 'WasMode' }
+            @{ Why = 'an unknown access value'; Row = @{ Action = 'restrict'; Id = 'T_1'; WasAvailableTo = 'allowedForEveryoneAndMore'; WasDeployedTo = '' }; Expect = 'access' }
+            @{ Why = 'a name in place of a group id'; Row = @{ Action = 'restrict'; Id = 'T_1'; WasAvailableTo = 'allowedForSome'; WasDeployedTo = ''; WasAllowed = '[{"resourceType":"group","resourceId":"All Staff"}]' }; Expect = 'Entra ids' }
+            @{ Why = 'a rule the tool did not make'; Row = @{ Action = 'blocklocalagent'; RuleId = '1234' }; Expect = 'not made by this tool' }
+        ) {
+            Get-UndoRowProblem -Row ([pscustomobject]$Row) -PackageById $script:catalog | Should -Match ([regex]::Escape($Expect))
+        }
+
+        It 'keeps only undoable rows that pass, named from the catalog' {
+            Mock Write-Warning { }
+            $rows = @(
+                [pscustomobject]@{ Action = 'block'; Result = 'Done'; Id = 'T_1'; DisplayName = '=HYPERLINK("x")' }
+                [pscustomobject]@{ Action = 'block'; Result = 'Failed'; Id = 'T_2'; DisplayName = 'Beta' }
+                [pscustomobject]@{ Action = 'addowner'; Result = 'Done'; Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = $script:idA; UserId = 'nope' }
+            )
+            $kept = @(Select-UndoRows -Rows $rows -PackageById $script:catalog)
+            $kept.Count | Should -Be 1
+            $kept[0].DisplayName | Should -Be 'Alpha'
+            Should -Invoke Write-Warning -Times 1
+        }
+
+        It 'keeps MCP undo items only when Entra confirms an agent subject, agent users and an MCP server' {
+            Mock Write-Warning { }
+            Mock Invoke-GraphBatch { @{ $script:idA = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.agentIdentity' } }
+                                         $script:idB = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.servicePrincipal' } } } }
+            Mock Get-AgentUserIdsByIdentity { @{ $script:idA = @($script:user) } }
+            Mock Invoke-Graph { [pscustomobject]@{ value = @([pscustomobject]@{ appId = $script:app; oauth2PermissionScopes = @([pscustomobject]@{ value = 'Tools.ListInvoke.All' }) }) } }
+            $ok = [pscustomobject]@{ Agent = 'Alpha'; Server = 'Mail'; IdentityId = $script:idA; AgentUserIds = @($script:user); ResourceAppId = $script:app; Target = '' }
+            $person = [pscustomobject]@{ Agent = 'Alpha'; Server = 'Mail'; IdentityId = $script:idA; AgentUserIds = @('66666666-6666-6666-6666-666666666666'); ResourceAppId = $script:app; Target = 'On' }
+            $notAgent = [pscustomobject]@{ Agent = 'Beta'; Server = 'Mail'; IdentityId = $script:idB; AgentUserIds = @(); ResourceAppId = $script:app; Target = 'On' }
+            $kept = @(Select-McpUndoItems @($ok, $person, $notAgent))
+            $kept.Count | Should -Be 1
+            $kept[0].Agent | Should -Be 'Alpha'
+            Should -Invoke Write-Warning -Times 2
+        }
+
+        It 'logs removed sponsors and owners, and escapes the ids it puts in the path' {
+            Mock Invoke-Graph { }
+            Mock Test-Proceed { $true }
+            Mock Write-Host { }
+            $OutFile = Join-Path $TestDrive 'remove.csv'
+            $script:LogsWritten.Clear()
+            Invoke-AccountabilityRemove -Records @([pscustomobject]@{ Action = 'addsponsor'; Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = $script:idA; UserId = $script:user; User = 'u@contoso.com' })
+            Should -Invoke Invoke-Graph -Times 1 -ParameterFilter { $Method -eq 'DELETE' -and $Uri -like "*/$($script:idA)/microsoft.graph.agentIdentity/sponsors/$($script:user)/`$ref" }
+            $log = @(Import-Csv $OutFile)
+            $log[0].Action | Should -Be 'remove-sponsor'
+            $log[0].Result | Should -Be 'Done'
+            $script:LogsWritten.Clear()
+        }
+    }
+
+    Context 'exports' {
+        It 'neutralizes a cell Excel would run as a formula: <Value>' -ForEach @(
+            @{ Value = '=HYPERLINK("https://x","open")' }
+            @{ Value = '+cmd' }
+            @{ Value = '@SUM(A1)' }
+            @{ Value = "`t=1" }
+            @{ Value = '-2+3' }
+        ) {
+            Protect-CsvCell $Value | Should -Be "'$Value"
+        }
+        It 'leaves an ordinary value alone: <Value>' -ForEach @(
+            @{ Value = 'Contoso agent' }
+            @{ Value = '-5' }
+            @{ Value = '-' }
+            @{ Value = '2026-10-28' }
+        ) {
+            Protect-CsvCell $Value | Should -Be $Value
+        }
+        It 'keeps every column when rows of different actions share a file' {
+            $rows = @(ConvertTo-CsvRows @([pscustomobject]@{ Action = 'block'; Id = 'T_1' }, [pscustomobject]@{ Action = 'restore-access'; Id = 'T_2'; RestoredTo = 'allowedForAll' }))
+            $rows[0].PSObject.Properties.Name | Should -Be @('Action', 'Id', 'RestoredTo')
+        }
+        It 'adds to a log the same run already wrote instead of replacing it' {
+            Mock Write-Host { }
+            $OutFile = Join-Path $TestDrive 'run.csv'
+            $script:LogsWritten.Clear()
+            Export-ActionLog -Records @([pscustomobject]@{ Action = 'block'; Result = 'Done'; Id = 'T_1' })
+            Export-ActionLog -Records @([pscustomobject]@{ Action = 'restrict'; Result = 'Done'; Id = 'T_2'; WasAvailableTo = 'allowedForAll' })
+            $log = @(Import-Csv $OutFile)
+            $log.Count | Should -Be 2
+            $log[1].WasAvailableTo | Should -Be 'allowedForAll'
+            $script:LogsWritten.Clear()
+        }
+    }
+
+    Context 'writes' {
+        It 'leaves the identity of an agent the run did not change alone, so -WhatIf writes nothing' {
+            Mock Start-Sleep { }
+            Mock Set-AgentIdentityState { }
+            Mock Get-AgentIdentityStateMap { @{ $script:idA = $true } }
+            $records = @([pscustomobject]@{ Id = 'T_1'; Result = 'Skipped'; Identity = ''; Error = '' }, [pscustomobject]@{ Id = 'T_1'; Result = 'WhatIf'; Identity = ''; Error = '' })
+            Confirm-AgentIdentityState -Records $records -PackageById $script:catalog -WantDisabled $true -WaitSeconds 0
+            Should -Invoke Set-AgentIdentityState -Times 0
+        }
+        It 'keeps exclusions an administrator added to a block policy' {
+            $existing = [pscustomobject]@{ conditions = [pscustomobject]@{ users = [pscustomobject]@{ excludeUsers = @($script:user) }; clientApplications = [pscustomobject]@{ excludeAgentIdServicePrincipals = @($script:idB) } } }
+            $body = New-McpBlockPolicyBody -AppId $script:app -ResourceName 'Mail' -Subject Identities -Ids @($script:idA) -Mode 'Report-only' -ConditionsOnly -Existing $existing
+            $body.conditions.users.excludeUsers | Should -Be @($script:user)
+            $body.conditions.clientApplications.excludeAgentIdServicePrincipals | Should -Be @($script:idB)
+            $body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @($script:idA)
+        }
+        It 'refuses a device id that could change the detection rule query' {
+            $row = [pscustomobject]@{ ToolKey = 'ollama'; Tool = 'Ollama'; Device = 'lab'; DeviceId = 'abc" or 1==1 //'; Blocked = ''
+                                      Evidence = [pscustomobject]@{ Processes = @([pscustomobject]@{ File = 'ollama.exe'; Path = 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe' }) } }
+            { New-LocalAgentBlockQuery $row } | Should -Throw '*device id*'
+        }
+        It 'hides tokens in environment variables, headers and known formats' {
+            $t = Protect-CommandLine 'GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 node server.js -H "X-Api-Key: s3cr3t" xoxb-123456789012-abcdef'
+            $t | Should -Not -Match 'ghp_|s3cr3t|xoxb-'
+            $t | Should -Match 'node server\.js'
+        }
+    }
+}
+
+Describe 'Own app registration' {
+    BeforeAll {
+        $script:app = '55555555-5555-5555-5555-555555555555'
+        $script:tenant = '66666666-6666-6666-6666-666666666666'
+    }
+    It 'asks for the mode''s scopes on the shared app' {
+        $c = New-ConnectSettings -Scopes @('A.Read.All', 'A.Read.All', 'B.Read.All')
+        $c.Scopes | Should -Be @('A.Read.All', 'B.Read.All')
+        $c.ContainsKey('ClientId') | Should -BeFalse
+    }
+    It 'passes the app and its tenant, and asks only for what the app was granted at -SignIn' {
+        $c = New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client $script:app
+        $c.ClientId | Should -Be $script:app
+        $c.TenantId | Should -Be $script:tenant
+        $c.Scopes | Should -Be @('A.Read.All')
+        $s = New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client $script:app -SignIn
+        $s.ContainsKey('Scopes') | Should -BeFalse
+    }
+    It 'refuses an app without a tenant, or an id that is not a GUID' {
+        { New-ConnectSettings -Scopes @('A.Read.All') -Client $script:app } | Should -Throw '*needs -TenantId*'
+        { New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client 'my-app' } | Should -Throw '*GUID*'
+    }
+    It 'keeps the app and the tenant when the console asks for one more permission' {
+        Mock Get-MgContext { [pscustomobject]@{ Scopes = @('A.Read.All'); TenantId = $script:tenant } }
+        Mock Connect-GraphSession { $script:sent = $Connect }
+        $script:ClientId = $script:app
+        try { Request-GraphScope 'B.Read.All' } finally { $script:ClientId = '' }
+        $script:sent.ClientId | Should -Be $script:app
+        $script:sent.TenantId | Should -Be $script:tenant
+        $script:sent.Scopes | Should -Be @('A.Read.All', 'B.Read.All')
+    }
+    It 'explains app registration errors: <Code>' -ForEach @(
+        @{ Code = 'AADSTS700016'; Says = 'not found in that tenant' }
+        @{ Code = 'AADSTS50011'; Says = 'redirect URI' }
+        @{ Code = 'AADSTS7000218'; Says = 'public client flows' }
+        @{ Code = 'AADSTS65001'; Says = 'admin consent' }
+    ) {
+        Get-SignInHelp "$($Code): something went wrong" | Should -Match ([regex]::Escape($Says))
+    }
+}
+
+Describe 'Script hygiene' {
+    It 'passes no -replace, -split, -join or -f expression as a method argument other than the last: <Name>' -ForEach @(
+        @{ Name = 'Agent365-Bulk-Actions.ps1'; Path = (Join-Path $PSScriptRoot '..\Agent365-Bulk-Actions.ps1') }
+        @{ Name = 'tools/Watch-GraphApi.ps1'; Path = (Join-Path $PSScriptRoot '..\tools\Watch-GraphApi.ps1') }
+    ) {
+        # Inside a method call a comma separates arguments, so $x.M($a -replace 'p', 'r') passes two arguments, not one.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $ops = 'Ireplace', 'Creplace', 'Isplit', 'Csplit', 'Join', 'Format'
+        $found = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Arguments.Count -gt 1 }, $true) | Where-Object {
+            $list = @($_.Arguments)
+            @($list[0..($list.Count - 2)] | Where-Object { $_ -is [System.Management.Automation.Language.BinaryExpressionAst] -and [string]$_.Operator -in $ops }).Count
+        } | ForEach-Object { '{0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
+        $found | Should -BeNullOrEmpty
     }
 }
