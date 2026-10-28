@@ -653,6 +653,16 @@ function Invoke-Graph {
     }
 }
 
+# Every item of a Graph list, following @odata.nextLink to the last page.
+function Get-GraphAll {
+    param([string]$Uri)
+    do {
+        $page = Invoke-Graph -Uri $Uri
+        foreach ($v in $page.value) { $v }
+        $Uri = [string]$page.'@odata.nextLink'
+    } while ($Uri)
+}
+
 function Get-Packages {
     param([switch]$AgentsOnly)
     $uri = if ($AgentsOnly) {
@@ -709,6 +719,15 @@ function Get-Distinct {
     begin { $seen = [System.Collections.Generic.HashSet[object]]::new() }
     process { if ($seen.Add($InputObject)) { $InputObject } }
 }
+
+# A time as yyyy-MM-dd HH:mm, or an empty string when there is none.
+function Format-When {
+    param($Time)
+    if ($Time) { ([datetime]$Time).ToString('yyyy-MM-dd HH:mm') } else { '' }
+}
+
+# The time a log record is written, in UTC and round-trip form.
+function Get-LogTimestamp { (Get-Date).ToUniversalTime().ToString('o') }
 
 # The record kept per user in the lookup caches; a missing user has the same shape with Exists = $false.
 function New-UserInfo {
@@ -770,6 +789,22 @@ function Invoke-GraphBatch {
     foreach ($p in $pending) { if (-not $results.ContainsKey([string]$p.id)) { $results[[string]$p.id] = [pscustomobject]@{ Status = 429; Body = $null } } }
     if ($Activity -and $total -gt 40) { Write-Progress -Activity $Activity -Completed }
     $results
+}
+
+# Service principals by application id in a few batched calls. Returns a map from app id to the first principal found, with the
+# selected fields. Only GUIDs are looked up, so nothing else reaches the filter.
+function Get-ServicePrincipalsByAppId {
+    param([string[]]$AppIds, [string]$Select = 'id', [ValidateSet('v1.0', 'beta')][string]$Version = 'v1.0', [string]$Activity)
+    $map = @{}
+    $apps = @($AppIds | Where-Object { $_ -match $script:GuidPattern } | Get-Distinct)
+    if ($apps.Count -eq 0) { return $map }
+    $res = Invoke-GraphBatch -Version $Version -Activity $Activity -Requests @($apps | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/servicePrincipals?`$filter=appId eq '{0}'&`$select={1}" -f $_, $Select) } })
+    foreach ($a in $apps) {
+        $r = $res[$a]
+        $sp = if ($r -and $r.Status -eq 200) { @(Get-ItemList $r.Body.value)[0] }
+        if ($sp) { $map[$a] = $sp }
+    }
+    $map
 }
 
 # Look up many users in a few calls and cache them (404 is cached as "does not exist"; other errors are not cached).
@@ -969,7 +1004,7 @@ function Invoke-OwnerReassign {
     $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($i in $Items) {
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'reassign'
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'reassign'
             Id = $i.Id; DisplayName = $i.DisplayName; WasOwner = $i.CurrentOwnerId; NewOwner = $i.NewOwnerId; Basis = $i.Source; Result = ''; Error = ''
         }
         if (-not (Test-Proceed ("{0} -> {1}" -f $i.DisplayName, $i.NewOwnerUpn) 'Reassign')) { $rec.Result = 'WhatIf' }
@@ -1075,7 +1110,7 @@ function Invoke-AvailabilityChange {
     $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0; $skip = 0
     foreach ($p in $Packages) {
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'restrict'
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'restrict'
             Id = $p.id; DisplayName = $p.displayName; WasAvailableTo = ''; WasAllowed = ''; WasDeployedTo = ''; WasAcquire = ''
             IncludeDeployment = [bool]$IncludeDeployment; NewAvailableTo = $target.Available; NewAllowed = ''; Result = ''; Error = ''
         }
@@ -1120,7 +1155,7 @@ function Invoke-AccessRestore {
     $who = (Get-MgContext).Account
     $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($r in $Records) {
-        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'restore-access'
+        $rec = [ordered]@{ Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'restore-access'
                            Id = $r.Id; DisplayName = $r.DisplayName; RestoredTo = [string]$r.WasAvailableTo; Result = ''; Error = '' }
         try {
             $allowed = @(if ($r.WasAllowed) { ConvertFrom-Json ([string]$r.WasAllowed) })
@@ -1249,7 +1284,7 @@ function Invoke-AccountabilityAssign {
         foreach ($kind in @(if ($i.AddSponsor) { 'sponsor' }; if ($i.AddOwner) { 'owner' })) {
             $segment = if ($kind -eq 'sponsor') { 'sponsors' } else { 'owners' }
             $rec = [ordered]@{
-                Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = "add$kind"
+                Timestamp = (Get-LogTimestamp); Operator = $who; Action = "add$kind"
                 Id = $i.Id; DisplayName = $i.DisplayName; IdentityId = $i.IdentityId; UserId = $i.ProposedId; User = $i.Proposed; Basis = $i.Source; Result = ''; Error = ''
             }
             if (-not (Test-Proceed ("{0}: add {1} {2}" -f $i.DisplayName, $kind, $i.Proposed) 'Add accountability')) { $rec.Result = 'WhatIf' }
@@ -1282,7 +1317,7 @@ function Invoke-AccountabilityRemove {
     $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($r in $Records) {
         $segment = if ($r.Action -eq 'addsponsor') { 'sponsors' } else { 'owners' }
-        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'remove-' + $segment.TrimEnd('s')
+        $rec = [ordered]@{ Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'remove-' + $segment.TrimEnd('s')
                            Id = $r.Id; DisplayName = $r.DisplayName; IdentityId = $r.IdentityId; UserId = $r.UserId; User = $r.User; Result = ''; Error = '' }
         if (-not (Test-Proceed ("{0}: remove {1} {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) 'Remove accountability')) { $rec.Result = 'WhatIf' }
         else {
@@ -1347,7 +1382,6 @@ $script:EndpointAiPorts = @(11434, 1234, 8188, 7860)
 $script:EndpointAiApprovalFlags = @('--dangerously-skip-permissions', '--dangerously-bypass-approvals-and-sandbox', '--yolo', '--full-auto', '--allow-all-tools', '--allow-all-paths', '--allow-all-urls')
 $script:EndpointAiMcpHints = @('@modelcontextprotocol', 'mcp-server', 'mcp_server', 'server-filesystem')
 $script:EndpointAiAlertPattern = 'SuspPrompt|prompt injection|jailbreak|AI agent|MCP|LLM|Copilot|Ollama|Claude|ChatGPT'
-$script:RiskOrder = @{ High = 3; Medium = 2; Low = 1; None = 0 }
 
 function ConvertTo-KqlList {
     param([string[]]$Items)
@@ -1390,6 +1424,7 @@ function ConvertTo-NameList {
     @($Values | ForEach-Object { $_ -split '\s*[,;]\s*' } | Where-Object { $_ })
 }
 # The Advanced Hunting queries. Each one is narrow and summarised on the service so the result stays small.
+# Processes and Network scan their table once and return two summaries, each row naming its set in the Set column.
 function Get-EndpointAiQueries {
     param([int]$Days = 30)
     $procs = ConvertTo-KqlList @($script:EndpointAiCatalog | ForEach-Object { $_.Processes } | Where-Object { $_ } | Get-Distinct)
@@ -1410,41 +1445,45 @@ AgentsInfo
           Account = tostring(m.accountName), Upn = tostring(m.upn), McpServers, DeclaredTools, LocalMcps = m.localMcps
 "@
         Processes = @"
-DeviceProcessEvents
+let events = materialize(DeviceProcessEvents
 | where Timestamp > ago(${Days}d)
+| where FileName in~ ($procs) or ProcessCommandLine has_any ($mcp)
+| project Timestamp, DeviceId, DeviceName, FileName, FolderPath, AccountName, InitiatingProcessFileName, ProcessCommandLine);
+let tools = events
 | where FileName in~ ($procs)
 | summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
             Parents = make_set(InitiatingProcessFileName, 5), ActiveAt = make_set(bin(Timestamp, 10m), 300), Command = take_any(substring(ProcessCommandLine, 0, 400)),
             FlagCommand = take_anyif(substring(ProcessCommandLine, 0, 400), ProcessCommandLine has_any ($flags))
     by DeviceId, DeviceName, FileName, FolderPath
-| top 400 by Runs
-"@
-        Mcp = @"
-DeviceProcessEvents
-| where Timestamp > ago(${Days}d)
+| top 400 by Runs;
+let servers = events
 | where ProcessCommandLine has_any ($mcp)
 | where FileName !in~ ($procs)
 | summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
             Parent = take_any(InitiatingProcessFileName) by DeviceId, DeviceName, FileName, Command = substring(ProcessCommandLine, 0, 300)
-| top 200 by Runs
+| top 200 by Runs;
+union (tools | extend Set = "Processes"), (servers | extend Set = "Mcp")
+| sort by Runs desc
 "@
-        Outbound = @"
-DeviceNetworkEvents
+        Network = @"
+let events = materialize(DeviceNetworkEvents
 | where Timestamp > ago(${Days}d)
+| where InitiatingProcessFileName in~ ($procs) or RemoteUrl has_any ($domains) or LocalPort in ($ports)
+| project Timestamp, ActionType, DeviceId, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP, LocalIP, LocalPort);
+let outbound = events
 | where ActionType != "ListeningConnectionCreated"
 | where InitiatingProcessFileName in~ ($procs) or RemoteUrl has_any ($domains)
 | extend Host = tostring(parse_url(iff(RemoteUrl has "://", RemoteUrl, strcat("https://", RemoteUrl))).Host)
 | extend Host = iff(isempty(Host), RemoteIP, Host)
 | summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, Host
-| top 600 by Hits
-"@
-        Listening = @"
-DeviceNetworkEvents
-| where Timestamp > ago(${Days}d)
+| top 600 by Hits;
+let listening = events
 | where ActionType == "ListeningConnectionCreated"
 | where InitiatingProcessFileName in~ ($procs) or LocalPort in ($ports)
 | summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, LocalIP, LocalPort
-| top 400 by Hits
+| top 400 by Hits;
+union (outbound | extend Set = "Outbound"), (listening | extend Set = "Listening")
+| sort by Hits desc
 "@
         Files = @"
 DeviceFileEvents
@@ -1529,7 +1568,7 @@ function Get-EndpointAiRisk {
     if ($remote -or $local) { & $add 'Low' ("MCP servers configured: {0} remote, {1} local." -f $remote, $local) ("{0} MCP server{1}" -f ($remote + $local), $(if (($remote + $local) -ne 1) { 's' })) }
     foreach ($f in $e.Files) { & $add 'Low' ("{0}: {1} file{2} written (for example {3})." -f $f.Kind, $f.Files, $(if ($f.Files -ne 1) { 's' }), $f.Example) ("{0}: {1} written" -f $f.Kind, $f.Files) }
     if ($Row.Status -eq 'Unsanctioned') { & $add 'Low' 'Not on the list of tools you have sanctioned.' 'Not sanctioned' }
-    $sorted = @($reasons | Sort-Object { -$script:RiskOrder[$_.Level] })
+    $sorted = @($reasons | Sort-Object { -(Get-SevRank $_.Level) })
     $level = if ($sorted.Count) { $sorted[0].Level } else { 'None' }
     [pscustomobject]@{ Level = $level; Reasons = $sorted }
 }
@@ -1714,7 +1753,19 @@ function New-EndpointAiRows {
         $row.Why = (@($risk.Reasons | Select-Object -First 3 | ForEach-Object { $_.Short }) -join '; ')
         $row.Sources = ($row.Sources.ToArray() -join ', ')
     }
-    @($rows.Values | Sort-Object @{ e = { -$script:RiskOrder[$_.Risk] } }, @{ e = { $_.LastSeen }; Descending = $true }, Tool)
+    @($rows.Values | Sort-Object @{ e = { -(Get-SevRank $_.Risk) } }, @{ e = { $_.LastSeen }; Descending = $true }, Tool)
+}
+
+# The rows of a query that unions several result sets, by the set each row names in its Set column. Every named set is
+# returned, empty when no row names it, and rows keep their order within a set.
+function Split-HuntingSets {
+    param([object[]]$Rows, [string[]]$Names)
+    $lists = @{}
+    foreach ($n in $Names) { $lists[$n] = [System.Collections.Generic.List[object]]::new() }
+    foreach ($r in $Rows) { $list = $lists[[string]$r.Set]; if ($null -ne $list) { $list.Add($r) } }
+    $out = @{}
+    foreach ($n in $Names) { $out[$n] = $lists[$n].ToArray() }
+    $out
 }
 
 # Everything for the window and the command: read the data, then build the rows.
@@ -1724,13 +1775,16 @@ function Get-EndpointAiData {
     $hint = 'Endpoint AI needs Advanced Hunting (ThreatHunting.Read.All) and devices onboarded to Microsoft Defender for Endpoint.'
     $q = Get-EndpointAiQueries -Days $Days
     $data = @{}
-    $steps = [ordered]@{ Agents = 'Defender local agent discovery'; Processes = 'process activity'; Mcp = 'MCP server processes'; Outbound = 'network connections'
-                         Listening = 'listening ports'; Files = 'model and MCP files'; Software = 'installed software'; Vulnerabilities = 'vulnerabilities'; Coverage = 'device coverage' }
+    $steps = [ordered]@{ Agents = 'Defender local agent discovery'; Processes = 'process activity and MCP servers'; Network = 'network connections and listening ports'
+                         Files = 'model and MCP files'; Software = 'installed software'; Vulnerabilities = 'vulnerabilities'; Coverage = 'device coverage' }
+    $sets = @{ Processes = @('Processes', 'Mcp'); Network = @('Outbound', 'Listening') }
     $i = 0
     foreach ($name in $steps.Keys) {
         $i++
         & $say ("Reading {0} ({1} of {2})..." -f $steps[$name], $i, ($steps.Count + 2))
-        $data[$name] = @(Invoke-HuntingQuery -Query $q[$name] -Hint $hint)
+        $result = @(Invoke-HuntingQuery -Query $q[$name] -Hint $hint)
+        if ($sets.ContainsKey($name)) { $split = Split-HuntingSets -Rows $result -Names $sets[$name]; foreach ($set in $split.Keys) { $data[$set] = $split[$set] } }
+        else { $data[$name] = $result }
     }
     $names = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Agents | ForEach-Object { if ($_.DeviceName) { $_.DeviceName } else { $_.Device } }) | Where-Object { $_ } | Get-Distinct)
     $ids = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Files + $data.Mcp + $data.Agents | ForEach-Object { $_.DeviceId }) | Where-Object { $_ } | Get-Distinct)
@@ -1752,7 +1806,7 @@ function Get-EndpointAiData {
 function Show-EndpointAiTable {
     param([object[]]$Rows)
     $Rows | Select-Object @{ n = 'tool'; e = { $_.Tool } }, @{ n = 'category'; e = { $_.Category } }, @{ n = 'device'; e = { $_.Device } }, @{ n = 'user'; e = { $_.User } },
-        @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'status'; e = { $_.Status } }, @{ n = 'blocked'; e = { $_.Blocked } }, @{ n = 'lastSeen'; e = { if ($_.LastSeen) { $_.LastSeen.ToString('yyyy-MM-dd HH:mm') } else { '' } } },
+        @{ n = 'risk'; e = { $_.Risk } }, @{ n = 'status'; e = { $_.Status } }, @{ n = 'blocked'; e = { $_.Blocked } }, @{ n = 'lastSeen'; e = { Format-When $_.LastSeen } },
         @{ n = 'why'; e = { $_.Why } } | Format-Table -AutoSize -Wrap | Out-Host
 }
 
@@ -1761,7 +1815,6 @@ function Get-EndpointAiDetailRows {
     param([object]$Row)
     $out = New-Object 'System.Collections.Generic.List[object]'
     $add = { param([string]$Section, [string]$Item, [string]$Info) $out.Add([pscustomobject]@{ Section = $Section; Item = $Item; Info = $Info }) }
-    $time = { param($t) if ($t) { ([datetime]$t).ToString('yyyy-MM-dd HH:mm') } else { '' } }
     $e = $Row.Evidence
     & $add 'Overview' 'Tool' ("{0} ({1}, {2})" -f $Row.Tool, $Row.Vendor, $Row.Category)
     & $add 'Overview' 'Device' $Row.Device
@@ -1770,30 +1823,30 @@ function Get-EndpointAiDetailRows {
     & $add 'Overview' 'Status' $Row.Status
     if ($Row.Blocked) { & $add 'Overview' 'Block' 'A Defender rule stops and quarantines its files on this device each time they appear.' }
     & $add 'Overview' 'Seen by' $Row.Sources
-    & $add 'Overview' 'First / last seen' ("{0}  /  {1}" -f (& $time $Row.FirstSeen), (& $time $Row.LastSeen))
+    & $add 'Overview' 'First / last seen' ("{0}  /  {1}" -f (Format-When $Row.FirstSeen), (Format-When $Row.LastSeen))
     if ($Row.Runs) { & $add 'Overview' 'Process starts' ([string]$Row.Runs) }
     if ($Row.Trusted) { & $add 'Overview' 'Host process trusted' $Row.Trusted }
     if ($Row.AutoApprove) { & $add 'Overview' 'Approves its own actions' $Row.AutoApprove }
     foreach ($r in @($Row.Reasons)) { & $add 'Risk' $r.Level $r.Text }
     if (-not @($Row.Reasons).Count) { & $add 'Risk' 'None' 'No risk indicators found.' }
     foreach ($p in @($e.Processes | Sort-Object Runs -Descending)) {
-        & $add 'Processes' $p.File ("{0} start{1}, last {2}. From {3}. Started by {4}. {5}" -f $p.Runs, $(if ($p.Runs -ne 1) { 's' }), (& $time $p.LastSeen), $p.Path, $p.Parents, $p.Command)
+        & $add 'Processes' $p.File ("{0} start{1}, last {2}. From {3}. Started by {4}. {5}" -f $p.Runs, $(if ($p.Runs -ne 1) { 's' }), (Format-When $p.LastSeen), $p.Path, $p.Parents, $p.Command)
     }
     $named = @($e.Hosts | Where-Object { $_.Host -notmatch '^[\d.:a-fA-F]+$' -or $_.Host -match '[g-zG-Z]' } | Sort-Object Hits -Descending)
     $bare = @($e.Hosts | Where-Object { $named -notcontains $_ })
-    foreach ($h in ($named | Select-Object -First 20)) { & $add 'Network' $h.Host ("{0} connection{1} by {2}, last {3}" -f $h.Hits, $(if ($h.Hits -ne 1) { 's' }), $h.Process, (& $time $h.LastSeen)) }
+    foreach ($h in ($named | Select-Object -First 20)) { & $add 'Network' $h.Host ("{0} connection{1} by {2}, last {3}" -f $h.Hits, $(if ($h.Hits -ne 1) { 's' }), $h.Process, (Format-When $h.LastSeen)) }
     if ($bare.Count) { & $add 'Network' 'IP addresses without a name' ("{0} address{1}, {2} connection{3}, for example {4}" -f $bare.Count, $(if ($bare.Count -ne 1) { 'es' }), (($bare | Measure-Object Hits -Sum).Sum), $(if ((($bare | Measure-Object Hits -Sum).Sum) -ne 1) { 's' }), $bare[0].Host) }
     foreach ($l in @($e.Listeners | Sort-Object Exposed, Port -Descending | Select-Object -First 15)) {
-        & $add 'Listening' ("{0}:{1}" -f $l.Ip, $l.Port) ("{0}. {1} time{2} by {3}, last {4}" -f $(if ($l.Exposed) { 'Reachable from other machines' } else { 'This device only' }), $l.Hits, $(if ($l.Hits -ne 1) { 's' }), $l.Process, (& $time $l.LastSeen))
+        & $add 'Listening' ("{0}:{1}" -f $l.Ip, $l.Port) ("{0}. {1} time{2} by {3}, last {4}" -f $(if ($l.Exposed) { 'Reachable from other machines' } else { 'This device only' }), $l.Hits, $(if ($l.Hits -ne 1) { 's' }), $l.Process, (Format-When $l.LastSeen))
     }
     foreach ($m in $e.RemoteMcps) { & $add 'MCP servers' $m.Name ("Remote ({0}) {1}" -f $m.Type, $m.Endpoint) }
     foreach ($m in $e.LocalMcps) { & $add 'MCP servers' $m.Name ("Local. {0}{1}" -f $m.Command, $(if ($m.Unpinned) { '  (fetches code through a package runner)' } else { '' })) }
-    foreach ($f in $e.Files) { & $add 'Files' $f.Kind ("{0} file(s), last {1}. For example {2}" -f $f.Files, (& $time $f.LastSeen), $f.Example) }
+    foreach ($f in $e.Files) { & $add 'Files' $f.Kind ("{0} file(s), last {1}. For example {2}" -f $f.Files, (Format-When $f.LastSeen), $f.Example) }
     foreach ($s in $e.Software) {
         & $add 'Software' ("{0} {1}" -f $s.Name, $s.Version) $(if ($s.Cves) { "{0} vulnerabilit{1}: {2} critical, {3} high. For example {4}" -f $s.Cves, $(if ($s.Cves -eq 1) { 'y' } else { 'ies' }), $s.Critical, $s.High, $s.Example } else { 'No known vulnerabilities' })
     }
     foreach ($a in @($e.Alerts | Sort-Object Time -Descending | Select-Object -First 15)) {
-        & $add 'Device alerts' $a.Title ("{0}{1}{2}, {3}, {4}" -f $a.Severity, $(if ($a.AiRelated) { ', AI-related' } else { '' }), $(if ($a.Near) { ', within 15 minutes of this tool''s activity' } else { ', same device, not near this tool' }), (& $time $a.Time), $a.Source)
+        & $add 'Device alerts' $a.Title ("{0}{1}{2}, {3}, {4}" -f $a.Severity, $(if ($a.AiRelated) { ', AI-related' } else { '' }), $(if ($a.Near) { ', within 15 minutes of this tool''s activity' } else { ', same device, not near this tool' }), (Format-When $a.Time), $a.Source)
     }
     if ($e.Device) {
         $d = $e.Device
@@ -1918,12 +1971,7 @@ function New-LocalAgentBlockRule {
 # The block rules this tool created, by rule id.
 function Get-LocalAgentBlocks {
     $rules = @{}
-    $uri = $script:DetectionRuleBase
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($r in @($page.value)) { if ([string]$r.id -like "$script:BlockRulePrefix*") { $rules[[string]$r.id] = $r } }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
+    foreach ($r in (Get-GraphAll -Uri $script:DetectionRuleBase)) { if ([string]$r.id -like "$script:BlockRulePrefix*") { $rules[[string]$r.id] = $r } }
     $rules
 }
 
@@ -1948,7 +1996,7 @@ function Invoke-LocalAgentBlock {
     foreach ($row in @($Rows)) {
         $id = Get-LocalAgentBlockId -ToolKey $row.ToolKey -DeviceId $row.DeviceId
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'blocklocalagent'
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'blocklocalagent'
             Tool = $row.Tool; Device = $row.Device; DeviceId = $row.DeviceId; RuleId = $id; Files = ((Get-LocalAgentBlockPaths $row) -join '; '); Result = ''; Error = ''
         }
         $why = Test-LocalAgentBlockable $row
@@ -1991,7 +2039,7 @@ function Invoke-LocalAgentUnblock {
     $who = (Get-MgContext).Account
     $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($rule in @($Rules)) {
-        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'unblocklocalagent'; Rule = [string]$rule.displayName; RuleId = [string]$rule.id; Result = ''; Error = '' }
+        $rec = [ordered]@{ Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'unblocklocalagent'; Rule = [string]$rule.displayName; RuleId = [string]$rule.id; Result = ''; Error = '' }
         if (-not (Test-Proceed ([string]$rule.displayName) 'Remove block')) { $rec.Result = 'WhatIf' }
         else {
             try {
@@ -2126,27 +2174,17 @@ function Get-AgentIdentityIds {
         $map[$id] = [pscustomobject]@{ Identity = $id; AppId = $(if ($body) { [string]$body.appId } else { '' }); Blueprint = $(if ($body) { [string]$body.agentIdentityBlueprintId } else { '' }); Principal = '' }
         if ($map[$id].Blueprint) { $blueprints[$map[$id].Blueprint] = $true }
     }
-    if ($blueprints.Count) {
-        $pr = Invoke-GraphBatch -Version beta -Requests @($blueprints.Keys | Where-Object { $_ -match $script:GuidPattern } | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals?$filter=appId eq ''{0}''&$select=id' -f $_) } })
-        foreach ($id in $ids) {
-            $bp = $map[$id].Blueprint
-            $r = if ($bp) { $pr[$bp] } else { $null }
-            if ($r -and $r.Status -eq 200 -and @($r.Body.value).Count) { $map[$id].Principal = [string]@($r.Body.value)[0].id }
-        }
+    $pr = Get-ServicePrincipalsByAppId -AppIds @($blueprints.Keys) -Version beta
+    foreach ($id in $ids) {
+        $bp = $map[$id].Blueprint
+        if ($bp -and $pr.ContainsKey($bp)) { $map[$id].Principal = [string]$pr[$bp].id }
     }
     $map
 }
 
 # The agent identities Entra ID Protection currently rates as at risk or confirmed compromised.
 function Get-EntraRiskyAgentIds {
-    $ids = New-Object 'System.Collections.Generic.List[string]'
-    $uri = $script:RiskBase
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($r in @($page.value)) { if ([string]$r.riskState -in 'atRisk', 'confirmedCompromised') { $ids.Add([string]$r.id) } }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
-    $ids.ToArray()
+    foreach ($r in (Get-GraphAll -Uri $script:RiskBase)) { if ([string]$r.riskState -in 'atRisk', 'confirmedCompromised') { [string]$r.id } }
 }
 
 # Coverage for a set of catalog agents: reads the policies, the agents' ids and their Entra risk once, then judges each agent.
@@ -2343,6 +2381,14 @@ function Get-AgentUsersReport {
     [pscustomobject]@{ Rows = @($rows) }
 }
 
+# The rows of chosen catalog agents (by AgentId), or every row when none is chosen. A row tied to no agent belongs to none.
+function Select-ChosenAgentRows {
+    param([object[]]$Rows, [string[]]$OnlyIds)
+    $only = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $OnlyIds) { if ($id) { [void]$only.Add($id) } }
+    @(foreach ($r in $Rows) { if (-not $only.Count -or ($r.AgentId -and $only.Contains([string]$r.AgentId))) { $r } })
+}
+
 # The rows of one period (7, 14 or 30 days): users with at least one interaction in it, the count for that period in Interactions,
 # optionally only users without an Agent 365 or E7 license, or whose agent, name or account contains the text.
 function Select-AgentUserRows {
@@ -2443,14 +2489,7 @@ function Get-KeyAgent {
 
 # Every agent user account with its parent identity, in pages of 999.
 function Get-AgentUsers {
-    $users = New-Object 'System.Collections.Generic.List[object]'
-    $uri = 'https://graph.microsoft.com/beta/users/microsoft.graph.agentUser?$select=id,displayName,identityParentId&$top=999'
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($u in @($page.value)) { $users.Add($u) }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
-    , $users.ToArray()
+    , @(Get-GraphAll -Uri 'https://graph.microsoft.com/beta/users/microsoft.graph.agentUser?$select=id,displayName,identityParentId&$top=999')
 }
 
 # Agent user accounts, each with the ids that lead back to its agent: the parent identity, that identity's application id and its blueprint.
@@ -2566,7 +2605,6 @@ function Get-PolicyHitDetailRows {
     param([object]$Row)
     $out = New-Object 'System.Collections.Generic.List[object]'
     $add = { param([string]$Section, [string]$Item, [string]$Info) if ($Info) { $out.Add([pscustomobject]@{ Section = $Section; Item = $Item; Info = $Info }) } }
-    $when = { param($t) if ($t) { ([datetime]$t).ToString('yyyy-MM-dd HH:mm') } else { '' } }
     if ($Row.AgentId) {
         & $add 'Agent' 'Agent' $Row.Agent
         & $add 'Agent' 'Catalog id' $Row.AgentId
@@ -2590,7 +2628,7 @@ function Get-PolicyHitDetailRows {
     & $add 'Hit' 'Item' $(if ($Row.ItemPath) { '{0}  ({1})' -f $Row.Item, $Row.ItemPath } else { $Row.Item })
     & $add 'Hit' 'Person' $Row.User
     & $add 'Hit' 'Hits' ('{0} in the last 7 days, {1} in 14, {2} in 30' -f $Row.N7, $Row.N14, $Row.N30)
-    & $add 'Hit' 'Last hit' (& $when $Row.Last)
+    & $add 'Hit' 'Last hit' (Format-When $Row.Last)
     $look = if ($Row.Link) { "Open the newest alert: $($Row.Link)" }
             elseif ($Row.Policy) { "Microsoft Purview portal, Data loss prevention, Activity explorer or Alerts: filter on the policy '$($Row.Policy)'." }
             else { '' }
@@ -2637,24 +2675,16 @@ function Get-AgentPolicyHitsReport {
             -N7 (& $age 7) -N14 (& $age 14) -N30 $g.Count -Last ($when | Sort-Object -Descending | Select-Object -First 1) -App ([string]@($f.Alert.AppIds)[0]) -Where $newest.Category -Link $newest.Link))
     }
     $all = $rows.ToArray()
-    $keep = $all
-    if ($OnlyIds) { $only = @($OnlyIds | ForEach-Object { ([string]$_).ToLowerInvariant() }); $keep = @($all | Where-Object { $_.AgentId -and ($only -contains $_.AgentId.ToLowerInvariant()) }) }
-    [pscustomobject]@{ Rows = $keep; AllRows = $all; Note = $userNote; AlertCount = $alerts.Count }
+    [pscustomobject]@{ Rows = @(Select-ChosenAgentRows -Rows $all -OnlyIds $OnlyIds); AllRows = $all; Note = $userNote; AlertCount = $alerts.Count }
 }
 
 # DLP and Insider Risk alerts of the last 30 days from the Microsoft Graph alerts API.
 function Get-PurviewAlerts {
     $since = (Get-Date).ToUniversalTime().AddDays(-30).ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $out = New-Object 'System.Collections.Generic.List[object]'
     foreach ($src in 'dataLossPrevention', 'microsoftInsiderRiskManagement') {
         $uri = ('https://graph.microsoft.com/v1.0/security/alerts_v2?$filter=serviceSource eq ''{0}'' and createdDateTime ge {1}&$top=100' -f $src, $since)
-        do {
-            $page = Invoke-Graph -Uri $uri
-            foreach ($a in @($page.value)) { $out.Add((ConvertTo-PurviewAlert $a)) }
-            $uri = [string]$page.'@odata.nextLink'
-        } while ($uri)
+        foreach ($a in (Get-GraphAll -Uri $uri)) { ConvertTo-PurviewAlert $a }
     }
-    $out.ToArray()
 }
 
 
@@ -2784,7 +2814,7 @@ function Get-AgentAlertDetailRows {
     & $add 'Alert' 'Severity' $Row.Severity
     & $add 'Alert' 'Category' $Row.Category
     & $add 'Alert' 'Source' $Row.Source
-    & $add 'Alert' 'Raised' $(if ($Row.Time) { ([datetime]$Row.Time).ToString('yyyy-MM-dd HH:mm') } else { '' })
+    & $add 'Alert' 'Raised' (Format-When $Row.Time)
     & $add 'Alert' 'Alert id' $Row.AlertId
     & $add 'Agent' 'Agent' $Row.Agent
     & $add 'Agent' 'Catalog id' $Row.AgentId
@@ -2893,14 +2923,7 @@ CloudAppEvents
 
 # The tenant's Conditional Access policies as Graph returns them.
 function Get-CaPoliciesRaw {
-    $out = New-Object 'System.Collections.Generic.List[object]'
-    $uri = $script:CaPolicyBase
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($r in @($page.value)) { $out.Add($r) }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
-    $out.ToArray()
+    Get-GraphAll -Uri $script:CaPolicyBase
 }
 
 # Agent identity id (lowercased) -> the ids of its agent user accounts.
@@ -2920,13 +2943,8 @@ function Get-AgentUserIdsByIdentity {
 # Every delegated grant that carries an MCP scope, with the client and the resource it joins. Grants are read tenant-wide because
 # a BYO server can have any name; only the MCP scopes are kept.
 function Get-McpGrantData {
-    $raw = New-Object 'System.Collections.Generic.List[object]'
-    $uri = 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$select=clientId,resourceId,scope,consentType&$top=999'
-    do {
-        $page = Invoke-Graph -Uri $uri
-        foreach ($g in @($page.value)) { if ((Get-McpScopes ([string]$g.scope)).Count) { $raw.Add($g) } }
-        $uri = [string]$page.'@odata.nextLink'
-    } while ($uri)
+    $raw = @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$select=clientId,resourceId,scope,consentType&$top=999' |
+             Where-Object { (Get-McpScopes ([string]$_.scope)).Count })
     $ids = @(@($raw | ForEach-Object { [string]$_.clientId; [string]$_.resourceId }) | Where-Object { $_ } | Get-Distinct)
     $sp = if ($ids.Count) { Invoke-GraphBatch -Version beta -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals/{0}?$select=id,appId,displayName' -f $_) } }) -Activity 'Reading MCP permission holders' } else { @{} }
     $clients = @{}
@@ -2967,16 +2985,15 @@ function Get-McpBlueprintPackages {
     $cands = @($Packages | Where-Object { -not $_.agentIdentityId -and [string]$_.manifestId -match $script:GuidPattern -and @($_.elementTypes) -contains 'AgenticUserTemplates' })
     if ($cands.Count -eq 0) { return $map }
     $apps = @($cands | ForEach-Object { ([string]$_.manifestId).ToLowerInvariant() } | Get-Distinct)
-    $reqs = @($apps | ForEach-Object {
-        @{ id = "p:$_"; method = 'GET'; url = ("/servicePrincipals?`$filter=appId eq '{0}'&`$select=id" -f $_) }
-        @{ id = "i:$_"; method = 'GET'; url = ("/servicePrincipals/microsoft.graph.agentIdentity?`$filter=agentIdentityBlueprintId eq '{0}'&`$select=id" -f $_) } })
+    $principals = Get-ServicePrincipalsByAppId -AppIds $apps -Version beta -Activity 'Reading agent blueprints'
+    $reqs = @($apps | Where-Object { $principals.ContainsKey($_) } | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/servicePrincipals/microsoft.graph.agentIdentity?`$filter=agentIdentityBlueprintId eq '{0}'&`$select=id" -f $_) } })
     $res = Invoke-GraphBatch -Version beta -Requests $reqs -Activity 'Reading agent blueprints'
     foreach ($p in $cands) {
         $a = ([string]$p.manifestId).ToLowerInvariant()
-        $pr = if ($res["p:$a"] -and $res["p:$a"].Status -eq 200) { @(Get-ItemList $res["p:$a"].Body.value)[0] } else { $null }
+        $pr = $principals[$a]
         if (-not $pr) { continue }
         $map[[string]$p.id] = [pscustomobject]@{ AppId = $a; Principal = [string]$pr.id
-                                                Identities = @(if ($res["i:$a"] -and $res["i:$a"].Status -eq 200) { Get-ItemList $res["i:$a"].Body.value | ForEach-Object { [string]$_.id } }) }
+                                                Identities = @(if ($res[$a] -and $res[$a].Status -eq 200) { Get-ItemList $res[$a].Body.value | ForEach-Object { [string]$_.id } }) }
     }
     $map
 }
@@ -3354,7 +3371,7 @@ function Get-McpAccessDetailRows {
     & $add 'Set up' 'Defender inventory' $(if ($Row.Declared) { $Row.DeclaredAs } else { 'Not listed among the agent''s MCP servers' })
     & $add 'Calls' 'Tool calls' ('{0} in 7 days, {1} in 14 days, {2} in 30 days{3}' -f $Row.Calls7, $Row.Calls14, $Row.Calls30, $(if ($Row.Connects) { "; $($Row.Connects) connection handshake(s)" } else { '' }))
     & $add 'Calls' 'Errors' $(if ($Row.Errors) { [string]$Row.Errors } else { '' })
-    & $add 'Calls' 'Last call' $(if ($Row.LastCall) { ([datetime]$Row.LastCall).ToString('yyyy-MM-dd HH:mm') } elseif ($Row.LastSeen) { 'No tool call; last connection ' + ([datetime]$Row.LastSeen).ToString('yyyy-MM-dd HH:mm') } else { 'None in 30 days' })
+    & $add 'Calls' 'Last call' $(if ($Row.LastCall) { Format-When $Row.LastCall } elseif ($Row.LastSeen) { 'No tool call; last connection ' + (Format-When $Row.LastSeen) } else { 'None in 30 days' })
     & $add 'Calls' $(if ($Row.ServerKey -eq 'agenttools') { 'Servers' } else { 'Tools called' }) $Row.Tools
     & $add 'Calls' 'Through' $Row.Via
     & $add 'Block' 'Conditional Access' $(if ($Row.Block) { "$($Row.Block). $($Row.BlockText)" } else { 'Not blocked by a policy that names this server.' })
@@ -3461,7 +3478,7 @@ function Invoke-McpBlockChange {
         $users = @($it.AgentUserIds | Where-Object { $_ })
         $target = [string]$it.Target
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $(if ($target) { 'blockmcp' } else { 'unblockmcp' })
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = $(if ($target) { 'blockmcp' } else { 'unblockmcp' })
             Agent = $it.Agent; AgentId = $it.AgentId; IdentityId = $it.IdentityId; AgentUserIds = ($users -join ';'); Server = $it.Server
             ResourceAppId = $it.ResourceAppId; ResourceName = $it.ResourceName; Mode = $(if ($target) { $target } else { 'Removed' }); WasMode = ''; Policies = ''; Result = ''; Error = ''
         }
@@ -3577,11 +3594,11 @@ function Invoke-AgentSessionRevoke {
         if ($users.Count -eq 0) {
             $why = 'The agent has no agent user account. Its identity''s own tokens cannot be revoked; block the agent or disable its identity to stop new ones.'
             Write-Host ("  SKIP {0}: {1}" -f $t.Agent, $why) -ForegroundColor DarkGray
-            $log.Add([pscustomobject]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = ''; Account = ''; ValidFrom = ''; Result = 'Skipped'; Error = $why })
+            $log.Add([pscustomobject]@{ Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = ''; Account = ''; ValidFrom = ''; Result = 'Skipped'; Error = $why })
             $skip++; continue
         }
         foreach ($u in $users) {
-            $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = $u; Account = ''; ValidFrom = ''; Result = ''; Error = '' }
+            $rec = [ordered]@{ Timestamp = (Get-LogTimestamp); Operator = $who; Action = 'revokesessions'; DisplayName = $t.Agent; Id = $t.AgentId; AgentUserId = $u; Account = ''; ValidFrom = ''; Result = ''; Error = '' }
             if (-not (Test-Proceed ("{0} (agent user {1})" -f $t.Agent, $u) 'Revoke sign-in sessions')) { $rec.Result = 'WhatIf' }
             else {
                 try {
@@ -3699,7 +3716,7 @@ function Invoke-AgentRiskAction {
         $idn = [string]$p.agentIdentityId
         $prev = $before[$idn]
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action.ToLowerInvariant()
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = $Action.ToLowerInvariant()
             Id = $p.id; DisplayName = $p.displayName; IdentityId = $idn
             WasRiskLevel = $(if ($prev) { $prev.Level } else { '' }); WasRiskState = $(if ($prev) { $prev.State } else { '' })
             NowRiskLevel = ''; NowRiskState = ''; Verified = ''; Result = ''; Error = ''
@@ -3915,7 +3932,7 @@ function Invoke-PolicyPlan {
 function Save-Snapshot {
     param([string]$Path, [object[]]$Packages)
     $items = $Packages | Select-Object id, displayName, type, platform, publisher, ownerId, isBlocked, version, lastModifiedDateTime, agentIdentityId
-    [pscustomobject]@{ takenAt = (Get-Date).ToUniversalTime().ToString('o'); count = @($items).Count; items = @($items) } |
+    [pscustomobject]@{ takenAt = (Get-LogTimestamp); count = @($items).Count; items = @($items) } |
         ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Path -Encoding utf8
 }
 
@@ -4092,18 +4109,6 @@ function ConvertTo-PermissionRows {
     }
 }
 
-# What one identity may do: delegated grants and application roles.
-function Get-IdentityPermissions {
-    param([string]$ServicePrincipalId, [string]$Source)
-    $grants = @(); $roles = @()
-    if ($ServicePrincipalId -notmatch $script:GuidPattern) { return }
-    try { $grants = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$ServicePrincipalId'").value) } catch { Write-Verbose $_.Exception.Message }
-    try { $roles = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignments?`$top=100").value) } catch { Write-Verbose $_.Exception.Message }
-    # resolve every resource in one pass before building rows
-    Initialize-ResourceCache -Ids @(@($grants) + @($roles) | ForEach-Object { $_.resourceId })
-    ConvertTo-PermissionRows -Grants $grants -Roles $roles -Source $Source
-}
-
 # Resource service principals (name and application roles) for many ids in a few calls.
 function Initialize-ResourceCache {
     param([string[]]$Ids)
@@ -4122,6 +4127,8 @@ function Initialize-ResourceCache {
 
 # Permissions of many agents at once. Items are { Key; ServicePrincipalId; BlueprintAppId }. Returns Key -> permission rows
 # (the identity's own plus those inherited from its blueprint). Costs a handful of batched calls, not two per agent.
+# Blueprint lookups are cached per run.
+$script:BlueprintPermCache = @{}
 function Get-PermissionsBulk {
     param([object[]]$Items)
     $out = @{}
@@ -4130,13 +4137,9 @@ function Get-PermissionsBulk {
 
     $bpApps = @($Items | ForEach-Object { $_.BlueprintAppId } | Where-Object { $_ -match $script:GuidPattern } | Get-Distinct | Where-Object { -not $script:BlueprintPermCache.ContainsKey($_) })
     $bpSp = @{}
-    if ($bpApps.Count) {
-        $res = Invoke-GraphBatch -Requests @($bpApps | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals?`$filter=appId eq '$_'&`$select=id" } }) -Activity 'Reading agent blueprints'
-        foreach ($a in $bpApps) {
-            $r = $res[$a]
-            $found = if ($r -and $r.Status -eq 200) { @(Get-ItemList $r.Body.value) } else { @() }
-            if ($found.Count) { $bpSp[$a] = [string]$found[0].id } else { $script:BlueprintPermCache[$a] = @() }
-        }
+    $principals = Get-ServicePrincipalsByAppId -AppIds $bpApps -Activity 'Reading agent blueprints'
+    foreach ($a in $bpApps) {
+        if ($principals.ContainsKey($a)) { $bpSp[$a] = [string]$principals[$a].id } else { $script:BlueprintPermCache[$a] = @() }
     }
 
     # grants and role assignments for every identity and blueprint, two requests each
@@ -4193,7 +4196,8 @@ function Get-AgentDetail {
         try { $identity = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity?`$select=id,displayName,accountEnabled,agentIdentityBlueprintId,createdDateTime" } catch { Write-Verbose $_.Exception.Message }
         $owners = @(Get-IdentityOwners $d.agentIdentityId | ForEach-Object { $_.Upn })
         try { $sp = Invoke-Graph -Uri "https://graph.microsoft.com/beta/servicePrincipals/$($d.agentIdentityId)/microsoft.graph.agentIdentity/sponsors?`$select=id"; $sponsors = @($sp.value | ForEach-Object { (Get-UserInfo $_.id).Upn }) } catch { Write-Verbose $_.Exception.Message }
-        $perms = @(Get-AgentPermissionList -AgentIdentityId $d.agentIdentityId -BlueprintAppId $(if ($identity) { $identity.agentIdentityBlueprintId }))
+        $item = [pscustomobject]@{ Key = 'agent'; ServicePrincipalId = $d.agentIdentityId; BlueprintAppId = $(if ($identity) { $identity.agentIdentityBlueprintId }) }
+        try { $perms = @(Get-ItemList (Get-PermissionsBulk -Items @($item))['agent']) } catch { Write-Verbose $_.Exception.Message }
     }
     $count = { param($x) @(Get-ItemList $x).Count }
     $riskEntry = try { Get-AgentRisk $Package } catch { $null }
@@ -4237,15 +4241,22 @@ function Get-AgentDetail {
     }
 }
 
-# Risk signals per agent come from one hunting run, cached for ten minutes so the details window is quick.
-$script:RiskCache = $null
-$script:RiskCacheAt = [datetime]::MinValue
-function Get-RiskCached {
-    if (-not $script:RiskCache -or ((Get-Date) - $script:RiskCacheAt).TotalMinutes -gt 10) {
-        $script:RiskCache = Get-RiskyIndex -Days 30
-        $script:RiskCacheAt = Get-Date
+# Hunting results that do not depend on a threshold are cached for ten minutes, keyed by the inputs of the query, so the
+# details window, every threshold of a console filter and every rule of a policy share one run.
+$script:HuntingCache = @{}
+function Get-HuntingCached {
+    param([string]$Key, [scriptblock]$Read)
+    $hit = $script:HuntingCache[$Key]
+    if (-not $hit -or ((Get-Date) - $hit.At).TotalMinutes -gt 10) {
+        $hit = @{ Value = (& $Read); At = Get-Date }
+        $script:HuntingCache[$Key] = $hit
     }
-    $script:RiskCache
+    $hit.Value
+}
+
+function Get-RiskCached {
+    param([int]$Days = 30, [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both')
+    Get-HuntingCached "risky|$Days|$Source" { Get-RiskyIndex -Days $Days -Source $Source }
 }
 
 # The risk entry for one package (severity, alert and detection counts, reasons), or $null when it has none.
@@ -4254,25 +4265,6 @@ function Get-AgentRisk {
     $idx = Get-RiskCached
     foreach ($k in (Get-PackageKeys $Package)) { if ($idx.ContainsKey($k)) { return $idx[$k] } }
     $null
-}
-
-# Permissions of an agent identity plus what it inherits from its blueprint. Blueprint lookups are cached per run.
-$script:BlueprintPermCache = @{}
-function Get-AgentPermissionList {
-    param([string]$AgentIdentityId, [string]$BlueprintAppId)
-    $perms = @(Get-IdentityPermissions -ServicePrincipalId $AgentIdentityId -Source 'Agent identity')
-    if ($BlueprintAppId -match $script:GuidPattern) {
-        if (-not $script:BlueprintPermCache.ContainsKey($BlueprintAppId)) {
-            $inherited = @()
-            try {
-                $bp = Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$BlueprintAppId'&`$select=id,displayName"
-                foreach ($b in @($bp.value | Select-Object -First 1)) { $inherited = @(Get-IdentityPermissions -ServicePrincipalId $b.id -Source 'Blueprint (inherited)') }
-            } catch { Write-Verbose $_.Exception.Message }
-            $script:BlueprintPermCache[$BlueprintAppId] = $inherited
-        }
-        $perms += $script:BlueprintPermCache[$BlueprintAppId]
-    }
-    $perms
 }
 
 # Does a permission list satisfy the filter: any permission, a Microsoft Graph application permission, or an MCP server permission?
@@ -4439,7 +4431,7 @@ function Get-StalePackages {
         return @($out | Sort-Object StaleSince)
     }
 
-    $idx = Get-ActivityIndex
+    $idx = Get-HuntingCached 'activity' { Get-ActivityIndex }
     $out = foreach ($p in $pkgs) {
         $last = $null
         foreach ($k in (Get-PackageKeys $p)) {
@@ -4614,7 +4606,7 @@ function Get-SevRank { param([string]$S)
 function Get-RiskyPackages {
     param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly,
           [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both', [object[]]$Packages)
-    $idx = Get-RiskyIndex -Days $Days -Source $Source
+    $idx = Get-RiskCached -Days $Days -Source $Source
     $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Select-PackageSet -Packages $Packages -Supplied:$PSBoundParameters.ContainsKey('Packages') -AgentsOnly:$AgentsOnly)) {
         $hit = $null
@@ -4723,15 +4715,9 @@ function Complete-AuditSearch {
     }
     if ($q.status -ne 'succeeded') { Write-Warning ("An audit search ended as '{0}'; its records are missing." -f $q.status); return $null }
     if ($q.isRecordCountLimitExceeded) { Write-Warning 'An audit search hit the service record limit; the oldest or newest records in that window may be missing. Use a shorter -AiDays.' }
-    $records = New-Object 'System.Collections.Generic.List[object]'
-    $uri = "$base/records?`$top=1000"
-    do {
-        try { $r = Invoke-Graph -Uri $uri } catch { throw "Reading the records of an audit search failed: $($_.Exception.Message)" }
-        foreach ($v in $r.value) { $records.Add($v) }
-        $uri = $r.'@odata.nextLink'
-    } while ($uri)
+    try { $records = @(Get-GraphAll -Uri "$base/records?`$top=1000") } catch { throw "Reading the records of an audit search failed: $($_.Exception.Message)" }
     try { Invoke-Graph -Method DELETE -Uri $base | Out-Null } catch { Write-Verbose $_.Exception.Message }   # tidy up the saved search when the service allows it
-    $records.ToArray()
+    $records
 }
 
 # Agent activity records for the last -Days days: Copilot and agent interactions, agent responses and the Agent 365 operations.
@@ -4778,7 +4764,8 @@ function Limit-Text {
 function Get-ConnectorLabel {
     param([string]$Id, [string]$Name)
     $raw = if ($Id -match '/apis/([^/]+)') { $Matches[1] } else { $Name }
-    $raw = [regex]::Replace([string]$raw, '-(2d|5f|2e|20)', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    # The operator rather than [regex]::Replace, which turns the script block into a delegate on every call (most of a record's cost).
+    $raw = [string]$raw -creplace '-(2d|5f|2e|20)', { [string][char][Convert]::ToInt32($_.Groups[1].Value, 16) }
     $raw = $raw -replace '^shared_', '' -replace '_[0-9a-fA-F]{16,}$', ''
     if ($raw) { $raw } else { $Name }
 }
@@ -4804,11 +4791,12 @@ function ConvertTo-AiActivity {
     param([object]$Record)
     $a = $Record.auditData
     $cd = $a.CopilotEventData
-    $resources = @($cd.AccessedResources | Where-Object { $_ })
+    $resources = @(foreach ($res in $cd.AccessedResources) { if ($res) { $res } })
     $signals = [System.Collections.Generic.List[object]]::new()
-    $tools = [System.Collections.Generic.List[string]]::new()
-    $files = [System.Collections.Generic.List[string]]::new()
-    $web = [System.Collections.Generic.List[string]]::new()
+    # Each list keeps the first-seen order and its set drops repeats.
+    $tools = [System.Collections.Generic.List[string]]::new(); $toolSet = [System.Collections.Generic.HashSet[string]]::new()
+    $files = [System.Collections.Generic.List[string]]::new(); $fileSet = [System.Collections.Generic.HashSet[string]]::new()
+    $web = [System.Collections.Generic.List[string]]::new(); $webSet = [System.Collections.Generic.HashSet[string]]::new()
     $search = $false
     foreach ($res in $resources) {
         switch ($res.Type) {
@@ -4817,7 +4805,7 @@ function ConvertTo-AiActivity {
             'SecurityWebhook' {
                 $why = [string]$res.Action
                 $tool = if ($why -match 'Evaluated tool name: ([^,]+)') { $Matches[1] } else { '' }
-                if ($tool) { $tools.Add("$tool ($($res.Name))") }
+                if ($tool) { $label = "$tool ($($res.Name))"; if ($toolSet.Add($label)) { $tools.Add($label) } }
                 if ($res.Name -eq 'Block') {
                     $rule = if ($why -match 'blocked by "([^"]+)"') { $Matches[1] } else { 'runtime protection' }
                     $signals.Add(@{ Name = 'Runtime protection blocked'; Risk = 'High'; Detail = "$rule on $tool" })
@@ -4828,16 +4816,16 @@ function ConvertTo-AiActivity {
             }
         }
         switch (Get-AiResourceKind $res) {
-            'Connector' { $tools.Add((Get-ConnectorLabel -Id $res.Id -Name $res.Name)) }
-            'File'      { $files.Add([string]$res.Name) }
-            'Web'       { $web.Add($(if ($res.Name) { [string]$res.Name } else { [string]$res.SiteUrl })) }
+            'Connector' { $label = Get-ConnectorLabel -Id $res.Id -Name $res.Name; if ($toolSet.Add($label)) { $tools.Add($label) } }
+            'File'      { $name = [string]$res.Name; if ($fileSet.Add($name)) { $files.Add($name) } }
+            'Web'       { $page = if ($res.Name) { [string]$res.Name } else { [string]$res.SiteUrl }; if ($webSet.Add($page)) { $web.Add($page) } }
             'WebSearch' { $search = $true }
         }
         if ($res.SensitivityLabelId) { $signals.Add(@{ Name = 'Labeled file accessed'; Risk = 'Medium'; Detail = [string]$res.Name }) }
     }
-    $messages = @($cd.Messages | Where-Object { $_ })
     $prompts = 0; $responses = 0; $flagged = $false
-    foreach ($m in $messages) {
+    foreach ($m in $cd.Messages) {
+        if (-not $m) { continue }
         if ($m.isPrompt -eq $true) { $prompts++ } elseif ($m.isPrompt -eq $false) { $responses++ }
         if ($m.JailbreakDetected -eq $true) { $flagged = $true }
     }
@@ -4845,17 +4833,22 @@ function ConvertTo-AiActivity {
     foreach ($s in $signals) { if ($s.Risk -eq 'High') { $high = $true }; if ($s.Name -eq 'Jailbreak attempt') { $jailbreak = $true } }
     if ($flagged -and -not $jailbreak) { $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = '' }); $high = $true }
     $risk = if ($high) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
+    $signalNames = [System.Collections.Generic.List[string]]::new(); $nameSet = [System.Collections.Generic.HashSet[string]]::new()
+    $details = [System.Collections.Generic.List[string]]::new(); $detailSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($s in $signals) {
+        if ($nameSet.Add($s.Name)) { $signalNames.Add($s.Name) }
+        if ($s.Detail) { $line = "$($s.Name): $($s.Detail)"; if ($detailSet.Add($line)) { $details.Add($line) } }
+    }
     $op = [string]$Record.operation
     $kind = if ($op -eq 'CopilotInteraction') { 'Interaction' } elseif ($op -like 'AISpanOutput*') { 'Agent response' } else { $op }
 
-    $uniqueTools = @($tools | Select-Object -Unique); $uniqueFiles = @($files | Select-Object -Unique); $uniqueWeb = @($web | Select-Object -Unique)
     $parts = [System.Collections.Generic.List[string]]::new()
     if ($kind -eq 'Agent response') {
         $parts.Add($(if ($a.ErrorType) { "Reply failed: $($a.ErrorType)" } else { 'Reply sent' }))
     } else {
-        if ($uniqueTools.Count) { $parts.Add('Tools: ' + ((@($uniqueTools | Select-Object -First 4)) -join ', ') + $(if ($uniqueTools.Count -gt 4) { " +$($uniqueTools.Count - 4)" } else { '' })) }
-        if ($uniqueFiles.Count) { $parts.Add("Files: $($uniqueFiles.Count)") }
-        if ($uniqueWeb.Count) { $parts.Add("Web pages: $($uniqueWeb.Count)") }
+        if ($tools.Count) { $parts.Add('Tools: ' + ($tools.GetRange(0, [Math]::Min(4, $tools.Count)) -join ', ') + $(if ($tools.Count -gt 4) { " +$($tools.Count - 4)" } else { '' })) }
+        if ($files.Count) { $parts.Add("Files: $($files.Count)") }
+        if ($web.Count) { $parts.Add("Web pages: $($web.Count)") }
         if ($search) { $parts.Add('Web search') }
         if ($cd.TargetAgentName) { $parts.Add("Handed to $($cd.TargetAgentName)") }
         if (-not $parts.Count) { $parts.Add('Chat turn, no tools or files') }
@@ -4867,16 +4860,16 @@ function ConvertTo-AiActivity {
         App = $(if ($cd.AppHost) { [string]$cd.AppHost } elseif ($a.ChannelName) { [string]$a.ChannelName } else { [string]$a.Workload })
         Kind = $kind; Risk = $risk
         Summary = ($parts -join '; ')
-        Signals = (@($signals | ForEach-Object { $_.Name } | Select-Object -Unique) -join '; ')
-        Detail = (@($signals | ForEach-Object { if ($_.Detail) { "$($_.Name): $($_.Detail)" } } | Select-Object -Unique) -join ' | ')
-        Tools = ($uniqueTools -join '; '); Files = ($uniqueFiles -join '; '); Web = ($uniqueWeb -join '; ')
-        Model = $(if ($mt) { ($mt.ModelProviderName, $mt.ModelName | Where-Object { $_ }) -join ' / ' } else { '' })
+        Signals = ($signalNames -join '; ')
+        Detail = ($details -join ' | ')
+        Tools = ($tools -join '; '); Files = ($files -join '; '); Web = ($web -join '; ')
+        Model = $(if ($mt) { @(foreach ($v in $mt.ModelProviderName, $mt.ModelName) { if ($v) { $v } }) -join ' / ' } else { '' })
         Prompts = $prompts; Responses = $responses
         Conversation = $(if ($cd.ConversationId) { [string]$cd.ConversationId } else { [string]$a.ConversationId })
         RecordId = [string]$Record.id; TitleId = ''; Agent = ''
         Extra = [pscustomobject]@{
             Resources = $resources; Thread = [string]$cd.ThreadId; ClientIp = [string]$(if ($a.ClientIP) { $a.ClientIP } else { $Record.clientIp }); Region = [string]$a.ClientRegion
-            License = [string]$cd.LicenseType; Plugin = (@($cd.AISystemPlugin | Where-Object { $_ } | ForEach-Object { "$($_.Name) $($_.Id)".Trim() }) -join ', ')
+            License = [string]$cd.LicenseType; Plugin = (@(foreach ($p in $cd.AISystemPlugin) { if ($p) { "$($p.Name) $($p.Id)".Trim() } }) -join ', ')
             TargetAgent = [string]$cd.TargetAgentName; Operation = [string]$a.OperationName
             ErrorType = [string]$a.ErrorType; ErrorMessage = [string]$a.ErrorMessage; OutputMessageId = [string]$a.OutputMessageId; Channel = [string]$a.ChannelName
         }
@@ -4976,7 +4969,7 @@ function Get-AiActivitySummary {
             Interactions = $rows.Count - $responses; Responses = $responses; Users = $users.Count; LastActivity = $last
             High = $high; Medium = $med; Risk = $(if ($high) { 'High' } elseif ($med) { 'Medium' } else { 'None' }); TopSignals = $top
         }
-    } | Sort-Object @{ e = { switch ($_.Risk) { 'High' { 0 } 'Medium' { 1 } default { 2 } } } }, @{ e = 'High'; Descending = $true }, @{ e = 'Interactions'; Descending = $true }
+    } | Sort-Object @{ e = { -(Get-SevRank $_.Risk) } }, @{ e = 'High'; Descending = $true }, @{ e = 'Interactions'; Descending = $true }
 }
 
 # Everything the CLI and the GUI need, read once and reused: activity rows (each tied to a catalog agent when possible).
@@ -4988,14 +4981,17 @@ function Get-AiActivityData {
     $records = @(Get-AiActivityRecords -Days $Days -OnWait $OnWait)
     $idx = New-AiAgentIndex -InfoTable $InfoTable
     $names = @{}; foreach ($p in $Packages) { $names[[string]$p.id] = [string]$p.displayName }
-    $rows = @($records | ForEach-Object { ConvertTo-AiActivity $_ })
+    # A record with neither agent id can never be tied to an agent and is shown nowhere, so it is not converted.
+    # The unmapped count is of records that do carry an agent id.
+    $rows = @(foreach ($rec in $records) { if ([string]$rec.auditData.AgentId -or [string]$rec.auditData.PlatformAgentId) { ConvertTo-AiActivity $rec } })
+    $unmapped = 0
     foreach ($r in $rows) {
         $r.TitleId = Resolve-AiActivityAgent -Activity $r -Index $idx
         $r.Agent = if ($r.TitleId -and $names.ContainsKey($r.TitleId)) { $names[$r.TitleId] } else { $r.AgentName }
+        if (-not $r.TitleId -and $r.AgentGuid) { $unmapped++ }
     }
     $script:AiActivityCache = [pscustomobject]@{
-        Days = $Days; At = Get-Date; Activities = $rows; Names = $names
-        Unmapped = @($rows | Where-Object { -not $_.TitleId -and $_.AgentGuid }).Count
+        Days = $Days; At = Get-Date; Activities = $rows; Names = $names; Unmapped = $unmapped
     }
     $script:AiActivityCache
 }
@@ -5090,6 +5086,13 @@ function ConvertTo-CsvRows {
     }
 }
 
+# Save rows as JSON when the path ends in .json, otherwise as CSV with safe cells. AsArray writes a JSON array even for one row.
+function Export-Rows {
+    param([object[]]$Rows, [string]$Path, [int]$Depth = 2, [switch]$AsArray)
+    if ($Path -match '\.json$') { $Rows | ConvertTo-Json -Depth $Depth -AsArray:$AsArray | Set-Content -LiteralPath $Path -Encoding utf8 }
+    else { ConvertTo-CsvRows @($Rows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 }
+}
+
 # Save the per-agent results (and the state each agent had before the run) as CSV or JSON. A run that writes the same file
 # more than once adds to it, so every change the run made stays undoable from one log.
 $script:LogsWritten = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -5103,8 +5106,7 @@ function Export-ActionLog {
         $earlier = if ($json) { @(Get-Content -Raw -LiteralPath $path | ConvertFrom-Json) } else { @(Import-Csv -LiteralPath $path) }
         $all = @($earlier) + $all
     }
-    if ($json) { ConvertTo-Json -InputObject $all -Depth 3 | Set-Content -LiteralPath $path -Encoding utf8 }
-    else { ConvertTo-CsvRows $all | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding utf8 }
+    Export-Rows -Rows $all -Path $path -Depth 3 -AsArray
     [void]$script:LogsWritten.Add($path)
     Write-Host "Result log: $OutFile" -ForegroundColor Cyan
 }
@@ -5167,7 +5169,7 @@ function Invoke-PackageAction {
             Write-Progress -Activity ("{0} agents" -f $verb) -Status ("{0} of {1}" -f $n, $Packages.Count) -PercentComplete (100 * $n / $Packages.Count)
         }
         $rec = [ordered]@{
-            Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = $Action
+            Timestamp = (Get-LogTimestamp); Operator = $who; Action = $Action
             Id = $p.id; DisplayName = $p.displayName; WasBlocked = $p.isBlocked; Result = ''; Identity = ''; Error = ''
         }
         if ($null -ne $p.isBlocked -and [bool]$p.isBlocked -eq $want) {
@@ -5242,8 +5244,9 @@ function Get-DeleteCandidates {
         }
     }
     try {
-        $audit = Invoke-HuntingQuery -Hint 'Audit events unavailable; relying on kit logs.' -Query ('CloudAppEvents | where Timestamp > ago(30d) and ActionType in ("BlockedAgent", "UnblockedAgent")' +
-            ' | extend d = todynamic(RawEventData) | project Timestamp, ActionType, AgentId = tostring(d.AgentId)')
+        $audit = Get-HuntingCached 'blocked' {
+            Invoke-HuntingQuery -Hint 'Audit events unavailable; relying on kit logs.' -Query ('CloudAppEvents | where Timestamp > ago(30d) and ActionType in ("BlockedAgent", "UnblockedAgent")' +
+                ' | extend d = todynamic(RawEventData) | project Timestamp, ActionType, AgentId = tostring(d.AgentId)') }
         foreach ($a in $audit) {
             $events.Add([pscustomobject]@{ Id = [string]$a.AgentId; At = [datetimeoffset]$a.Timestamp; Action = $(if ($a.ActionType -eq 'BlockedAgent') { 'block' } else { 'unblock' }); Source = 'audit' })
         }
@@ -6339,6 +6342,13 @@ function Request-GraphScope {
     Connect-GraphSession -Connect $connect
 }
 
+# The callback a long read reports through: it shows the message, if any, in the note and lets the window repaint. A closure
+# cannot see $script: variables, so it is handed the note and the dispatcher.
+function New-UiPump {
+    param($Note, $Dispatcher)
+    { param($m) if ($m) { $Note.Text = $m }; $Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+}
+
 # Fill the pane under the events with everything known about the highlighted one.
 function Update-AiDetailPane {
     param([System.Windows.Window]$Window)
@@ -6356,8 +6366,7 @@ function Update-AiActivityTab {
             $days = [int]$Window.FindName('AiDaysBox').SelectedItem.Tag
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
             if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { $note.Text = 'Granting audit log read access: finish the sign-in window...'; & $script:ctx.Pump; Request-GraphScope 'AuditLogsQuery.Read.All' }
-            $dispatcher = $script:w.Dispatcher   # a closure cannot see $script: variables, so hand it the dispatcher directly
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $script:w.Dispatcher
             $info = if ($script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
             $null = Get-AiActivityData -Days $days -InfoTable $info -Packages @($script:ctx.Rows | ForEach-Object { $_.Package }) -OnWait $pump -Refresh
         } catch {
@@ -6470,8 +6479,7 @@ function Update-EndpointAiWindow {
         try {
             $days = [int]$Window.FindName('EpDaysBox').SelectedItem.Tag
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
             $Window.Tag = Get-EndpointAiData -Days $days -OnStatus $pump
         } catch {
             $note.Text = 'Could not read endpoint telemetry: ' + $_.Exception.Message
@@ -6567,8 +6575,7 @@ function New-EndpointAiWindow {
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'endpoint-ai.csv'
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Blocked, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
     })
     $d.Add_ContentRendered({ if (-not $script:epWindow.Tag) { Update-EndpointAiWindow -Window $script:epWindow -Load } })
     $d
@@ -6669,8 +6676,7 @@ function Update-CaCheckWindow {
         }
         try {
             $btn.IsEnabled = $false
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
             if (-not (Test-GraphScope 'Policy.Read.All')) { & $pump 'Granting read access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.Read.All' }
             if (-not ((Test-GraphScope 'IdentityRiskyAgent.Read.All') -or (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All'))) { & $pump 'Granting read access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.Read.All' }
             & $pump ("Reading Conditional Access policies and the Entra risk of {0} agent(s)..." -f $targets.Count)
@@ -6761,17 +6767,16 @@ $AgentUsersXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read the report first (-Load). The period, the license filter and the search only
-# change what is shown; all three periods come from the one read.
+# Fill the window from the report it holds, or read the report first (-Load). The report covers every agent, so the ticked agents,
+# the period, the license filter and the search only change what is shown; all three periods come from the one read.
 function Update-AgentUsersWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('AuNote'); $grid = $Window.FindName('AuGrid'); $btn = $Window.FindName('BtnAuLoad'); $summary = $Window.FindName('AuSummary')
     if ($Load) {
         try {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
-            $Window.Tag = Get-AgentUsersReport -Packages $script:auState.Packages -OnlyIds $script:auState.OnlyIds -OnStatus $pump
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
+            $Window.Tag = Get-AgentUsersReport -Packages $script:auState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read the agent interactions: ' + $_.Exception.Message
             return
@@ -6780,8 +6785,9 @@ function Update-AgentUsersWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
     $days = [int]$Window.FindName('AuDaysBox').SelectedItem.Tag
-    $inPeriod = @(Select-AgentUserRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-AgentUserRows -Rows $report.Rows -Days $days -UnlicensedOnly:([bool]$Window.FindName('AuUnlicensed').IsChecked) -Text $Window.FindName('AuSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.Rows -OnlyIds $script:auState.OnlyIds)
+    $inPeriod = @(Select-AgentUserRows -Rows $rows -Days $days)
+    $shown = @(Select-AgentUserRows -Rows $rows -Days $days -UnlicensedOnly:([bool]$Window.FindName('AuUnlicensed').IsChecked) -Text $Window.FindName('AuSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-AgentUserSummary $inPeriod
     $summary.Text = ("Last {0} days: {1} user(s) with {2} agent(s), {3} interaction(s). {4} user(s) have no Agent 365 or E7 license.{5}" -f $days, $s.Users, $s.Agents, $s.Interactions, $s.Unlicensed,
@@ -6809,8 +6815,7 @@ function New-AgentUsersWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object Agent, User, Upn, Kind, @{ n = 'Interactions'; e = { $_.Interactions } }, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } },
                                         Last, Licensed, License, LicenseDetail)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
     })
     $d.Add_ContentRendered({ if (-not $script:auWindow.Tag) { Update-AgentUsersWindow -Window $script:auWindow -Load } })
     $d
@@ -6884,17 +6889,16 @@ $PolicyHitsXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read the report first (-Load). The period, the unattributed switch and the search only
-# change what is shown; all three periods come from the one read.
+# Fill the window from the report it holds, or read the report first (-Load). The report covers every agent, so the ticked agents,
+# the period, the unattributed switch and the search only change what is shown; all three periods come from the one read.
 function Update-PolicyHitsWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('PhNote'); $grid = $Window.FindName('PhGrid'); $btn = $Window.FindName('BtnPhLoad'); $summary = $Window.FindName('PhSummary'); $detail = $Window.FindName('PhDetailGrid')
     if ($Load) {
         try {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
-            $Window.Tag = Get-AgentPolicyHitsReport -Packages $script:phState.Packages -OnlyIds $script:phState.OnlyIds -OnStatus $pump
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
+            $Window.Tag = Get-AgentPolicyHitsReport -Packages $script:phState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read the policy hits: ' + $_.Exception.Message
             return
@@ -6903,8 +6907,9 @@ function Update-PolicyHitsWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $detail.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
     $days = [int]$Window.FindName('PhDaysBox').SelectedItem.Tag
-    $inPeriod = @(Select-PolicyHitRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-PolicyHitRows -Rows $report.Rows -Days $days -AttributedOnly:(-not [bool]$Window.FindName('PhAll').IsChecked) -Text $Window.FindName('PhSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.AllRows -OnlyIds $script:phState.OnlyIds)
+    $inPeriod = @(Select-PolicyHitRows -Rows $rows -Days $days)
+    $shown = @(Select-PolicyHitRows -Rows $rows -Days $days -AttributedOnly:(-not [bool]$Window.FindName('PhAll').IsChecked) -Text $Window.FindName('PhSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-PolicyHitSummary $inPeriod
     $tenant = Get-PolicyHitSummary @(Select-PolicyHitRows -Rows $report.AllRows -Days $days)
@@ -6951,8 +6956,7 @@ function New-PolicyHitsWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object Agent, Source, Policy, Rule, @{ n = 'WhatItDid'; e = { $_.Did } }, Actions, Severity, Where, Item, ItemPath, User, @{ n = 'ApplicationId'; e = { $_.App } }, @{ n = 'TiedBy'; e = { $_.Tied } },
                                         Hits, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } }, Last, Link)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
     })
     $d.Add_ContentRendered({ if (-not $script:phWindow.Tag) { Update-PolicyHitsWindow -Window $script:phWindow -Load } })
     $d
@@ -7050,8 +7054,7 @@ function Update-AgentAlertsWindow {
     if ($Load) {
         try {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            $dispatcher = $Window.Dispatcher
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
             $Window.Tag = @(Get-AgentDefenderAlerts -Packages $script:aaState.Packages -OnStatus $pump)
         } catch {
             $note.Text = 'Could not read the alerts: ' + $_.Exception.Message
@@ -7112,8 +7115,7 @@ function New-AgentAlertsWindow {
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'defender-alerts-on-agents.csv'
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object @{ n = 'Raised'; e = { $_.Time } }, Agent, @{ n = 'Alert'; e = { $_.Title } }, Severity, Category, Source, @{ n = 'TiedBy'; e = { $_.Via } }, InInventory, AlertId, Link)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
     })
     $d.Add_ContentRendered({ if ($null -eq $script:aaWindow.Tag) { Update-AgentAlertsWindow -Window $script:aaWindow -Load } })
     $d
@@ -7200,19 +7202,20 @@ $McpAccessXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read it first (-Load). The period, the filter and the search only change what is shown.
+# Fill the window from the report it holds, or read it first (-Load). The report covers every agent, so the ticked agents, the
+# period, the filter and the search only change what is shown. With agents ticked, applications and blueprints that are not
+# catalog agents carry no agent id and drop out, as they do from a report read for those agents.
 function Update-McpAccessWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('McNote'); $grid = $Window.FindName('McGrid'); $btn = $Window.FindName('BtnMcLoad'); $summary = $Window.FindName('McSummary'); $detail = $Window.FindName('McDetailGrid')
     if ($Load) {
         try {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
             foreach ($s in 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'Policy.Read.All') {
                 if (-not (Test-GraphScope $s)) { & $pump "Granting $s`: finish the sign-in window..."; Request-GraphScope $s }
             }
-            $Window.Tag = Get-McpAccessReport -Packages $script:mcpState.Packages -OnlyIds $script:mcpState.OnlyIds -OnStatus $pump
+            $Window.Tag = Get-McpAccessReport -Packages $script:mcpState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read MCP access: ' + $_.Exception.Message
             return
@@ -7221,8 +7224,9 @@ function Update-McpAccessWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $detail.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; Update-McpButtons -Window $Window; return }
     $days = [int]$Window.FindName('McDaysBox').SelectedItem.Tag
-    $all = @(Select-McpAccessRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-McpAccessRows -Rows $report.Rows -Days $days -Show ([string]$Window.FindName('McShowBox').SelectedItem.Tag) -Text $Window.FindName('McSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.Rows -OnlyIds $script:mcpState.OnlyIds)
+    $all = @(Select-McpAccessRows -Rows $rows -Days $days)
+    $shown = @(Select-McpAccessRows -Rows $rows -Days $days -Show ([string]$Window.FindName('McShowBox').SelectedItem.Tag) -Text $Window.FindName('McSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-McpAccessSummary -Rows $all -Days $days
     $scope = if ($script:mcpState.OnlyIds.Count) { "the $($script:mcpState.OnlyIds.Count) ticked agent(s)" } else { 'all agents' }
@@ -7347,8 +7351,7 @@ function New-McpAccessWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object Agent, AgentId, Kind, Platform, Server, @{ n = 'EntraApplication'; e = { $_.ResourceAppId } }, Permission, @{ n = 'PermissionDetail'; e = { $_.PermParts -join ' | ' } },
             @{ n = 'SetUp'; e = { $_.Declared } }, Calls, Calls7, Calls14, Calls30, Connects, Errors, LastCall, Tools, Via, Block, BlockText, BlockPolicies, @{ n = 'CannotBlockBecause'; e = { $_.CanBlock } }, Note)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
     })
     $d.Add_ContentRendered({ if (-not $script:mcWindow.Tag) { Update-McpAccessWindow -Window $script:mcWindow -Load } })
     $d
@@ -8840,11 +8843,9 @@ function New-HuntingWindow {
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'
         $dlg.FileName = (([string]$script:huWindow.FindName('HuTitle').Text).ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-') + '.csv'
         if (-not $dlg.ShowDialog()) { return }
-        if ($dlg.FileName -match '\.json$') { $res.Rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else {
-            ConvertTo-CsvRows @(foreach ($dr in $res.Table.Rows) { $o = [ordered]@{}; foreach ($c in $res.Columns) { $o[$c] = $dr[$c] }; [pscustomobject]$o }) |
-                Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8
-        }
+        # JSON keeps the nested values of the hunting rows; CSV takes the flat table.
+        $rows = if ($dlg.FileName -match '\.json$') { $res.Rows } else { foreach ($dr in $res.Table.Rows) { $o = [ordered]@{}; foreach ($c in $res.Columns) { $o[$c] = $dr[$c] }; [pscustomobject]$o } }
+        Export-Rows -Rows $rows -Path $dlg.FileName -Depth 8
     })
     $d
 }
@@ -8930,8 +8931,7 @@ function Update-PurviewAuditWindow {
     if ($Load) {
         try {
             $btn.IsEnabled = $false
-            $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
-            $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
+            $pump = New-UiPump -Note $note -Dispatcher $Window.Dispatcher
             if (-not (Test-GraphScope 'AuditLogsQuery.Read.All')) { & $pump 'Granting audit log read access: finish the sign-in window...'; Request-GraphScope 'AuditLogsQuery.Read.All' }
             & $pump ("Searching the Purview audit log for the last {0} day(s). This takes a few minutes..." -f $days)
             $info = if ($script:ctx -and $script:ctx.InfoTable) { $script:ctx.InfoTable } else { Get-AgentInfoTable }
@@ -8996,8 +8996,7 @@ function New-PurviewAuditWindow {
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'purview-ai-activity.csv'
         if (-not $dlg.ShowDialog()) { return }
         $out = @($acts | Select-Object Time, Agent, User, App, Kind, Risk, Summary, Signals, Detail, Tools, Files, Web, Model, Conversation, RecordId)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName -Depth 4
     })
     $d
 }
@@ -9022,7 +9021,8 @@ function Invoke-AlertResponse {
 # Console shell: navigation on the left grouped like the Agent 365 portal, one page at a time on the right. All agents is the
 # console's own grid and Home is drawn here; every other page is the content of one of the feature windows above, moved into the
 # shell. The window object stays alive unseen, so its named elements, its Tag (the data it read) and its update functions work
-# unchanged. A page reads its data the first time it opens, and again when the agents ticked on All agents have changed.
+# unchanged. A page reads its data the first time it opens. When the agents ticked on All agents have changed, a page that read
+# data for every agent filters it again, and any other page reads again.
 # ---------------------------------------------------------------------------------------------
 
 # The agents ticked on All agents (catalog ids), and every catalog package, as the pages read them.
@@ -9051,9 +9051,11 @@ function Initialize-Shell {
     & $page 'agents' 'NavAgents' $script:w.FindName('PageAgents') $null $null
     & $page 'shadow' 'NavShadow' $null { Mount-ShellPage 'shadow' (New-EndpointAiWindow) } { Update-EndpointAiWindow -Window $script:epWindow -Load }
     & $page 'tools' 'NavTools' $null { Mount-ShellPage 'tools' (New-McpAccessWindow -Packages @(Get-ShellPackages)) } {
-        $script:mcpState.Packages = @(Get-ShellPackages); $script:mcpState.OnlyIds = @(Get-ShellTicked); Update-McpAccessWindow -Window $script:mcWindow -Load } -Scoped $true
+        param($Reload)
+        $script:mcpState.Packages = @(Get-ShellPackages); $script:mcpState.OnlyIds = @(Get-ShellTicked); Update-McpAccessWindow -Window $script:mcWindow -Load:($Reload -or -not $script:mcWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'users' 'NavUsers' $null { Mount-ShellPage 'users' (New-AgentUsersWindow -Packages @(Get-ShellPackages)) } {
-        $script:auState.Packages = @(Get-ShellPackages); $script:auState.OnlyIds = @(Get-ShellTicked); Update-AgentUsersWindow -Window $script:auWindow -Load } -Scoped $true
+        param($Reload)
+        $script:auState.Packages = @(Get-ShellPackages); $script:auState.OnlyIds = @(Get-ShellTicked); Update-AgentUsersWindow -Window $script:auWindow -Load:($Reload -or -not $script:auWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'alerts' 'NavAlerts' $null { Mount-ShellPage 'alerts' (New-AgentAlertsWindow -Packages @(Get-ShellPackages)) } {
         param($Reload)
         $script:aaState.Packages = @(Get-ShellPackages); $script:aaState.OnlyIds = @(Get-ShellTicked); Update-AgentAlertsWindow -Window $script:aaWindow -Load:$Reload } -Scoped $true -FilterOnly $true
@@ -9061,7 +9063,8 @@ function Initialize-Shell {
     & $page 'purview' 'NavPurview' $null { Mount-ShellPage 'purview' (New-PurviewAuditWindow -Packages @(Get-ShellPackages)) } {
         $script:paState.Packages = @(Get-ShellPackages); $script:paState.OnlyIds = @(Get-ShellTicked); Update-PurviewAuditWindow -Window $script:paWindow } -Scoped $true -FilterOnly $true
     & $page 'hits' 'NavHits' $null { Mount-ShellPage 'hits' (New-PolicyHitsWindow -Packages @(Get-ShellPackages)) } {
-        $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load } -Scoped $true
+        param($Reload)
+        $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load:($Reload -or -not $script:phWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'ca' 'NavCa' $null { Mount-ShellPage 'ca' (New-CaCheckWindow) } {
         $script:caState = @{ Packages = @(Get-ShellPackages); OnlyIds = @(Get-ShellTicked) }; Update-CaCheckWindow -Window $script:caWindow -Load } -Scoped $true
 
@@ -9102,8 +9105,12 @@ function Show-ShellPage {
     $p.Loaded = $true; $p.Scope = $scope
 }
 
-# After the catalog is read again, every page that read data reads it again when it next opens.
-function Reset-ShellPages { if ($script:shell) { foreach ($p in $script:shell.Pages.Values) { if ($p.Load -and -not $p.Always) { $p.Loaded = $false } } } }
+# After the catalog is read again, every page that read data reads it again when it next opens, and so do the filters that
+# use cached hunting results.
+function Reset-ShellPages {
+    $script:HuntingCache = @{}
+    if ($script:shell) { foreach ($p in $script:shell.Pages.Values) { if ($p.Load -and -not $p.Always) { $p.Loaded = $false } } }
+}
 
 # A Home card opens its page, set up for what the card counts.
 function Invoke-ShellCard {
@@ -9137,11 +9144,11 @@ function Update-ShellHome {
         & $set 'HomeCa' @($c | Where-Object { $_.Kind -ne 'Protected' }).Count (('{0} report-only, {1} unprotected, of {2} agent(s) with an identity.' -f @($c | Where-Object { $_.Kind -eq 'Report-only' }).Count, @($c | Where-Object { $_.Kind -eq 'Unprotected' }).Count, $c.Count) + (& $scopeOf $script:caState))
     } else { & $set 'HomeCa' '-' 'Not checked yet. Select to open Conditional Access.' }
     if ($script:mcWindow -and $script:mcWindow.Tag) {
-        $s = Get-McpAccessSummary -Rows @($script:mcWindow.Tag.Rows) -Days 30
+        $s = Get-McpAccessSummary -Rows @(Select-ChosenAgentRows -Rows $script:mcWindow.Tag.Rows -OnlyIds $script:mcpState.OnlyIds) -Days 30
         & $set 'HomeMcp' $s.Unused (('Of {0} agent and server permission(s), no call in 30 days.' -f $s.Granted) + (& $scopeOf $script:mcpState))
     } else { & $set 'HomeMcp' '-' 'Not read yet. Select to open Tools.' }
     if ($script:auWindow -and $script:auWindow.Tag) {
-        $s = Get-AgentUserSummary @(Select-AgentUserRows -Rows $script:auWindow.Tag.Rows -Days 30)
+        $s = Get-AgentUserSummary @(Select-AgentUserRows -Rows @(Select-ChosenAgentRows -Rows $script:auWindow.Tag.Rows -OnlyIds $script:auState.OnlyIds) -Days 30)
         & $set 'HomeUsers' $s.Unlicensed (('Of {0} user(s) who used an agent in 30 days.' -f $s.Users) + (& $scopeOf $script:auState))
     } else { & $set 'HomeUsers' '-' 'Not read yet. Select to open Users.' }
 }
@@ -9916,8 +9923,7 @@ function New-ConsoleWindow {
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
         if (-not $dlg.ShowDialog()) { return }
         $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, Availability, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
-        if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        Export-Rows -Rows $out -Path $dlg.FileName
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
     })
 
@@ -10056,7 +10062,7 @@ switch ($PSCmdlet.ParameterSetName) {
         if ($tied.Count) {
             Write-Host "`nBy agent:" -ForegroundColor Cyan
             Get-PolicyHitsByAgent $tied | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'DLP matches'; e = { $_.DlpMatches } }, @{ n = 'DLP alerts'; e = { $_.DlpAlerts } }, @{ n = 'Insider Risk alerts'; e = { $_.InsiderRisk } },
-                @{ n = 'policies'; e = { $_.Policies } }, @{ n = 'last'; e = { if ($_.Last) { $_.Last.ToString('yyyy-MM-dd HH:mm') } } } | Format-Table -AutoSize -Wrap | Out-Host
+                @{ n = 'policies'; e = { $_.Policies } }, @{ n = 'last'; e = { Format-When $_.Last } } | Format-Table -AutoSize -Wrap | Out-Host
             Write-Host "`nWhat fired:" -ForegroundColor Cyan
             foreach ($g in @($tied | Group-Object AgentId)) {
                 Write-Host @($g.Group)[0].Agent -ForegroundColor White
