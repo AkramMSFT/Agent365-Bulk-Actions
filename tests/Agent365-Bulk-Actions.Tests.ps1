@@ -479,17 +479,6 @@ Describe 'Permission and risk helpers' {
         Test-PermissionMatch -Perms $script:perms -Mode 'mcp' | Should -BeTrue
         Test-PermissionMatch -Perms @($script:perms[0], $script:perms[1]) -Mode 'mcp' | Should -BeFalse
     }
-    It 'combines identity and blueprint permissions and looks the blueprint up once' {
-        $script:script_bpCalls = 0
-        $script:BlueprintPermCache = @{}
-        Mock Get-IdentityPermissions { param($ServicePrincipalId, $Source) @([pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = 'R'; Permission = "p-$ServicePrincipalId"; Consent = 'x' }) }
-        Mock Invoke-Graph { $script:script_bpCalls++; [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-sp'; displayName = 'BP' }) } }
-        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
-        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
-        $first.Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
-        $second.Count | Should -Be 2
-        $script:script_bpCalls | Should -Be 1
-    }
     It 'finds an agent''s risk entry by any of its identifiers' {
         Mock Get-RiskCached { @{ 't_abc' = [pscustomobject]@{ Severity = 'High'; AlertCount = 2; DetectionCount = 1 } } }
         (Get-AgentRisk (New-Pkg 'T_ABC' 'x')).Severity | Should -Be 'High'
@@ -613,6 +602,24 @@ Describe 'Bulk prefetch caches' {
         (Get-ManagerInfo $script:g1).Upn | Should -Be 'boss@contoso.com'
         Get-ManagerInfo $script:g3 | Should -BeNullOrEmpty
     }
+    It 'looks service principals up by app id in one batch, for GUIDs only' {
+        Mock Invoke-GraphBatch {
+            $script:asked = @($Requests); $script:askedVersion = $Version
+            @{ $script:g1 = [pscustomobject]@{ Status = 200; Body = @{ value = @(@{ id = 'sp1'; displayName = 'One' }) } }
+               $script:g2 = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @() } }
+               $script:g3 = [pscustomobject]@{ Status = 403; Body = $null } }
+        }
+        $m = Get-ServicePrincipalsByAppId -AppIds @($script:g1, $script:g2, $script:g3, "x' or 1 eq 1", $script:g1) -Select 'id,displayName' -Version beta
+        $script:asked.Count | Should -Be 3
+        $script:asked[0].url | Should -Be "/servicePrincipals?`$filter=appId eq '$($script:g1)'&`$select=id,displayName"
+        $script:askedVersion | Should -Be 'beta'
+        $m.Count | Should -Be 1
+        $m[$script:g1].displayName | Should -Be 'One'
+    }
+    It 'makes no call when no app id is a GUID' {
+        Mock Invoke-GraphBatch { throw 'no call expected' }
+        (Get-ServicePrincipalsByAppId -AppIds @('', 'not-a-guid')).Count | Should -Be 0
+    }
 }
 
 Describe 'Get-Packages paging' {
@@ -632,6 +639,93 @@ Describe 'Get-Packages paging' {
         $sw.Elapsed.TotalSeconds | Should -BeLessThan 20
         $script:page = 0
         @(Get-Packages -AgentsOnly).Count | Should -Be 12000
+    }
+}
+
+Describe 'Get-GraphAll' {
+    It 'follows nextLink to the last page and returns every item' {
+        Mock Invoke-Graph {
+            if ($Uri -like '*page2') { @{ value = @(@{ id = 'c' }) } }
+            else { @{ value = @(@{ id = 'a' }, @{ id = 'b' }); '@odata.nextLink' = 'https://graph.microsoft.com/v1.0/x?page2' } }
+        }
+        @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/x' | ForEach-Object { $_.id }) | Should -Be @('a', 'b', 'c')
+        Should -Invoke Invoke-Graph -Times 2
+    }
+    It 'returns nothing for an empty list or a page without values' {
+        Mock Invoke-Graph { @{ value = @() } }
+        @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/x').Count | Should -Be 0
+        Mock Invoke-Graph { @{} }
+        @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/x').Count | Should -Be 0
+    }
+    It 'passes a failed page on to the caller' {
+        Mock Invoke-Graph { throw 'Forbidden' }
+        { Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/x' } | Should -Throw '*Forbidden*'
+    }
+}
+
+Describe 'Shared formatting' {
+    It 'formats a time to the minute, and no time as an empty string' {
+        Format-When ([datetime]'2026-10-28 14:05:59') | Should -Be '2026-10-28 14:05'
+        Format-When '2026-10-28T14:05:00' | Should -Be '2026-10-28 14:05'
+        Format-When $null | Should -Be ''
+        Format-When '' | Should -Be ''
+    }
+    It 'stamps log records in UTC round-trip form' {
+        $t = Get-LogTimestamp
+        $t | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$'
+        [datetime]::Parse($t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).Kind | Should -Be 'Utc'
+    }
+    It 'ranks severities the same way for endpoint tools and AI activity, worst first' {
+        # The Medium reason (a high CVE) is found before the High one (an AI alert), so only the sort puts High first.
+        $e = [pscustomobject]@{ Flag = ''; Listeners = @(); Software = @([pscustomobject]@{ Name = 'n'; Version = '1'; Critical = 0; High = 2 })
+            Alerts = @([pscustomobject]@{ AiRelated = $true; Near = $true; Severity = 'High'; Title = 't' }); LocalMcps = @(); RemoteMcps = @(); Files = @(); AssetValue = ''; ExposureLevel = '' }
+        $reasons = (Get-EndpointAiRisk ([pscustomobject]@{ AutoApprove = ''; Trusted = ''; Status = 'Unsanctioned'; Evidence = $e })).Reasons
+        @($reasons | ForEach-Object { $_.Level }) | Should -Be @('High', 'Medium', 'Low')
+        $rows = @('None', 'Medium', 'High' | ForEach-Object { [pscustomobject]@{ TitleId = "t_$_"; Kind = 'Interaction'; Risk = $_; Signals = ''; User = 'a'; Time = [datetime]'2026-09-01'; AgentName = $_ } })
+        @(Get-AiActivitySummary -Activities $rows | ForEach-Object { $_.Risk }) | Should -Be @('High', 'Medium', 'None')
+    }
+}
+
+Describe 'Window helpers' {
+    It 'shows a message in the note and lets the window repaint' {
+        Add-Type -AssemblyName WindowsBase
+        $dispatcher = [pscustomobject]@{ Calls = [System.Collections.Generic.List[object]]::new() }
+        $dispatcher | Add-Member -MemberType ScriptMethod -Name Invoke -Value { param($Action, $Priority) $this.Calls.Add($Priority) }
+        $note = [pscustomobject]@{ Text = 'before' }
+        $pump = New-UiPump -Note $note -Dispatcher $dispatcher
+        & $pump 'Reading...'
+        & $pump $null
+        $note.Text | Should -Be 'Reading...'
+        $dispatcher.Calls.Count | Should -Be 2
+        $dispatcher.Calls[0] | Should -Be ([Windows.Threading.DispatcherPriority]::Background)
+    }
+}
+
+Describe 'Export-Rows' {
+    It 'saves CSV with safe cells, or JSON when the name ends in .json' {
+        $rows = @([pscustomobject]@{ Name = '=cmd'; N = 1 }, [pscustomobject]@{ Name = 'b'; N = 2 })
+        $csv = Join-Path $TestDrive 'rows.csv'; $json = Join-Path $TestDrive 'rows.JSON'
+        Export-Rows -Rows $rows -Path $csv
+        @(Import-Csv $csv)[0].Name | Should -Be "'=cmd"
+        Export-Rows -Rows $rows -Path $json
+        $back = @(Get-Content -Raw $json | ConvertFrom-Json)
+        $back.Count | Should -Be 2
+        $back[0].Name | Should -Be '=cmd'
+    }
+    It 'writes one row as an object, or as an array with -AsArray, to the depth asked' {
+        $row = [pscustomobject]@{ A = [pscustomobject]@{ B = [pscustomobject]@{ C = 1 } } }
+        $p = Join-Path $TestDrive 'one.json'
+        Export-Rows -Rows @($row) -Path $p -Depth 3
+        (Get-Content -Raw $p).TrimStart() | Should -Match '^\{'
+        Export-Rows -Rows @($row) -Path $p -Depth 3 -AsArray
+        (Get-Content -Raw $p).TrimStart() | Should -Match '^\['
+        @(Get-Content -Raw $p | ConvertFrom-Json)[0].A.B.C | Should -Be 1
+    }
+    It 'writes the same log file as before: an array at depth 3' {
+        $records = @([pscustomobject]@{ Action = 'block'; Id = 'T_1'; Result = 'Done'; Detail = [pscustomobject]@{ Was = [pscustomobject]@{ State = 'x' } } })
+        $p = Join-Path $TestDrive 'log.json'
+        Export-Rows -Rows $records -Path $p -Depth 3 -AsArray
+        Get-Content -Raw $p | Should -Be ((ConvertTo-Json -InputObject $records -Depth 3) + [Environment]::NewLine)
     }
 }
 
@@ -662,6 +756,49 @@ Describe 'Bulk permission, detail and identity-state reads' {
         $got['k7'][0].Permission | Should -Be 'Runtime.All'
         # 1 blueprint lookup + 2 per identity + 2 for the blueprint SP + 1 resource lookup
         $script:batchRequests | Should -Be (1 + 60 + 2 + 1)
+    }
+    It 'combines identity and blueprint permissions and looks the blueprint up once across calls' {
+        $script:bpLookups = 0
+        Mock Invoke-GraphBatch {
+            $h = @{}
+            foreach ($r in $Requests) {
+                # Graph bodies are hashtables, so a list holding one principal must not be read as the principal itself.
+                if ($r.url.StartsWith('/servicePrincipals?')) { $script:bpLookups++; $h[$r.id] = [pscustomobject]@{ Status = 200; Body = @{ value = @(@{ id = 'bp-sp' }) } } }
+                elseif ($r.id -like 'g:*') { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ resourceId = 'res1'; scope = 'p-' + $r.id.Substring(2); consentType = 'x' }) } } }
+                elseif ($r.id -like 'r:*') { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @() } } }
+                else { $h[$r.id] = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ displayName = 'R'; appRoles = @() } } }
+            }
+            $h
+        }
+        $bp = 'b0000000-0000-0000-0000-0000000000b1'; $id1 = '00000000-0000-0000-0000-000000000001'; $id2 = '00000000-0000-0000-0000-000000000002'
+        $first = @((Get-PermissionsBulk -Items @(@{ Key = 'a'; ServicePrincipalId = $id1; BlueprintAppId = $bp }))['a'])
+        $second = @((Get-PermissionsBulk -Items @(@{ Key = 'b'; ServicePrincipalId = $id2; BlueprintAppId = $bp }))['b'])
+        $first.Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
+        $first.Permission | Should -Be @("p-$id1", 'p-bp-sp')
+        $second.Permission | Should -Be @("p-$id2", 'p-bp-sp')
+        $script:bpLookups | Should -Be 1
+    }
+    It 'reads nothing for an identity that is not a GUID' {
+        Mock Invoke-GraphBatch { throw 'no call expected' }
+        (Get-PermissionsBulk -Items @(@{ Key = 'a'; ServicePrincipalId = "x' or 1 eq 1"; BlueprintAppId = '' })).Count | Should -Be 0
+    }
+    It 'gives the detail view one agent''s permissions from the bulk reader, and none when it fails' {
+        $script:idA = '00000000-0000-0000-0000-00000000000a'; $script:bpA = 'b0000000-0000-0000-0000-0000000000b1'
+        Mock Invoke-Graph {
+            if ($Uri -like '*/sponsors*') { @{ value = @() } }
+            elseif ($Uri -like '*microsoft.graph.agentIdentity?*') { @{ id = $script:idA; accountEnabled = $true; agentIdentityBlueprintId = $script:bpA } }
+            else { @{ id = 'T_1'; displayName = 'Alpha'; type = 'shared'; agentIdentityId = $script:idA } }
+        }
+        Mock Get-AgentInfoTable { @{} }
+        Mock Get-UserInfo { [pscustomobject]@{ Exists = $false; Upn = '' } }
+        Mock Get-IdentityOwners { }
+        Mock Get-AgentRisk { $null }
+        Mock Get-PermissionsBulk { @{ agent = @([pscustomobject]@{ Source = 'Agent identity'; Kind = 'Delegated'; Resource = 'R'; Permission = 'p'; Consent = 'x' }) } }
+        $d = Get-AgentDetail (New-Pkg 'T_1' 'Alpha')
+        @($d.Permissions).Count | Should -Be 1
+        Should -Invoke Get-PermissionsBulk -Times 1 -ParameterFilter { @($Items).Count -eq 1 -and $Items[0].ServicePrincipalId -eq $script:idA -and $Items[0].BlueprintAppId -eq $script:bpA }
+        Mock Get-PermissionsBulk { throw 'batch failed' }
+        @((Get-AgentDetail (New-Pkg 'T_1' 'Alpha')).Permissions).Count | Should -Be 0
     }
     It 'maps package details and identity states by id' {
         Mock Invoke-GraphBatch {
