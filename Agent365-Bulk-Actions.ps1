@@ -1390,6 +1390,7 @@ function ConvertTo-NameList {
     @($Values | ForEach-Object { $_ -split '\s*[,;]\s*' } | Where-Object { $_ })
 }
 # The Advanced Hunting queries. Each one is narrow and summarised on the service so the result stays small.
+# Processes and Network scan their table once and return two summaries, each row naming its set in the Set column.
 function Get-EndpointAiQueries {
     param([int]$Days = 30)
     $procs = ConvertTo-KqlList @($script:EndpointAiCatalog | ForEach-Object { $_.Processes } | Where-Object { $_ } | Get-Distinct)
@@ -1410,41 +1411,45 @@ AgentsInfo
           Account = tostring(m.accountName), Upn = tostring(m.upn), McpServers, DeclaredTools, LocalMcps = m.localMcps
 "@
         Processes = @"
-DeviceProcessEvents
+let events = materialize(DeviceProcessEvents
 | where Timestamp > ago(${Days}d)
+| where FileName in~ ($procs) or ProcessCommandLine has_any ($mcp)
+| project Timestamp, DeviceId, DeviceName, FileName, FolderPath, AccountName, InitiatingProcessFileName, ProcessCommandLine);
+let tools = events
 | where FileName in~ ($procs)
 | summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
             Parents = make_set(InitiatingProcessFileName, 5), ActiveAt = make_set(bin(Timestamp, 10m), 300), Command = take_any(substring(ProcessCommandLine, 0, 400)),
             FlagCommand = take_anyif(substring(ProcessCommandLine, 0, 400), ProcessCommandLine has_any ($flags))
     by DeviceId, DeviceName, FileName, FolderPath
-| top 400 by Runs
-"@
-        Mcp = @"
-DeviceProcessEvents
-| where Timestamp > ago(${Days}d)
+| top 400 by Runs;
+let servers = events
 | where ProcessCommandLine has_any ($mcp)
 | where FileName !in~ ($procs)
 | summarize Runs = count(), FirstSeen = min(Timestamp), LastSeen = max(Timestamp), Accounts = make_set(AccountName, 5),
             Parent = take_any(InitiatingProcessFileName) by DeviceId, DeviceName, FileName, Command = substring(ProcessCommandLine, 0, 300)
-| top 200 by Runs
+| top 200 by Runs;
+union (tools | extend Set = "Processes"), (servers | extend Set = "Mcp")
+| sort by Runs desc
 "@
-        Outbound = @"
-DeviceNetworkEvents
+        Network = @"
+let events = materialize(DeviceNetworkEvents
 | where Timestamp > ago(${Days}d)
+| where InitiatingProcessFileName in~ ($procs) or RemoteUrl has_any ($domains) or LocalPort in ($ports)
+| project Timestamp, ActionType, DeviceId, DeviceName, InitiatingProcessFileName, RemoteUrl, RemoteIP, LocalIP, LocalPort);
+let outbound = events
 | where ActionType != "ListeningConnectionCreated"
 | where InitiatingProcessFileName in~ ($procs) or RemoteUrl has_any ($domains)
 | extend Host = tostring(parse_url(iff(RemoteUrl has "://", RemoteUrl, strcat("https://", RemoteUrl))).Host)
 | extend Host = iff(isempty(Host), RemoteIP, Host)
 | summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, Host
-| top 600 by Hits
-"@
-        Listening = @"
-DeviceNetworkEvents
-| where Timestamp > ago(${Days}d)
+| top 600 by Hits;
+let listening = events
 | where ActionType == "ListeningConnectionCreated"
 | where InitiatingProcessFileName in~ ($procs) or LocalPort in ($ports)
 | summarize Hits = count(), LastSeen = max(Timestamp) by DeviceId, DeviceName, Process = InitiatingProcessFileName, LocalIP, LocalPort
-| top 400 by Hits
+| top 400 by Hits;
+union (outbound | extend Set = "Outbound"), (listening | extend Set = "Listening")
+| sort by Hits desc
 "@
         Files = @"
 DeviceFileEvents
@@ -1717,6 +1722,18 @@ function New-EndpointAiRows {
     @($rows.Values | Sort-Object @{ e = { -$script:RiskOrder[$_.Risk] } }, @{ e = { $_.LastSeen }; Descending = $true }, Tool)
 }
 
+# The rows of a query that unions several result sets, by the set each row names in its Set column. Every named set is
+# returned, empty when no row names it, and rows keep their order within a set.
+function Split-HuntingSets {
+    param([object[]]$Rows, [string[]]$Names)
+    $lists = @{}
+    foreach ($n in $Names) { $lists[$n] = [System.Collections.Generic.List[object]]::new() }
+    foreach ($r in $Rows) { $list = $lists[[string]$r.Set]; if ($null -ne $list) { $list.Add($r) } }
+    $out = @{}
+    foreach ($n in $Names) { $out[$n] = $lists[$n].ToArray() }
+    $out
+}
+
 # Everything for the window and the command: read the data, then build the rows.
 function Get-EndpointAiData {
     param([ValidateRange(1, 30)][int]$Days = 30, [string[]]$Sanctioned = @(), [scriptblock]$OnStatus)
@@ -1724,13 +1741,16 @@ function Get-EndpointAiData {
     $hint = 'Endpoint AI needs Advanced Hunting (ThreatHunting.Read.All) and devices onboarded to Microsoft Defender for Endpoint.'
     $q = Get-EndpointAiQueries -Days $Days
     $data = @{}
-    $steps = [ordered]@{ Agents = 'Defender local agent discovery'; Processes = 'process activity'; Mcp = 'MCP server processes'; Outbound = 'network connections'
-                         Listening = 'listening ports'; Files = 'model and MCP files'; Software = 'installed software'; Vulnerabilities = 'vulnerabilities'; Coverage = 'device coverage' }
+    $steps = [ordered]@{ Agents = 'Defender local agent discovery'; Processes = 'process activity and MCP servers'; Network = 'network connections and listening ports'
+                         Files = 'model and MCP files'; Software = 'installed software'; Vulnerabilities = 'vulnerabilities'; Coverage = 'device coverage' }
+    $sets = @{ Processes = @('Processes', 'Mcp'); Network = @('Outbound', 'Listening') }
     $i = 0
     foreach ($name in $steps.Keys) {
         $i++
         & $say ("Reading {0} ({1} of {2})..." -f $steps[$name], $i, ($steps.Count + 2))
-        $data[$name] = @(Invoke-HuntingQuery -Query $q[$name] -Hint $hint)
+        $result = @(Invoke-HuntingQuery -Query $q[$name] -Hint $hint)
+        if ($sets.ContainsKey($name)) { $split = Split-HuntingSets -Rows $result -Names $sets[$name]; foreach ($set in $split.Keys) { $data[$set] = $split[$set] } }
+        else { $data[$name] = $result }
     }
     $names = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Agents | ForEach-Object { if ($_.DeviceName) { $_.DeviceName } else { $_.Device } }) | Where-Object { $_ } | Get-Distinct)
     $ids = @(@($data.Processes + $data.Outbound + $data.Listening + $data.Software + $data.Files + $data.Mcp + $data.Agents | ForEach-Object { $_.DeviceId }) | Where-Object { $_ } | Get-Distinct)
@@ -4791,7 +4811,8 @@ function Limit-Text {
 function Get-ConnectorLabel {
     param([string]$Id, [string]$Name)
     $raw = if ($Id -match '/apis/([^/]+)') { $Matches[1] } else { $Name }
-    $raw = [regex]::Replace([string]$raw, '-(2d|5f|2e|20)', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    # The operator rather than [regex]::Replace, which turns the script block into a delegate on every call (most of a record's cost).
+    $raw = [string]$raw -creplace '-(2d|5f|2e|20)', { [string][char][Convert]::ToInt32($_.Groups[1].Value, 16) }
     $raw = $raw -replace '^shared_', '' -replace '_[0-9a-fA-F]{16,}$', ''
     if ($raw) { $raw } else { $Name }
 }
@@ -4817,11 +4838,12 @@ function ConvertTo-AiActivity {
     param([object]$Record)
     $a = $Record.auditData
     $cd = $a.CopilotEventData
-    $resources = @($cd.AccessedResources | Where-Object { $_ })
+    $resources = @(foreach ($res in $cd.AccessedResources) { if ($res) { $res } })
     $signals = [System.Collections.Generic.List[object]]::new()
-    $tools = [System.Collections.Generic.List[string]]::new()
-    $files = [System.Collections.Generic.List[string]]::new()
-    $web = [System.Collections.Generic.List[string]]::new()
+    # Each list keeps the first-seen order and its set drops repeats.
+    $tools = [System.Collections.Generic.List[string]]::new(); $toolSet = [System.Collections.Generic.HashSet[string]]::new()
+    $files = [System.Collections.Generic.List[string]]::new(); $fileSet = [System.Collections.Generic.HashSet[string]]::new()
+    $web = [System.Collections.Generic.List[string]]::new(); $webSet = [System.Collections.Generic.HashSet[string]]::new()
     $search = $false
     foreach ($res in $resources) {
         switch ($res.Type) {
@@ -4830,7 +4852,7 @@ function ConvertTo-AiActivity {
             'SecurityWebhook' {
                 $why = [string]$res.Action
                 $tool = if ($why -match 'Evaluated tool name: ([^,]+)') { $Matches[1] } else { '' }
-                if ($tool) { $tools.Add("$tool ($($res.Name))") }
+                if ($tool) { $label = "$tool ($($res.Name))"; if ($toolSet.Add($label)) { $tools.Add($label) } }
                 if ($res.Name -eq 'Block') {
                     $rule = if ($why -match 'blocked by "([^"]+)"') { $Matches[1] } else { 'runtime protection' }
                     $signals.Add(@{ Name = 'Runtime protection blocked'; Risk = 'High'; Detail = "$rule on $tool" })
@@ -4841,16 +4863,16 @@ function ConvertTo-AiActivity {
             }
         }
         switch (Get-AiResourceKind $res) {
-            'Connector' { $tools.Add((Get-ConnectorLabel -Id $res.Id -Name $res.Name)) }
-            'File'      { $files.Add([string]$res.Name) }
-            'Web'       { $web.Add($(if ($res.Name) { [string]$res.Name } else { [string]$res.SiteUrl })) }
+            'Connector' { $label = Get-ConnectorLabel -Id $res.Id -Name $res.Name; if ($toolSet.Add($label)) { $tools.Add($label) } }
+            'File'      { $name = [string]$res.Name; if ($fileSet.Add($name)) { $files.Add($name) } }
+            'Web'       { $page = if ($res.Name) { [string]$res.Name } else { [string]$res.SiteUrl }; if ($webSet.Add($page)) { $web.Add($page) } }
             'WebSearch' { $search = $true }
         }
         if ($res.SensitivityLabelId) { $signals.Add(@{ Name = 'Labeled file accessed'; Risk = 'Medium'; Detail = [string]$res.Name }) }
     }
-    $messages = @($cd.Messages | Where-Object { $_ })
     $prompts = 0; $responses = 0; $flagged = $false
-    foreach ($m in $messages) {
+    foreach ($m in $cd.Messages) {
+        if (-not $m) { continue }
         if ($m.isPrompt -eq $true) { $prompts++ } elseif ($m.isPrompt -eq $false) { $responses++ }
         if ($m.JailbreakDetected -eq $true) { $flagged = $true }
     }
@@ -4858,17 +4880,22 @@ function ConvertTo-AiActivity {
     foreach ($s in $signals) { if ($s.Risk -eq 'High') { $high = $true }; if ($s.Name -eq 'Jailbreak attempt') { $jailbreak = $true } }
     if ($flagged -and -not $jailbreak) { $signals.Add(@{ Name = 'Jailbreak attempt'; Risk = 'High'; Detail = '' }); $high = $true }
     $risk = if ($high) { 'High' } elseif ($signals.Count) { 'Medium' } else { 'None' }
+    $signalNames = [System.Collections.Generic.List[string]]::new(); $nameSet = [System.Collections.Generic.HashSet[string]]::new()
+    $details = [System.Collections.Generic.List[string]]::new(); $detailSet = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($s in $signals) {
+        if ($nameSet.Add($s.Name)) { $signalNames.Add($s.Name) }
+        if ($s.Detail) { $line = "$($s.Name): $($s.Detail)"; if ($detailSet.Add($line)) { $details.Add($line) } }
+    }
     $op = [string]$Record.operation
     $kind = if ($op -eq 'CopilotInteraction') { 'Interaction' } elseif ($op -like 'AISpanOutput*') { 'Agent response' } else { $op }
 
-    $uniqueTools = @($tools | Select-Object -Unique); $uniqueFiles = @($files | Select-Object -Unique); $uniqueWeb = @($web | Select-Object -Unique)
     $parts = [System.Collections.Generic.List[string]]::new()
     if ($kind -eq 'Agent response') {
         $parts.Add($(if ($a.ErrorType) { "Reply failed: $($a.ErrorType)" } else { 'Reply sent' }))
     } else {
-        if ($uniqueTools.Count) { $parts.Add('Tools: ' + ((@($uniqueTools | Select-Object -First 4)) -join ', ') + $(if ($uniqueTools.Count -gt 4) { " +$($uniqueTools.Count - 4)" } else { '' })) }
-        if ($uniqueFiles.Count) { $parts.Add("Files: $($uniqueFiles.Count)") }
-        if ($uniqueWeb.Count) { $parts.Add("Web pages: $($uniqueWeb.Count)") }
+        if ($tools.Count) { $parts.Add('Tools: ' + ($tools.GetRange(0, [Math]::Min(4, $tools.Count)) -join ', ') + $(if ($tools.Count -gt 4) { " +$($tools.Count - 4)" } else { '' })) }
+        if ($files.Count) { $parts.Add("Files: $($files.Count)") }
+        if ($web.Count) { $parts.Add("Web pages: $($web.Count)") }
         if ($search) { $parts.Add('Web search') }
         if ($cd.TargetAgentName) { $parts.Add("Handed to $($cd.TargetAgentName)") }
         if (-not $parts.Count) { $parts.Add('Chat turn, no tools or files') }
@@ -4880,16 +4907,16 @@ function ConvertTo-AiActivity {
         App = $(if ($cd.AppHost) { [string]$cd.AppHost } elseif ($a.ChannelName) { [string]$a.ChannelName } else { [string]$a.Workload })
         Kind = $kind; Risk = $risk
         Summary = ($parts -join '; ')
-        Signals = (@($signals | ForEach-Object { $_.Name } | Select-Object -Unique) -join '; ')
-        Detail = (@($signals | ForEach-Object { if ($_.Detail) { "$($_.Name): $($_.Detail)" } } | Select-Object -Unique) -join ' | ')
-        Tools = ($uniqueTools -join '; '); Files = ($uniqueFiles -join '; '); Web = ($uniqueWeb -join '; ')
-        Model = $(if ($mt) { ($mt.ModelProviderName, $mt.ModelName | Where-Object { $_ }) -join ' / ' } else { '' })
+        Signals = ($signalNames -join '; ')
+        Detail = ($details -join ' | ')
+        Tools = ($tools -join '; '); Files = ($files -join '; '); Web = ($web -join '; ')
+        Model = $(if ($mt) { @(foreach ($v in $mt.ModelProviderName, $mt.ModelName) { if ($v) { $v } }) -join ' / ' } else { '' })
         Prompts = $prompts; Responses = $responses
         Conversation = $(if ($cd.ConversationId) { [string]$cd.ConversationId } else { [string]$a.ConversationId })
         RecordId = [string]$Record.id; TitleId = ''; Agent = ''
         Extra = [pscustomobject]@{
             Resources = $resources; Thread = [string]$cd.ThreadId; ClientIp = [string]$(if ($a.ClientIP) { $a.ClientIP } else { $Record.clientIp }); Region = [string]$a.ClientRegion
-            License = [string]$cd.LicenseType; Plugin = (@($cd.AISystemPlugin | Where-Object { $_ } | ForEach-Object { "$($_.Name) $($_.Id)".Trim() }) -join ', ')
+            License = [string]$cd.LicenseType; Plugin = (@(foreach ($p in $cd.AISystemPlugin) { if ($p) { "$($p.Name) $($p.Id)".Trim() } }) -join ', ')
             TargetAgent = [string]$cd.TargetAgentName; Operation = [string]$a.OperationName
             ErrorType = [string]$a.ErrorType; ErrorMessage = [string]$a.ErrorMessage; OutputMessageId = [string]$a.OutputMessageId; Channel = [string]$a.ChannelName
         }
@@ -5001,14 +5028,17 @@ function Get-AiActivityData {
     $records = @(Get-AiActivityRecords -Days $Days -OnWait $OnWait)
     $idx = New-AiAgentIndex -InfoTable $InfoTable
     $names = @{}; foreach ($p in $Packages) { $names[[string]$p.id] = [string]$p.displayName }
-    $rows = @($records | ForEach-Object { ConvertTo-AiActivity $_ })
+    # A record with neither agent id can never be tied to an agent and is shown nowhere, so it is not converted.
+    # The unmapped count is of records that do carry an agent id.
+    $rows = @(foreach ($rec in $records) { if ([string]$rec.auditData.AgentId -or [string]$rec.auditData.PlatformAgentId) { ConvertTo-AiActivity $rec } })
+    $unmapped = 0
     foreach ($r in $rows) {
         $r.TitleId = Resolve-AiActivityAgent -Activity $r -Index $idx
         $r.Agent = if ($r.TitleId -and $names.ContainsKey($r.TitleId)) { $names[$r.TitleId] } else { $r.AgentName }
+        if (-not $r.TitleId -and $r.AgentGuid) { $unmapped++ }
     }
     $script:AiActivityCache = [pscustomobject]@{
-        Days = $Days; At = Get-Date; Activities = $rows; Names = $names
-        Unmapped = @($rows | Where-Object { -not $_.TitleId -and $_.AgentGuid }).Count
+        Days = $Days; At = Get-Date; Activities = $rows; Names = $names; Unmapped = $unmapped
     }
     $script:AiActivityCache
 }

@@ -954,6 +954,19 @@ Describe 'AI activity from the audit log' {
         $s[0].Interactions | Should -Be 1; $s[0].Responses | Should -Be 1
         $s[1].Risk | Should -Be 'None'
     }
+    It 'converts only records that name an agent, and still counts the ones outside the catalog' {
+        Mock Get-AiActivityRecords {
+            $none = New-AuditRecord -Id 'no-agent'; $none.auditData.AgentId = ''; $none.auditData.PlatformAgentId = ''
+            $platformOnly = New-AuditRecord -Id 'platform-only'; $platformOnly.auditData.AgentId = ''
+            @((New-AuditRecord -Id 'mine'), $none, (New-AuditRecord -Id 'other' -AgentId 'not-in-catalog'), $platformOnly)
+        }
+        $info = @{ 't_1' = [pscustomobject]@{ AgentKeys = @('BOT-1') } }
+        $data = Get-AiActivityData -Days 7 -InfoTable $info -Packages @((New-Pkg 't_1' 'One')) -Refresh
+        @($data.Activities.RecordId) | Should -Be @('mine', 'other', 'platform-only')
+        @($data.Activities | Where-Object TitleId -eq 't_1').RecordId | Should -Be @('mine', 'platform-only')
+        $data.Activities[0].Agent | Should -Be 'One'
+        $data.Unmapped | Should -Be 1
+    }
     It 'splits a long range into windows, merges and de-duplicates records, and tidies up its searches' {
         $script:created = 0; $script:deleted = 0
         Mock Wait-AuditPoll { }
@@ -1033,6 +1046,7 @@ Describe 'AI activity detail' {
     It 'turns an escaped connector reference into a readable name' {
         Get-ConnectorLabel -Id $mcp.Id -Name $mcp.Name | Should -Be 'cnt01_contoso-sales-mcp'
         Get-ConnectorLabel -Id '' -Name 'office365' | Should -Be 'office365'
+        Get-ConnectorLabel -Id '/providers/Microsoft.PowerApps/apis/shared_a-2D-2d5f-20b' -Name 'x' | Should -Be 'a-2D-5f b'
     }
     It 'sorts resources into connectors, files, web pages and protection' {
         Get-AiResourceKind $mcp | Should -Be 'Connector'
@@ -1046,6 +1060,19 @@ Describe 'AI activity detail' {
         $a.Summary | Should -Be 'Tools: cnt01_contoso-sales-mcp; Files: 1; Web pages: 1'
         (ConvertTo-AiActivity (New-DetailRecord)).Summary | Should -Be 'Chat turn, no tools or files'
         (ConvertTo-AiActivity (New-DetailRecord -Extra @{ Target = 'Email agent' })).Summary | Should -BeLike '*Handed to Email agent*'
+    }
+    It 'lists each tool, file, web page and signal once, in the order first seen' {
+        $lakes = [pscustomobject]@{ Type = 'Text'; Name = 'Alpine lakes'; Action = 'Read'; SiteUrl = 'https://example.com/lakes' }
+        $labeled = [pscustomobject]@{ Type = 'Doc'; Name = 'plan.docx'; Action = 'Read'; SiteUrl = 'https://contoso.sharepoint.com/sites/x/plan.docx'; SensitivityLabelId = 'label-1' }
+        $a = ConvertTo-AiActivity (New-DetailRecord -Resources @($page, $mcp, $lakes, $labeled, $mcp, $page, $labeled))
+        $a.Tools | Should -Be 'cnt01_contoso-sales-mcp'
+        $a.Files | Should -Be 'plan.docx'
+        $a.Web | Should -Be 'Banff hikes; Alpine lakes'
+        $a.Signals | Should -Be 'Labeled file accessed'
+        $a.Detail | Should -Be 'Labeled file accessed: plan.docx'
+        $a.Summary | Should -Be 'Tools: cnt01_contoso-sales-mcp; Files: 1; Web pages: 2'
+        $many = @(1..5 | ForEach-Object { [pscustomobject]@{ Type = 'Connector'; Name = "tool$_"; Id = ''; Action = 'Invoke' } })
+        (ConvertTo-AiActivity (New-DetailRecord -Resources ($many + $many[0]))).Summary | Should -Be 'Tools: tool1, tool2, tool3, tool4 +1'
     }
     It 'keeps model, conversation and message counts, and lists the detail rows by section' {
         $a = ConvertTo-AiActivity (New-DetailRecord -Resources @($mcp, $file, $jail))
@@ -1730,8 +1757,15 @@ Describe 'Endpoint AI: recognising tools and hiding secrets' {
         $q.Agents | Should -BeLike '*Platform == "LocalAgents"*'
         $q.Processes | Should -BeLike '*ago(14d)*'
         $q.Processes | Should -BeLike '*"ollama.exe"*'
-        $q.Outbound | Should -BeLike '*"anthropic.com"*'
-        $q.Listening | Should -BeLike '*11434*'
+        $q.Network | Should -BeLike '*"anthropic.com"*'
+        $q.Network | Should -BeLike '*11434*'
+        @($q.Keys) | Should -Not -Contain 'Mcp'
+        foreach ($name in 'Processes', 'Network') {
+            ([regex]::Matches($q[$name], 'Device\w+Events')).Count | Should -Be 1 -Because "$name reads its table once"
+            $q[$name] | Should -BeLike '*materialize(*'
+        }
+        $q.Processes | Should -BeLike '*Set = "Processes"*Set = "Mcp"*'
+        $q.Network | Should -BeLike '*Set = "Outbound"*Set = "Listening"*'
         $alerts = Get-EndpointAiAlertQuery -Days 7 -DeviceNames @('lab', 'we"ird')
         $alerts | Should -BeLike '*"lab", "we\"ird"*'
         (Get-EndpointAiDeviceQuery -DeviceIds @('d1', 'd2')) | Should -BeLike '*"d1", "d2"*'
@@ -1878,9 +1912,40 @@ Describe 'Endpoint AI: reading the data' {
         $data.Rows[0].Risk | Should -Be 'None'
         $data.Coverage['Onboarded'] | Should -Be 3
         $data.RemovedAgents | Should -Be 1
-        Should -Invoke Invoke-HuntingQuery -Times 11
-        $script:said.Count | Should -Be 11
+        Should -Invoke Invoke-HuntingQuery -Times 9 -Exactly
+        $script:said.Count | Should -Be 9
         $script:said[0] | Should -BeLike 'Reading Defender local agent discovery*'
+    }
+    It 'splits the process and network results by set into the evidence of each tool' {
+        Mock Invoke-HuntingQuery {
+            if ($Query -like '*DeviceProcessEvents*') {
+                @(@{ Set = 'Mcp'; DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'node.exe'; Runs = 9; FirstSeen = '2026-10-01T10:00:00Z'; LastSeen = '2026-10-01T11:00:00Z'; Accounts = @('alice'); Parent = 'cursor.exe'; Command = 'npx -y @modelcontextprotocol/server-filesystem C:\' },
+                  @{ Set = 'Processes'; DeviceId = 'dev1'; DeviceName = 'lab'; FileName = 'ollama.exe'; FolderPath = 'C:\Ollama\ollama.exe'; Runs = 5; FirstSeen = '2026-10-01T10:00:00Z'; LastSeen = '2026-10-01T10:30:00Z'; Accounts = @('alice'); Parents = @('explorer.exe'); ActiveAt = @('2026-10-01T10:00:00Z'); Command = 'ollama.exe serve'; FlagCommand = '' })
+            } elseif ($Query -like '*DeviceNetworkEvents*') {
+                @(@{ Set = 'Outbound'; DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; Host = 'ollama.com'; Hits = 7; LastSeen = '2026-10-01T10:20:00Z' },
+                  @{ Set = 'Listening'; DeviceId = 'dev1'; DeviceName = 'lab'; Process = 'ollama.exe'; LocalIP = '0.0.0.0'; LocalPort = 11434; Hits = 2; LastSeen = '2026-10-01T10:10:00Z' })
+            } else { @() }
+        }
+        $data = Get-EndpointAiData -Days 7
+        $ollama = @($data.Rows | Where-Object Tool -eq 'Ollama')
+        $ollama.Count | Should -Be 1
+        $ollama[0].Evidence.Processes.Count | Should -Be 1
+        $ollama[0].Evidence.Hosts.Host | Should -Be 'ollama.com'
+        $ollama[0].Evidence.Listeners.Port | Should -Be 11434
+        $ollama[0].Risk | Should -Be 'High'
+        $mcp = @($data.Rows | Where-Object Tool -eq 'MCP server (local)')
+        $mcp.Count | Should -Be 1
+        $mcp[0].Runs | Should -Be 9
+        $mcp[0].Evidence.LocalMcps.Count | Should -Be 1
+    }
+    It 'returns every named set, keeps the order within a set and drops rows of other sets' {
+        $rows = @([pscustomobject]@{ Set = 'B'; N = 1 }, [pscustomobject]@{ Set = 'A'; N = 2 }, [pscustomobject]@{ Set = 'B'; N = 3 }, [pscustomobject]@{ Set = 'X'; N = 4 })
+        $out = Split-HuntingSets -Rows $rows -Names 'A', 'B', 'C'
+        @($out.Keys | Sort-Object) | Should -Be @('A', 'B', 'C')
+        $out['A'].N | Should -Be 2
+        $out['B'].N | Should -Be @(1, 3)
+        $out['C'].Count | Should -Be 0
+        (Split-HuntingSets -Rows @() -Names 'A')['A'].Count | Should -Be 0
     }
     It 'says what is needed when Advanced Hunting is not available' {
         Mock Invoke-HuntingQuery { throw 'Advanced Hunting query failed (403). Endpoint AI needs Advanced Hunting' }
