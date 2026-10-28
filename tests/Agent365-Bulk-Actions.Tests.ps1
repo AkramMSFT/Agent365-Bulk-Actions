@@ -739,7 +739,9 @@ Describe 'Batch pacing stays bounded under heavy throttling' {
         }
         $reqs = 1..200 | ForEach-Object { @{ id = "r$_"; method = 'GET'; url = "/x/$_" } }
         Invoke-GraphBatch -Requests $reqs -ChunkSize 10 -PaceSeconds 0.3 | Out-Null
-        $perRequest = ($script:sleepMs | Measure-Object -Maximum).Maximum / 10
+        $paceMs = @($script:sleepMs | Where-Object { $_ -lt 10000 })   # the 424 back-off between rounds waits 10 s or more
+        $paceMs.Count | Should -BeGreaterThan 0
+        $perRequest = ($paceMs | Measure-Object -Maximum).Maximum / 10
         $perRequest | Should -BeLessOrEqual 2100   # ms per request, capped at 2 seconds
     }
 }
@@ -1288,6 +1290,7 @@ Describe 'Policy: AI activity and restrict' {
     }
     It 'applies a restrict step through the availability routine' {
         Mock Write-Host { }
+        Mock Out-Host { }
         Mock Confirm-Batch { $true }
         Mock Invoke-AvailabilityChange { }
         $d = Doc '{ "rules": [ { "name": "r", "when": { "aiActivity": { "days": 7, "minHigh": 3 } }, "then": { "action": "restrict", "availableTo": "none", "includeDeployment": true } } ] }'
