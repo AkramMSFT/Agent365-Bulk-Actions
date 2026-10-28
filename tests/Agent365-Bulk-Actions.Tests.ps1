@@ -1860,7 +1860,7 @@ Describe 'Sign-in help' {
         Get-SignInHelp 'AADSTS50076: multi-factor authentication is required' | Should -Be 'AADSTS50076: multi-factor authentication is required'
     }
     It 'asks -SignIn for every permission the modes use, including the newest' {
-        foreach ($scope in 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'AgentIdentity.ReadWrite.All', 'AuditLogsQuery.Read.All', 'Group.Read.All', 'IdentityRiskyAgent.ReadWrite.All') {
+        foreach ($scope in 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'AgentIdentity.ReadWrite.All', 'AuditLogsQuery.Read.All', 'Group.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'DelegatedPermissionGrant.ReadWrite.All') {
             $script:AllScopes | Should -Contain $scope
         }
         @($script:AllScopes | Select-Object -Unique).Count | Should -Be @($script:AllScopes).Count
@@ -3291,6 +3291,418 @@ Describe 'MCP access' {
         ($d | Where-Object Item -eq 'Blueprint principal').Info | Should -BeLike 'bpsp-b (a block on it covers every agent identity*'
         ($d | Where-Object Item -eq 'Entra application').Info | Should -Be 'Work IQ Mail MCP (app-mail)'
         ($d | Where-Object Item -eq 'Can this tool block it').Info | Should -BeLike 'Yes:*'
+    }
+}
+
+Describe 'MCP permissions' {
+    BeforeAll {
+        # Ids are GUIDs because the writer refuses anything else; the last block of digits names what each one is.
+        $script:p = @{
+            idA = '0000000a-0000-0000-0000-000000000001'; idB = '0000000b-0000-0000-0000-000000000001'; idC = '0000000c-0000-0000-0000-000000000001'
+            idD1 = '0000000d-0000-0000-0000-000000000001'; idD2 = '0000000d-0000-0000-0000-000000000002'; idE1 = '0000000e-0000-0000-0000-000000000001'
+            bpA = '0000000a-0000-0000-0000-0000000000b0'; bpS = '00000005-0000-0000-0000-0000000000b0'; bpD = '0000000d-0000-0000-0000-0000000000b0'
+            spA = '0000000a-0000-0000-0000-0000000005b0'; spS = '00000005-0000-0000-0000-0000000005b0'; spD = '0000000d-0000-0000-0000-0000000005b0'
+            mailApp = '16b1878d-62c7-4009-aa25-68989d63bbad'; teamsApp = 'ce5029ee-c1d3-45c0-bdcc-efb5a4245687'; calApp = '910333d2-47e9-43ca-981f-6df2f4531ef4'
+            mailSp = '00000111-0000-0000-0000-000000000005'; teamsSp = '00000222-0000-0000-0000-000000000005'; toolsSp = '00000333-0000-0000-0000-000000000005'; calSp = '00000444-0000-0000-0000-000000000005'
+            uD2 = '0000000d-0000-0000-0000-0000000000c2'
+        }
+        # Alpha: own identity (own grant on Mail) and a blueprint only it uses (shared scopes). Bravo and Charlie: two identities of
+        # one blueprint, whose catalog entry Echo owns a third identity. Delta: a blueprint entry with two identities, its own.
+        function New-PermReport {
+            $p = $script:p
+            $pk = @(
+                [pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = $p.idA; platform = 'Not Available'; manifestId = $null; elementTypes = @() },
+                [pscustomobject]@{ id = 'P_B'; displayName = 'Bravo'; agentIdentityId = $p.idB; platform = 'Not Available'; manifestId = $null; elementTypes = @() },
+                [pscustomobject]@{ id = 'P_C'; displayName = 'Charlie'; agentIdentityId = $p.idC; platform = 'Not Available'; manifestId = $null; elementTypes = @() },
+                [pscustomobject]@{ id = 'T_D'; displayName = 'Delta'; agentIdentityId = $null; platform = 'Not Available'; manifestId = $p.bpD; elementTypes = @('AgenticUserTemplates') },
+                [pscustomobject]@{ id = 'T_E'; displayName = 'Echo'; agentIdentityId = $null; platform = 'Not Available'; manifestId = $p.bpS; elementTypes = @('AgenticUserTemplates') })
+            $ids = @{ $p.idA = [pscustomobject]@{ AppId = 'x'; Blueprint = $p.bpA; Principal = $p.spA }; $p.idB = [pscustomobject]@{ AppId = 'x'; Blueprint = $p.bpS; Principal = $p.spS }
+                      $p.idC = [pscustomobject]@{ AppId = 'x'; Blueprint = $p.bpS; Principal = $p.spS } }
+            $bps = @{ 'T_D' = [pscustomobject]@{ AppId = $p.bpD; Principal = $p.spD; Identities = @($p.idD1, $p.idD2) }
+                      'T_E' = [pscustomobject]@{ AppId = $p.bpS; Principal = $p.spS; Identities = @($p.idB, $p.idC, $p.idE1) } }
+            $users = @{ $p.idA = @('u-a'); $p.idB = @('u-b'); $p.idD1 = @('u-d1'); $p.idD2 = @($p.uD2); $p.idE1 = @('u-e1') }
+            $cl = { param($id, $name, $type) [pscustomobject]@{ Id = $id; Name = $name; AppId = ''; Type = $type } }
+            $clients = @{ $p.spA = (& $cl $p.spA 'Alpha Blueprint' 'blueprint'); $p.spS = (& $cl $p.spS 'Shared Blueprint' 'blueprint'); $p.spD = (& $cl $p.spD 'Delta Blueprint' 'blueprint')
+                          $p.idA = (& $cl $p.idA 'Alpha Identity' 'identity'); $p.idD1 = (& $cl $p.idD1 'Delta One' 'identity'); $p.idD2 = (& $cl $p.idD2 'Delta Two' 'identity') }
+            $gr = { param($id, $client, $sp, $app, $name, $scope, $consent = 'AllPrincipals', $principal = '')
+                    [pscustomobject]@{ Id = $id; ClientId = $client; ResourceId = $sp; ResourceAppId = $app; ResourceName = $name; PrincipalId = $principal; Scopes = @(Get-McpScopes $scope); Scope = $scope; Consent = $consent } }
+            $grants = @(
+                (& $gr 'grantA1' $p.idA $p.mailSp $p.mailApp 'Work IQ Mail MCP' 'Tools.ListInvoke.All'),
+                (& $gr 'grantA2' $p.spA $p.toolsSp $script:AgentToolsAppId 'Agent Tools' ' openid McpServers.Calendar.All McpServers.Mail.All McpServersMetadata.Read.All'),
+                (& $gr 'grantS1' $p.spS $p.teamsSp $p.teamsApp 'Work IQ Teams MCP' 'Tools.ListInvoke.All'),
+                (& $gr 'grantS2' $p.spS $p.toolsSp $script:AgentToolsAppId 'Agent Tools' 'McpServers.Excel.All McpServers.Word.All'),
+                (& $gr 'grantD1' $p.spD $p.mailSp $p.mailApp 'Work IQ Mail MCP' 'Tools.ListInvoke.All User.Read'),
+                (& $gr 'grantD2' $p.idD1 $p.teamsSp $p.teamsApp 'Work IQ Teams MCP' 'Tools.ListInvoke.All'),
+                (& $gr 'grantD3' $p.idD2 $p.mailSp $p.mailApp 'Work IQ Mail MCP' 'Tools.ListInvoke.All' 'Principal' $p.uD2))
+            $inherit = @{
+                $p.bpA = @(@{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'allAllowed' } })
+                $p.bpS = @(@{ resourceAppId = $p.teamsApp; inheritableScopes = @{ kind = 'allAllowed' } }, @{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'enumerated'; scopes = @('McpServers.Excel.All') } })
+                $p.bpD = @(@{ resourceAppId = $p.mailApp; inheritableScopes = @{ kind = 'allAllowed' } })
+            }
+            $apps = @{ mail = [pscustomobject]@{ AppId = $p.mailApp; Name = 'Work IQ Mail MCP' }; teams = [pscustomobject]@{ AppId = $p.teamsApp; Name = 'Work IQ Teams MCP' }
+                       calendar = [pscustomobject]@{ AppId = $p.calApp; Name = 'Work IQ Calendar MCP' }; agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } }
+            $built = New-McpAccessRows -Packages $pk -IdentityIds $ids -AgentUsers $users -Grants $grants -Clients $clients -Inherit $inherit -ServerApps $apps -Blueprints $bps
+            [pscustomobject]@{ Rows = $built.Rows; Agents = $built.Agents; ServerApps = $apps; Policies = @(); Grants = $grants; Clients = $clients; Inherit = $inherit
+                               IdentityIds = $ids; AgentUsers = $users; Packages = $pk }
+        }
+        function New-PermContext {
+            param([object]$Report, [string[]]$AgentIds = @('P_A', 'P_B', 'P_C', 'T_D', 'T_E'))
+            Get-McpPermissionContext -Report $Report -Catalog $Report.Packages -AgentIds $AgentIds
+        }
+        function Get-PermRow {
+            param($Report, $Agent, $Key)
+            $r = @($Report.Rows | Where-Object { $_.Agent -eq $Agent -and $_.ServerKey -eq $Key })[0]
+            if (-not $r) { $pkg = @($Report.Packages | Where-Object { $_.displayName -eq $Agent }); $r = @(Resolve-McpBlockRows -Report $Report -Packages $pkg -Servers @($Key))[0] }
+            $r
+        }
+        function New-Sp { param($id, $app, $name, [string[]]$scopes = @('Tools.ListInvoke.All')) [pscustomobject]@{ id = $id; appId = $app; displayName = $name; oauth2PermissionScopes = @($scopes | ForEach-Object { [pscustomobject]@{ value = $_ } }) } }
+    }
+    BeforeEach {
+        $p = $script:p
+        $o = { param($id, $name) [pscustomobject]@{ Id = $id; Name = $name } }
+        $script:made = @{ $p.bpA = @(& $o $p.idA 'Alpha Identity'); $p.bpS = @((& $o $p.idB 'Bravo Identity'), (& $o $p.idC 'Charlie Identity'), (& $o $p.idE1 'Echo One')); $p.bpD = @((& $o $p.idD1 'Delta One'), (& $o $p.idD2 'Delta Two')) }
+        $script:sps = @{ $p.mailApp = (New-Sp $p.mailSp $p.mailApp 'Work IQ Mail MCP'); $p.teamsApp = (New-Sp $p.teamsSp $p.teamsApp 'Work IQ Teams MCP'); $p.calApp = (New-Sp $p.calSp $p.calApp 'Work IQ Calendar MCP') }
+        Mock Get-BlueprintIdentities { $script:made }
+        Mock Get-ServicePrincipalsByAppId { $script:sps }
+    }
+
+    It 'takes out and adds MCP scopes only, keeping every other scope and its order' {
+        Edit-McpScope -Scope ' openid McpServers.Mail.All User.Read McpServers.Calendar.All' -Remove 'mcpservers.mail.all', 'User.Read' | Should -Be 'openid User.Read McpServers.Calendar.All'
+        Edit-McpScope -Scope 'User.Read' -Add 'Tools.ListInvoke.All', 'Directory.ReadWrite.All', 'tools.listinvoke.all' | Should -Be 'User.Read Tools.ListInvoke.All'
+        Edit-McpScope -Scope 'Tools.ListInvoke.All' -Remove 'Tools.ListInvoke.All' | Should -Be ''
+        Edit-McpScope -Add 'McpServers.Mail.All McpServers.Me.All', 'McpServersMetadata.Read.All' | Should -Be 'McpServers.Mail.All McpServers.Me.All'
+        Test-OneMcpScope 'McpServers.Mail.All' | Should -BeTrue
+        foreach ($s in 'Tools.ListInvoke.All Directory.ReadWrite.All', 'Directory.ReadWrite.All', 'McpServersMetadata.Read.All', '', ' Tools.ListInvoke.All') { Test-OneMcpScope $s | Should -BeFalse -Because "'$s'" }
+        ConvertTo-McpRequestKey 'Agent Tools' | Should -Be 'agenttools'
+        ConvertTo-McpRequestKey 'Work IQ Mail MCP' | Should -Be 'mail'
+    }
+
+    It 'knows who holds each agent''s permissions and who else uses its blueprint' {
+        $c = New-PermContext (New-PermReport)
+        $c.Holders['P_A'].Identities | Should -Be @($p.idA); $c.Holders['P_A'].Principal | Should -Be $p.spA; @($c.Holders['P_A'].Others).Count | Should -Be 0
+        $c.Holders['P_B'].Others | Should -Be @('Charlie', 'Echo')
+        $c.Holders['T_D'].Identities | Should -Be @($p.idD1, $p.idD2); $c.Holders['T_D'].Principal | Should -Be $p.spD; @($c.Holders['T_D'].Others).Count | Should -Be 0
+        $c.Holders['T_E'].Identities | Should -Be @($p.idE1); $c.Holders['T_E'].Others | Should -Be @('Bravo', 'Charlie')
+        $c.ResourceSps[$p.teamsApp].id | Should -Be $p.teamsSp
+        $script:made = @{ $p.bpA = $null }
+        (New-PermContext (New-PermReport) -AgentIds 'P_A').Holders['P_A'].Others | Should -BeLike '*could not be read*'
+    }
+
+    It 'names an identity of the blueprint that no catalog agent owns as one more user of it' {
+        $r = New-PermReport
+        $r.Packages = @($r.Packages | Where-Object { $_.id -ne 'T_E' })
+        (Get-McpPermissionContext -Report $r -Catalog $r.Packages -AgentIds 'P_B').Holders['P_B'].Others | Should -Be @('Charlie', 'Echo One (an agent identity not in the catalog)')
+    }
+
+    It 'removes the agent identity''s own grant and the scope of a blueprint only this agent uses, keeping other scopes' {
+        $r = New-PermReport
+        $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail'))
+        $plan.Count | Should -Be 2
+        $own = $plan | Where-Object { $_.GrantId -eq 'grantA1' }
+        $own.Change | Should -Be 'Remove'; $own.Lever | Should -Be 'Agent identity grant'; $own.ClientKind | Should -Be 'identity'; $own.Scope | Should -Be 'Tools.ListInvoke.All'
+        $own.ScopeAfter | Should -Be ''; $own.Effect | Should -BeLike '*deleted*'
+        $bp = $plan | Where-Object { $_.GrantId -eq 'grantA2' }
+        $bp.Lever | Should -Be 'Blueprint grant'; $bp.ClientKind | Should -Be 'blueprint'; $bp.Scope | Should -Be 'McpServers.Mail.All'; $bp.ClientName | Should -Be 'Alpha Blueprint'
+        $bp.ScopeAfter | Should -Be 'openid McpServers.Calendar.All McpServersMetadata.Read.All'
+    }
+
+    It 'removes every shared scope for the Agent Tools row, and only those' {
+        $r = New-PermReport
+        $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'agenttools'))
+        @($plan | ForEach-Object { $_.Scope }) | Should -Be @('McpServers.Calendar.All', 'McpServers.Mail.All')
+        @($plan.ScopeAfter | Get-Distinct) | Should -Be @('openid McpServersMetadata.Read.All')
+    }
+
+    It 'blocks with Conditional Access instead of changing a blueprint other agents use, and says who they are' {
+        $r = New-PermReport
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams'))
+        $c.Count | Should -Be 1
+        $c[0].Change | Should -Be 'Block'; $c[0].Lever | Should -Be 'Conditional Access'; $c[0].Shared | Should -BeTrue; $c[0].Others | Should -Be @('Charlie', 'Echo')
+        $c[0].BlockItems.Count | Should -Be 1
+        $c[0].BlockItems[0].IdentityId | Should -Be $p.idB; $c[0].BlockItems[0].AgentUserIds | Should -Be @('u-b'); $c[0].BlockItems[0].ResourceAppId | Should -Be $p.teamsApp; $c[0].BlockItems[0].Target | Should -Be 'On'
+        $c[0].Why | Should -BeLike '*shared with Charlie, Echo*'
+        (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams') -BlockMode 'Report-only'))[0].Effect | Should -Be 'Blocked in report-only mode'
+    }
+
+    It 'removes it from a shared blueprint only when asked, naming every agent that loses it' {
+        $r = New-PermReport
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams') -IncludeSharedBlueprint)
+        $c.Count | Should -Be 1
+        $c[0].Change | Should -Be 'Remove'; $c[0].Lever | Should -Be 'Shared blueprint grant'; $c[0].GrantId | Should -Be 'grantS1'; $c[0].Others | Should -Be @('Charlie', 'Echo')
+        (Get-McpPlanNotes $c) -join ' ' | Should -BeLike '*Bravo*shared with Charlie, Echo*removed for them too*'
+    }
+
+    It 'blocks a blueprint entry that shares its blueprint through its own identities only' {
+        $r = New-PermReport
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Echo' 'teams'))
+        $c[0].Change | Should -Be 'Block'
+        @($c[0].BlockItems | ForEach-Object { $_.IdentityId }) | Should -Be @($p.idE1)
+        $c[0].BlockItems[0].AgentUserIds | Should -Be @('u-e1')
+    }
+
+    It 'cannot take a shared scope from a shared blueprint for one agent, and explains the ways out' {
+        $r = New-PermReport
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'excel'))
+        $c.Count | Should -Be 1
+        $c[0].Change | Should -Be 'None'; $c[0].Shared | Should -BeTrue; $c[0].Why | Should -BeLike '*only through the shared permission*Agent Tools*'
+        $t = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'agenttools'))
+        $t[0].Change | Should -Be 'Block'; $t[0].BlockItems[0].ResourceAppId | Should -Be $script:AgentToolsAppId
+        (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'excel') -IncludeSharedBlueprint))[0].GrantId | Should -Be 'grantS2'
+    }
+
+    It 'leaves a scope the blueprint does not pass on, and a server the agent does not hold' {
+        $r = New-PermReport
+        $w = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'word'))
+        $w[0].Change | Should -Be 'None'; $w[0].Why | Should -BeLike '*does not pass it to the agent*'
+        (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'teams')))[0].Why | Should -BeLike '*holds no Entra permission*'
+    }
+
+    It 'removes from a blueprint entry''s own blueprint and from its identities'' grants, one-user grants included' {
+        $r = New-PermReport
+        $m = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'mail'))
+        $m.Count | Should -Be 2
+        $bp = $m | Where-Object { $_.GrantId -eq 'grantD1' }
+        $bp.Lever | Should -Be 'Blueprint grant'; $bp.ScopeAfter | Should -Be 'User.Read'; $bp.Effect | Should -Be 'Removed; the grant keeps User.Read'
+        $one = $m | Where-Object { $_.GrantId -eq 'grantD3' }
+        $one.Lever | Should -Be 'Agent identity grant'; $one.ConsentType | Should -Be 'Principal'; $one.PrincipalId | Should -Be $p.uD2
+        (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'teams')))[0].ClientId | Should -Be $p.idD1
+    }
+
+    It 'grants a server''s own scope to each agent identity, never to a blueprint and never a shared scope' {
+        $r = New-PermReport
+        $ctx = New-PermContext $r
+        $a = @(New-McpPermissionPlan -Context $ctx -GrantRows @(Get-PermRow $r 'Alpha' 'teams'))
+        $a.Count | Should -Be 1
+        $a[0].Change | Should -Be 'Grant'; $a[0].ClientId | Should -Be $p.idA; $a[0].ResourceId | Should -Be $p.teamsSp; $a[0].Scope | Should -Be 'Tools.ListInvoke.All'
+        $a[0].ConsentType | Should -Be 'AllPrincipals'; $a[0].GrantId | Should -Be ''; $a[0].Effect | Should -Be 'Granted in a new grant'
+        $d = @(New-McpPermissionPlan -Context $ctx -GrantRows @(Get-PermRow $r 'Delta' 'calendar'))
+        @($d | ForEach-Object { $_.ClientId }) | Should -Be @($p.idD1, $p.idD2)
+        @($d | Where-Object { $_.ClientId -in $p.spD, $p.spS }).Count | Should -Be 0
+        (@(New-McpPermissionPlan -Context $ctx -GrantRows @(Get-PermRow $r 'Alpha' 'mail')))[0].Why | Should -Be 'The agent already holds it.'
+        (@(New-McpPermissionPlan -Context $ctx -GrantRows @(Get-PermRow $r 'Bravo' 'teams')))[0].Why | Should -BeLike '*through its blueprint*'
+        (@(New-McpPermissionPlan -Context $ctx -GrantRows @(Get-PermRow $r 'Alpha' 'agenttools')))[0].Why | Should -BeLike '*shared permission*not granted*'
+        $nowhere = Get-PermRow $r 'Alpha' 'Nowhere'
+        (@(New-McpPermissionPlan -Context $ctx -GrantRows @($nowhere)))[0].Why | Should -BeLike "*No MCP server called 'Nowhere'*"
+        Get-McpPlanNotes $a | Select-Object -First 1 | Should -BeLike '*code or manifest*declare the server*'
+    }
+
+    It 'adds to an identity''s existing grant on the server, and refuses a resource that is not an MCP server' {
+        $r = New-PermReport
+        $r.Grants += [pscustomobject]@{ Id = 'grantA3'; ClientId = $p.idA; ResourceId = $p.teamsSp; ResourceAppId = $p.teamsApp; ResourceName = 'Work IQ Teams MCP'; PrincipalId = ''; Scopes = @(); Scope = 'Other.Read'; Consent = 'AllPrincipals' }
+        $a = @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Alpha' 'teams'))
+        $a[0].GrantId | Should -Be 'grantA3'; $a[0].ScopeAfter | Should -Be 'Other.Read Tools.ListInvoke.All'; $a[0].Effect | Should -Be 'Granted; added to its grant'
+        $script:sps = @{ $p.teamsApp = (New-Sp $p.teamsSp $p.teamsApp 'Not MCP' -scopes @('User.Read')) }
+        (@(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Alpha' 'teams')))[0].Why | Should -BeLike '*not an MCP server*'
+    }
+
+    It 'allows only the chosen servers: removes the rest and, when asked, grants what is missing' {
+        $r = New-PermReport
+        $pk = @($r.Packages | Where-Object { $_.id -eq 'P_A' })[0]
+        $s = Select-McpAllowOnlyRows -Report $r -Package $pk -AllowKeys @('mail')
+        @($s.Remove | ForEach-Object { $_.ServerKey }) | Should -Be @('calendar'); @($s.Grant).Count | Should -Be 0
+        $g = Select-McpAllowOnlyRows -Report $r -Package $pk -AllowKeys @('mail', 'teams') -GrantMissing
+        @($g.Grant | ForEach-Object { $_.ServerKey }) | Should -Be @('teams')
+        $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows $g.Remove -GrantRows $g.Grant)
+        @($plan | ForEach-Object { "$($_.Change):$($_.Scope)" }) | Should -Be @('Remove:McpServers.Calendar.All', 'Grant:Tools.ListInvoke.All')
+        $k = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @((Select-McpAllowOnlyRows -Report $r -Package $pk -AllowKeys @('agenttools')).Remove) -KeepShared)
+        @($k | Where-Object { $_.Change -eq 'Remove' } | ForEach-Object { $_.GrantId }) | Should -Be @('grantA1')
+        ($k | Where-Object { $_.ServerKey -eq 'calendar' }).Why | Should -BeLike '*shared permission, which stays allowed*'
+    }
+
+    It 'refuses rows of something that is not a catalog agent' {
+        $row = [pscustomobject]@{ Agent = 'Some CLI'; AgentId = ''; Server = 'Mail'; ServerKey = 'mail' }
+        $c = New-PermContext (New-PermReport)
+        (Get-McpRemovalChanges -Context $c -Row $row).Change | Should -Be 'None'
+        (Get-McpGrantChanges -Context $c -Row $row).Change | Should -Be 'None'
+    }
+
+    Context 'writing the grants' {
+        BeforeAll {
+            function New-LiveGrant { param($id, $client, $resource, $scope, $consent = 'AllPrincipals', $principal = $null) @{ id = $id; clientId = $client; resourceId = $resource; scope = $scope; consentType = $consent; principalId = $principal } }
+        }
+        BeforeEach {
+            Mock Write-Host { }
+            Mock Export-ActionLog { }
+            Mock Test-Proceed { $true }
+            $script:writes = @()
+            $script:live = @{}
+            Mock Get-GraphAll { $c = if ($Uri -match "clientId eq '([^']+)'") { $Matches[1] } else { '' }; @($script:live[$c]) | Where-Object { $_ } }
+            Mock Invoke-Graph { $script:writes += , [pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($Body) { $Body | ConvertFrom-Json }) }; if ($Method -eq 'POST') { @{ id = 'newGrant' } } }
+        }
+        It 'writes each grant once: a PATCH with what stays, never a scope that is not MCP' {
+            $r = New-PermReport
+            $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp ' openid McpServers.Calendar.All McpServers.Mail.All McpServersMetadata.Read.All')
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'agenttools'))
+            $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $script:writes.Count | Should -Be 1
+            $script:writes[0].Method | Should -Be 'PATCH'; $script:writes[0].Uri | Should -Be "$($script:GrantBase)/grantA2"; $script:writes[0].Body.scope | Should -Be 'openid McpServersMetadata.Read.All'
+            $recs.Count | Should -Be 2
+            $recs[0].Action | Should -Be 'revokemcpscope'; $recs[0].Result | Should -Be 'Done'; $recs[0].Scope | Should -Be 'McpServers.Calendar.All'; $recs[0].ClientKind | Should -Be 'blueprint'
+            $recs[0].ScopeBefore | Should -Be 'openid McpServers.Calendar.All McpServers.Mail.All McpServersMetadata.Read.All'; $recs[0].ScopeAfter | Should -Be 'openid McpServersMetadata.Read.All'
+            $recs[0].Deleted | Should -BeFalse; $recs[0].Created | Should -BeFalse; $recs[0].GrantId | Should -Be 'grantA2'
+        }
+        It 'deletes a grant left with nothing, and skips a scope already gone' {
+            $r = New-PermReport
+            $script:live[$p.idA] = @(New-LiveGrant 'grantA1' $p.idA $p.mailSp 'Tools.ListInvoke.All')
+            $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'McpServers.Calendar.All')
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail')) -PassThru)
+            @($script:writes | ForEach-Object { $_.Method }) | Should -Be @('DELETE')
+            ($recs | Where-Object { $_.GrantId -eq 'grantA1' }).Deleted | Should -BeTrue
+            $skip = $recs | Where-Object { $_.Scope -eq 'McpServers.Mail.All' }
+            $skip.Result | Should -Be 'Skipped'; $skip.Error | Should -Be 'Already removed.'
+        }
+        It 'creates a grant for every user when the identity has none, and adds to one it has' {
+            $r = New-PermReport
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Alpha' 'teams')) -PassThru)
+            $script:writes[0].Method | Should -Be 'POST'; $script:writes[0].Uri | Should -Be $script:GrantBase
+            $b = $script:writes[0].Body
+            $b.clientId | Should -Be $p.idA; $b.resourceId | Should -Be $p.teamsSp; $b.consentType | Should -Be 'AllPrincipals'; $b.principalId | Should -BeNullOrEmpty; $b.scope | Should -Be 'Tools.ListInvoke.All'
+            $recs[0].Action | Should -Be 'grantmcpscope'; $recs[0].Created | Should -BeTrue; $recs[0].GrantId | Should -Be 'newGrant'; $recs[0].ScopeAfter | Should -Be 'Tools.ListInvoke.All'
+            $script:writes = @()
+            $script:live[$p.idA] = @(New-LiveGrant 'grantA3' $p.idA $p.teamsSp 'Other.Read')
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Alpha' 'teams')) -PassThru)
+            $script:writes[0].Method | Should -Be 'PATCH'; $script:writes[0].Body.scope | Should -Be 'Other.Read Tools.ListInvoke.All'; $recs[0].Created | Should -BeFalse
+        }
+        It 'changes nothing under -WhatIf or for a change it cannot trust, and explains a refusal' {
+            $r = New-PermReport
+            $script:live[$p.idA] = @(New-LiveGrant 'grantA1' $p.idA $p.mailSp 'Tools.ListInvoke.All')
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail') | Where-Object { $_.GrantId -eq 'grantA1' })
+            Mock Test-Proceed { $false }
+            (@(Invoke-McpPermissionChange -Changes $plan -PassThru))[0].Result | Should -Be 'WhatIf'
+            $script:writes.Count | Should -Be 0
+            Mock Test-Proceed { $true }
+            $bad = $plan[0].PSObject.Copy(); $bad.Scope = 'Tools.ListInvoke.All Directory.ReadWrite.All'
+            @(Invoke-McpPermissionChange -Changes @($bad) -PassThru).Count | Should -Be 0
+            Mock Invoke-Graph { throw 'Response status code does not indicate success: Forbidden' }
+            $f = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $f[0].Result | Should -Be 'Failed'; $f[0].Error | Should -BeLike '*DelegatedPermissionGrant.ReadWrite.All*Cloud Application Administrator*'
+        }
+        It 'sends the Conditional Access fallback to the block writer' {
+            Mock Invoke-McpBlockChange { $script:blocked = @($Items); @([pscustomobject]@{ Action = 'blockmcp'; Result = 'Done' }) }
+            $r = New-PermReport
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams')) -PassThru)
+            $script:blocked.Count | Should -Be 1; $script:blocked[0].IdentityId | Should -Be $p.idB
+            $recs[0].Action | Should -Be 'blockmcp'; $script:writes.Count | Should -Be 0
+        }
+        It 'undoes a removal: adds the scope back, or creates a deleted grant again with the same user and only its MCP scopes' {
+            $log = @(
+                [pscustomobject]@{ Action = 'revokemcpscope'; Result = 'Done'; Agent = 'Alpha'; AgentId = 'P_A'; Server = 'Mail'; GrantId = 'grantA2'; ClientId = $p.spA; ClientKind = 'blueprint'; ClientName = 'Alpha Blueprint'
+                                   ResourceId = $p.toolsSp; ResourceAppId = $script:AgentToolsAppId; ResourceName = 'Agent Tools'; ConsentType = 'AllPrincipals'; PrincipalId = ''; Scope = 'McpServers.Mail.All'
+                                   ScopeBefore = 'openid McpServers.Mail.All'; ScopeAfter = 'openid'; Created = 'False'; Deleted = 'False' },
+                [pscustomobject]@{ Action = 'revokemcpscope'; Result = 'Done'; Agent = 'Delta'; AgentId = 'T_D'; Server = 'Mail'; GrantId = 'grantD3'; ClientId = $p.idD2; ClientKind = 'identity'; ClientName = 'Delta Two'
+                                   ResourceId = $p.mailSp; ResourceAppId = $p.mailApp; ResourceName = 'Work IQ Mail MCP'; ConsentType = 'Principal'; PrincipalId = $p.uD2; Scope = 'Tools.ListInvoke.All'
+                                   ScopeBefore = 'Tools.ListInvoke.All'; ScopeAfter = ''; Created = 'False'; Deleted = 'True' },
+                [pscustomobject]@{ Action = 'revokemcpscope'; Result = 'Failed'; Agent = 'Echo' })
+            $u = @(ConvertTo-McpPermissionUndoChanges $log)
+            $u.Count | Should -Be 2
+            $u[0].Change | Should -Be 'Grant'; $u[0].CreateScope | Should -Be ''; $u[0].ScopeAfter | Should -Be 'openid McpServers.Mail.All'
+            $u[1].CreateScope | Should -Be 'Tools.ListInvoke.All'
+            $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'openid')
+            $recs = @(Invoke-McpPermissionChange -Changes $u -PassThru)
+            $patch = $script:writes | Where-Object Method -eq 'PATCH'
+            $patch.Uri | Should -Be "$($script:GrantBase)/grantA2"; $patch.Body.scope | Should -Be 'openid McpServers.Mail.All'
+            $post = $script:writes | Where-Object Method -eq 'POST'
+            $post.Body.consentType | Should -Be 'Principal'; $post.Body.principalId | Should -Be $p.uD2; $post.Body.clientId | Should -Be $p.idD2; $post.Body.scope | Should -Be 'Tools.ListInvoke.All'
+            @($recs | Where-Object Result -eq 'Done').Count | Should -Be 2
+        }
+        It 'undoes a grant: removes what it added, and deletes the grant it created when nothing else is in it' {
+            $log = @([pscustomobject]@{ Action = 'grantmcpscope'; Result = 'Done'; Agent = 'Alpha'; AgentId = 'P_A'; Server = 'Teams'; GrantId = 'newGrant'; ClientId = $p.idA; ClientKind = 'identity'; ClientName = 'Alpha Identity'
+                                        ResourceId = $p.teamsSp; ResourceAppId = $p.teamsApp; ResourceName = 'Work IQ Teams MCP'; ConsentType = 'AllPrincipals'; PrincipalId = ''; Scope = 'Tools.ListInvoke.All'
+                                        ScopeBefore = ''; ScopeAfter = 'Tools.ListInvoke.All'; Created = $true; Deleted = $false })
+            $u = @(ConvertTo-McpPermissionUndoChanges $log)
+            $u[0].Change | Should -Be 'Remove'
+            $script:live[$p.idA] = @(New-LiveGrant 'newGrant' $p.idA $p.teamsSp 'Tools.ListInvoke.All')
+            Invoke-McpPermissionChange -Changes $u | Out-Null
+            $script:writes[0].Method | Should -Be 'DELETE'; $script:writes[0].Uri | Should -Be "$($script:GrantBase)/newGrant"
+        }
+    }
+
+    Context 'undo logs' {
+        BeforeAll {
+            function New-PermLogRow {
+                param([hashtable]$Change = @{})
+                $row = @{ Action = 'revokemcpscope'; Result = 'Done'; Agent = 'Alpha'; AgentId = 'P_A'; GrantId = '4w2Z3x1ol0mKzkSvk9pp0D2o3qrGicxOhDVpxDR_Q5o'; ClientId = $script:p.spA; ClientKind = 'blueprint'
+                          ResourceId = $script:p.toolsSp; ResourceAppId = $script:AgentToolsAppId; ConsentType = 'AllPrincipals'; PrincipalId = ''; Scope = 'McpServers.Mail.All'
+                          ScopeBefore = 'McpServers.Mail.All McpServersMetadata.Read.All'; ScopeAfter = 'McpServersMetadata.Read.All'; Created = 'False'; Deleted = 'False' }
+                foreach ($k in $Change.Keys) { $row[$k] = $Change[$k] }
+                [pscustomobject]$row
+            }
+        }
+        It 'accepts a row the tool wrote: <Name>' -ForEach @(
+            @{ Name = 'a removed scope'; Change = @{} }
+            @{ Name = 'a deleted one-user grant'; Change = @{ ConsentType = 'Principal'; PrincipalId = '33333333-3333-3333-3333-333333333333'; Deleted = 'True'; ScopeBefore = 'Tools.ListInvoke.All'; Scope = 'Tools.ListInvoke.All'; ScopeAfter = '' } }
+            @{ Name = 'a new grant'; Change = @{ Action = 'grantmcpscope'; GrantId = ''; ClientKind = 'identity'; Created = 'True' } }
+        ) {
+            Get-UndoRowProblem -Row (New-PermLogRow $Change) -PackageById @{} | Should -BeNullOrEmpty
+        }
+        It 'refuses an edited row: <Why>' -ForEach @(
+            @{ Why = 'another permission as the scope'; Change = @{ Scope = 'Directory.ReadWrite.All' }; Expect = 'Scope' }
+            @{ Why = 'two scopes in one'; Change = @{ Scope = 'McpServers.Mail.All Directory.ReadWrite.All' }; Expect = 'Scope' }
+            @{ Why = 'the metadata scope'; Change = @{ Scope = 'McpServersMetadata.Read.All' }; Expect = 'Scope' }
+            @{ Why = 'a deleted grant to create with another permission'; Change = @{ Deleted = 'True'; ScopeBefore = 'McpServers.Mail.All Directory.ReadWrite.All'; ScopeAfter = '' }; Expect = 'ScopeBefore' }
+            @{ Why = 'a path as the client'; Change = @{ ClientId = '../applications/x' }; Expect = 'ClientId' }
+            @{ Why = 'a name as the resource'; Change = @{ ResourceId = 'Microsoft Graph' }; Expect = 'ResourceId' }
+            @{ Why = 'a path as the grant id'; Change = @{ GrantId = 'abc/../../x' }; Expect = 'GrantId' }
+            @{ Why = 'an unknown consent type'; Change = @{ ConsentType = 'Everyone' }; Expect = 'ConsentType' }
+            @{ Why = 'a person in a grant for everyone'; Change = @{ PrincipalId = '33333333-3333-3333-3333-333333333333' }; Expect = 'names a principal' }
+            @{ Why = 'a one-user grant with no Entra id'; Change = @{ ConsentType = 'Principal'; PrincipalId = 'alice@contoso.com' }; Expect = 'PrincipalId' }
+            @{ Why = 'another kind of client'; Change = @{ ClientKind = 'application' }; Expect = 'ClientKind' }
+            @{ Why = 'a flag that is not true or false'; Change = @{ Deleted = 'yes' }; Expect = 'Created or Deleted' }
+        ) {
+            Get-UndoRowProblem -Row (New-PermLogRow $Change) -PackageById @{} | Should -Match ([regex]::Escape($Expect))
+        }
+        It 'keeps undo changes only when Entra confirms the client, the MCP server, the scope, the user and the scopes logged' {
+            Mock Write-Warning { $script:warned += , $Message }
+            $script:warned = @()
+            Mock Invoke-GraphBatch {
+                $q = $script:p
+                if ($Version -eq 'beta') { @{ $q.spA = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.agentIdentityBlueprintPrincipal' } }; $q.idA = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.agentIdentity' } } } }
+                else { @{ $q.toolsSp = @{ Status = 200; Body = [pscustomobject]@{ appId = $script:AgentToolsAppId; oauth2PermissionScopes = @([pscustomobject]@{ value = 'McpServers.Mail.All' }, [pscustomobject]@{ value = 'McpServers.Me.All' }) } }
+                          $q.mailSp = @{ Status = 200; Body = [pscustomobject]@{ appId = 'graph-app'; oauth2PermissionScopes = @([pscustomobject]@{ value = 'Mail.Read' }) } } } }
+            }
+            Mock Get-GraphAll { @(@{ id = 'g'; clientId = $script:p.spA; resourceId = $script:p.toolsSp; consentType = 'AllPrincipals'; principalId = $null; scope = 'McpServersMetadata.Read.All openid' }) }
+            Mock Get-AgentUserIdsByIdentity { @{ $script:p.idA = @('44444444-4444-4444-4444-444444444444') } }
+            $mk = { param([hashtable]$c) $x = New-PermLogRow $c; @(ConvertTo-McpPermissionUndoChanges @($x))[0] }
+            $ok = & $mk @{ ScopeAfter = 'McpServersMetadata.Read.All openid' }
+            $wrongKind = & $mk @{ ClientId = $p.idA; Agent = 'kind' }
+            $notMcp = & $mk @{ ResourceId = $p.mailSp; ResourceAppId = 'graph-app'; Agent = 'not mcp' }
+            $unpublished = & $mk @{ Scope = 'McpServers.Excel.All'; Agent = 'unpublished' }
+            $extra = & $mk @{ ScopeAfter = 'McpServersMetadata.Read.All Directory.ReadWrite.All'; Agent = 'extra' }
+            $person = & $mk @{ ClientId = $p.idA; ClientKind = 'identity'; ConsentType = 'Principal'; PrincipalId = '55555555-5555-5555-5555-555555555555'; Agent = 'person' }
+            $kept = @(Select-McpPermissionUndoChanges @($ok, $wrongKind, $notMcp, $unpublished, $extra, $person))
+            $kept.Count | Should -Be 1
+            $kept[0].Scope | Should -Be 'McpServers.Mail.All'
+            $script:warned.Count | Should -Be 5
+            ($script:warned -join "`n") | Should -BeLike '*kind*client is not*not mcp*not an MCP server*unpublished*does not publish*extra*Directory.ReadWrite.All*person*not an agent user*'
+        }
+        It 'takes the agents whose permission was removed for revoking straight after, once each' {
+            Mock Get-AgentSessionTargets { @($Packages | ForEach-Object { [pscustomobject]@{ Agent = $_.displayName; AgentId = $_.id; Identities = @(); AgentUsers = @('u') } }) }
+            Mock Invoke-AgentSessionRevoke { $script:revoked = @($Targets) }
+            $pk = @([pscustomobject]@{ id = 'P_A'; displayName = 'Alpha' }, [pscustomobject]@{ id = 'P_B'; displayName = 'Bravo' })
+            $recs = @([pscustomobject]@{ Result = 'Done'; Action = 'revokemcpscope'; AgentId = 'P_A' }, [pscustomobject]@{ Result = 'Done'; Action = 'revokemcpscope'; AgentId = 'P_A' },
+                      [pscustomobject]@{ Result = 'Done'; Action = 'blockmcp'; Mode = 'On'; Agent = 'Bravo'; AgentId = 'P_B'; IdentityId = 'id-b'; AgentUserIds = 'u-b' },
+                      [pscustomobject]@{ Result = 'Done'; Action = 'revokemcpscope'; AgentId = 'P_B' })
+            Invoke-SessionRevokeAfter -Records $recs -Packages $pk
+            @($script:revoked | ForEach-Object { $_.AgentId }) | Should -Be @('P_B', 'P_A')
+        }
+        It 'reads nothing for a log with no MCP block rows' {
+            Mock Invoke-GraphBatch { throw 'no call expected' }
+            @(Select-McpUndoItems (ConvertTo-McpUndoItems @())).Count | Should -Be 0
+            @(Select-McpPermissionUndoChanges (ConvertTo-McpPermissionUndoChanges @())).Count | Should -Be 0
+        }
+    }
+}
+
+Describe 'Agent identities of a blueprint' {
+    It 'lists every identity of a blueprint, following the next page, and marks one it cannot read' {
+        $bp1 = '11111111-0000-0000-0000-0000000000b0'; $bp2 = '22222222-0000-0000-0000-0000000000b0'
+        $script:pages = @{ $bp1 = @{ Status = 200; Body = @{ value = @(@{ id = 'AAAA'; displayName = 'One' }); '@odata.nextLink' = 'https://graph.microsoft.com/beta/next' } }; $bp2 = @{ Status = 403; Body = @{} } }
+        Mock Invoke-GraphBatch { $script:pages }
+        Mock Get-GraphAll { @(@{ id = 'BBBB'; displayName = 'Two' }) }
+        $m = Get-BlueprintIdentities @($bp1, $bp2.ToUpperInvariant(), 'not-a-guid')
+        @($m[$bp1] | ForEach-Object { $_.Id }) | Should -Be @('aaaa', 'bbbb')
+        $m.ContainsKey($bp2) | Should -BeTrue; $null -eq $m[$bp2] | Should -BeTrue
+        $m.Count | Should -Be 2
     }
 }
 
