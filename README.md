@@ -67,7 +67,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 ## Requirements
 
 - An **Agent 365 license** on the tenant (the catalog API returns packages only with it).
-- **PowerShell 7 or later** is recommended. The `Microsoft.Graph.Authentication` module installs itself on first run.
+- **PowerShell 7 or later** is recommended. When `Microsoft.Graph.Authentication` is missing, the first run installs the tested version (2.39.0) from the PowerShell Gallery for the current user; PowerShellGet asks first if the gallery is not trusted.
 - An administrator who can consent to the permissions listed below, for example an AI Administrator or Global Administrator.
 - Stale-by-activity, risky agents, inventory details and policies also read **Defender Advanced Hunting**: a Microsoft Defender or Microsoft 365 E5 license with Security for AI onboarded.
 - Endpoint AI needs devices onboarded to **Microsoft Defender for Endpoint** (Windows or macOS). Defender's own local agent discovery needs Plan 2.
@@ -125,7 +125,9 @@ The tool signs in with delegated permissions and requests only what the chosen m
 
 - **Preview first.** `-WhatIf` shows what would happen. `-Action list` shows the matched set without acting.
 - **One confirmation per batch.** Each write mode lists its targets and asks once. `-Force` skips the question. A selection made in a picker counts as confirmation.
-- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners and access scope, removes sponsors or owners the run added, dismisses a compromised flag the run set, and puts MCP blocks back the way they were.
+- **A log you can undo.** `-OutFile run.csv` (or `.json`) records every agent with the state it had before the change. `-Undo run.csv` restores block state, owners and access scope, removes sponsors or owners the run added, dismisses a compromised flag the run set, removes local AI agent block rules, and puts MCP blocks back the way they were. All changes of one run go into one log, even when the run writes it more than once.
+- **An edited log cannot widen an undo.** Before a log drives any write, every row is checked: the agent must be in the catalog, Entra ids must be ids, an identity must be that agent's own, and values must be ones the tool writes. MCP rows are confirmed in Entra (an agent identity or blueprint, agent user accounts only, an MCP server), and block rules must be ones the tool made. Rows that fail are named and left out, and agents are shown with their names from the catalog.
+- **Exports are safe to open in Excel.** A cell that starts with `=`, `+`, `-` or `@` is written with a leading apostrophe, so an agent name or page title from the tenant cannot run as a formula.
 - **Revoking sessions is the exception.** It cannot be undone and needs nothing undone: the agent signs in again, subject to any block in place. It writes a log of its own (`name-revoke.csv` beside `-OutFile`) so the log of the block it follows stays usable by `-Undo`.
 - **Agents already in the target state are skipped.**
 - **Throttling is handled.** HTTP 429 and transient 5xx responses are retried with the service's delay; large reads are batched and writes are paced.
@@ -400,7 +402,7 @@ In the console, select a tool on the Shadow AI page and press **Block on this de
 .\Agent365-Bulk-Actions.ps1 -DeleteCandidates -MinDaysBlocked 30 -OutFile .\delete-candidates.csv
 ```
 
-- **`-DisableIdentity`** checks the agent's Entra identity after the block. Blocking a package that has an Agent ID normally makes the platform disable the identity within about ten seconds, and unblocking re-enables it. The tool waits up to 30 seconds, records `Disabled (by platform)` or `Enabled (by platform)` in the log, and calls the identity API itself only if the platform left it in the wrong state (`Disabled (by tool)`, or `Failed` with the error). Only agents that have an identity are checked. The forced path needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role.
+- **`-DisableIdentity`** checks the agent's Entra identity after the block. Blocking a package that has an Agent ID normally makes the platform disable the identity within about ten seconds, and unblocking re-enables it. The tool waits up to 30 seconds, records `Disabled (by platform)` or `Enabled (by platform)` in the log, and calls the identity API itself only if the platform left it in the wrong state (`Disabled (by tool)`, or `Failed` with the error). Only agents that have an identity and that the run blocked or unblocked are checked; an agent already in the target state is left as it is, so `-WhatIf` changes nothing. The forced path needs `AgentIdentity.EnableDisable.All` and the Agent ID Administrator role.
 - **`-Impact`** reads each target's detail record (`activeUsers`, `totalSessions`, `lastUsedDateTime`). These figures are not in the list call, so the tool fetches them only for the agents you are about to act on.
 - **`-DeleteCandidates`** deletes nothing: the catalog API has no delete, and a block lasts until someone reverses it. It lists blocked agents that have stayed blocked at least `-MinDaysBlocked` days. The block date comes from this tool's own logs (`-OutFile` files and the console's logs under `%LOCALAPPDATA%\Agent365-Bulk-Actions\logs`; add others with `-History`) and from the `BlockedAgent` audit events Defender keeps for about 30 days. Agents whose block date is unknown are skipped unless you add `-IncludeUnknown`. Delete them in the admin center (Agents > All agents > Delete, then Deleted > Permanently delete), or through the Power Platform API for Copilot Studio agents.
 
@@ -655,7 +657,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-Unblock` | names and/or ids | Unblock packages. |
 | `-Select` | switch | Pick agents from a grid or numbered menu, then apply `-Action`. |
 | `-FromCsv` | path | Apply `-Action` (block, unblock or list) to every agent in a CSV with an `Id` or `DisplayName` column. |
-| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners, compromised flags, MCP blocks). |
+| `-Undo` | path | Reverse a run from its `-OutFile` log (block state, owners, access scope, added sponsors and owners, compromised flags, local AI agent block rules, MCP blocks). Every row is checked first. |
 | `-Stale` | switch | Act on agents stale beyond `-StaleDays`. |
 | `-Risky` | switch | Act on agents with Defender AI-security alerts or detections. |
 | `-Ownerless` | switch | Propose owners for shared agents whose owner is missing. Add `-Action reassign` to apply. |

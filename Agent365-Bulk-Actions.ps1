@@ -419,9 +419,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity' -and $StaleDa
 }
 
 # --- ensure the Graph auth module (no full SDK needed) ---
+# Installs the tested version, and lets PowerShellGet ask before it trusts a repository.
 if (-not $script:LoadOnly -and -not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-    Write-Host 'Installing Microsoft.Graph.Authentication (CurrentUser)...' -ForegroundColor Yellow
-    Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber
+    Write-Host 'Installing Microsoft.Graph.Authentication 2.39.0 (CurrentUser)...' -ForegroundColor Yellow
+    Install-Module Microsoft.Graph.Authentication -RequiredVersion 2.39.0 -Repository PSGallery -Scope CurrentUser
 }
 if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
 
@@ -527,7 +528,7 @@ function Connect-GraphSession {
 }
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
-$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory', 'Compromise', 'DismissRisk')) -or
+$readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory', 'Compromise', 'DismissRisk', 'DeleteCandidates', 'AiActivity', 'AddSponsor', 'Accountability')) -or
             ($PSCmdlet.ParameterSetName -eq 'Policy' -and -not $Apply) -or
             ($PSCmdlet.ParameterSetName -in @('Select', 'Stale', 'Risky', 'FromCsv', 'Ownerless', 'Accountability') -and $Action -eq 'list')
 $scopes = @(if ($readOnly) { 'CopilotPackages.Read.All' } else { 'CopilotPackages.ReadWrite.All' })
@@ -551,7 +552,10 @@ if ($PSCmdlet.ParameterSetName -eq 'Policy' -and (Test-Path -LiteralPath $Policy
     if ($policyText -match '"groups"\s*:\s*\[\s*"') { $scopes += 'Group.Read.All' }
 }
 if ($PSCmdlet.ParameterSetName -in @('Detail', 'Inventory')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All', 'DelegatedPermissionGrant.Read.All' }
-if ($PSCmdlet.ParameterSetName -eq 'Policy') { $scopes += 'User.Read.All', 'AgentIdentity.Read.All'; if ($Apply) { $scopes += 'AgentIdentity.EnableDisable.All' } }
+if ($PSCmdlet.ParameterSetName -eq 'Policy') {
+    $scopes += 'User.Read.All', 'AgentIdentity.Read.All'
+    if ($Apply -and $policyText -match '"disableIdentity"\s*:\s*true') { $scopes += 'AgentIdentity.EnableDisable.All' }
+}
 if ($PSCmdlet.ParameterSetName -eq 'SignIn') { $scopes = $script:AllScopes }
 if ($PSCmdlet.ParameterSetName -eq 'EndpointAi') { $scopes = @('ThreatHunting.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'BlockLocalAgent') { $scopes = @('ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All') }
@@ -562,7 +566,7 @@ if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.
 if ($PSCmdlet.ParameterSetName -eq 'McpAccess') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All') }
 if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess') }
 if ($RevokeSessions) { $scopes += 'User.RevokeSessions.All', 'User.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All' }
-if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess' }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess', 'Application.Read.All', 'User.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
 $connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
 if ($TenantId)   { $connect['TenantId'] = $TenantId }
@@ -936,7 +940,7 @@ function Invoke-OwnerReassign {
         if (-not (Test-Proceed ("{0} -> {1}" -f $i.DisplayName, $i.NewOwnerUpn) 'Reassign')) { $rec.Result = 'WhatIf' }
         else {
             try {
-                Invoke-Graph -Method POST -Uri "$BaseBeta/$($i.Id)/reassign" -Body (@{ userId = $i.NewOwnerId } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+                Invoke-Graph -Method POST -Uri "$BaseBeta/$([uri]::EscapeDataString([string]$i.Id))/reassign" -Body (@{ userId = $i.NewOwnerId } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
                 Write-Host ("  OK   {0}  ->  {1}" -f $i.DisplayName, $i.NewOwnerUpn) -ForegroundColor Green
                 $rec.Result = 'Done'; $ok++
             } catch {
@@ -986,7 +990,7 @@ function Resolve-AccessEntities {
     foreach ($g in @($Groups | Where-Object { $_ })) {
         $byId = $g -match $script:GuidPattern
         $uri = if ($byId) { "https://graph.microsoft.com/v1.0/groups/$g`?`$select=id,displayName" }
-               else { ("https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '{0}'&`$select=id,displayName" -f ($g -replace "'", "''")) }
+               else { ("https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '{0}'&`$select=id,displayName" -f [uri]::EscapeDataString(($g -replace "'", "''"))) }
         $r = Invoke-Graph -Uri $uri
         $hit = @(if ($byId) { $r } else { $r.value })
         if ($hit.Count -ne 1 -or -not $hit[0].id) { throw "Group '$g' matched $($hit.Count) group(s); use its object id." }
@@ -1090,7 +1094,7 @@ function Invoke-AccessRestore {
             $body = New-AccessPatchBody -AvailableTo ([string]$r.WasAvailableTo) -Allowed $allowed -DeployedTo ([string]$r.WasDeployedTo) -Acquire $acquire -IncludeDeployment:$deploy
             if (-not (Test-Proceed ("{0} -> {1}" -f $r.DisplayName, (Get-AccessLabel $r.WasAvailableTo)) 'Restore who can use')) { $rec.Result = 'WhatIf' }
             else {
-                Invoke-Graph -Method PATCH -Uri "$Base/$($r.Id)" -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' | Out-Null
+                Invoke-Graph -Method PATCH -Uri "$Base/$([uri]::EscapeDataString([string]$r.Id))" -Body ($body | ConvertTo-Json -Depth 5) -ContentType 'application/json' | Out-Null
                 Write-Host ("  OK   {0}  restored to {1}" -f $r.DisplayName, (Get-AccessLabel $r.WasAvailableTo)) -ForegroundColor Green
                 $rec.Result = 'Done'; $ok++
             }
@@ -1239,17 +1243,28 @@ function Invoke-AccountabilityAssign {
 # Remove what logged 'addsponsor' / 'addowner' rows added.
 function Invoke-AccountabilityRemove {
     param([object[]]$Records)
-    $ok = 0; $fail = 0
+    $who = (Get-MgContext).Account
+    $log = New-Object 'System.Collections.Generic.List[object]'; $ok = 0; $fail = 0
     foreach ($r in $Records) {
         $segment = if ($r.Action -eq 'addsponsor') { 'sponsors' } else { 'owners' }
-        if (-not (Test-Proceed ("{0}: remove {1} {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) 'Remove accountability')) { continue }
-        try {
-            $uri = 'https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/{1}/{2}/$ref' -f $r.IdentityId, $segment, $r.UserId
-            Invoke-Graph -Method DELETE -Uri $uri | Out-Null
-            Write-Host ("  OK   {0}  -{1}  {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) -ForegroundColor Green; $ok++
-        } catch { Write-Host ("  FAIL {0}  -> {1}" -f $r.DisplayName, $_.Exception.Message) -ForegroundColor Red; $fail++ }
+        $rec = [ordered]@{ Timestamp = (Get-Date).ToUniversalTime().ToString('o'); Operator = $who; Action = 'remove-' + $segment.TrimEnd('s')
+                           Id = $r.Id; DisplayName = $r.DisplayName; IdentityId = $r.IdentityId; UserId = $r.UserId; User = $r.User; Result = ''; Error = '' }
+        if (-not (Test-Proceed ("{0}: remove {1} {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) 'Remove accountability')) { $rec.Result = 'WhatIf' }
+        else {
+            try {
+                $uri = 'https://graph.microsoft.com/beta/servicePrincipals/{0}/microsoft.graph.agentIdentity/{1}/{2}/$ref' -f [uri]::EscapeDataString([string]$r.IdentityId), $segment, [uri]::EscapeDataString([string]$r.UserId)
+                Invoke-Graph -Method DELETE -Uri $uri | Out-Null
+                Write-Host ("  OK   {0}  -{1}  {2}" -f $r.DisplayName, $segment.TrimEnd('s'), $r.User) -ForegroundColor Green
+                $rec.Result = 'Done'; $ok++
+            } catch {
+                Write-Host ("  FAIL {0}  -> {1}" -f $r.DisplayName, $_.Exception.Message) -ForegroundColor Red
+                $rec.Result = 'Failed'; $rec.Error = $_.Exception.Message; $fail++
+            }
+        }
+        $log.Add([pscustomobject]$rec)
     }
     Write-Host ("Removed {0}, {1} failed." -f $ok, $fail) -ForegroundColor Cyan
+    Export-ActionLog -Records $log
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1328,6 +1343,8 @@ function Protect-CommandLine {
     $t = $Text -replace '(?i)(\s(?:-p|--prompt|-m|--message|--print|-c)\s+)("[^"]*"|''[^'']*''|\S+)', '$1"<prompt hidden>"'
     $t = $t -replace '(?i)(--?(?:api[-_]?key|token|password|secret|authorization|auth)(?:\s+|=))\S+', '$1***'
     $t = $t -replace '(?i)\bsk-[A-Za-z0-9_\-]{12,}', 'sk-***' -replace '(?i)Bearer\s+\S+', 'Bearer ***'
+    $t = $t -replace '(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PWD)[A-Z0-9_]*\s*[=:]\s*)("[^"]*"|''[^'']*''|\S+)', '$1***'
+    $t = $t -replace '\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,})', '***'
     if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + '...' }
     $t
 }
@@ -1806,8 +1823,9 @@ function Get-LocalAgentBlockWarning {
 # The hunting query the rule runs: that device, and only the files this tool was seen running from.
 function New-LocalAgentBlockQuery {
     param([object]$Row)
+    if ([string]$Row.DeviceId -notmatch '^[\w-]+$') { throw "Unexpected Defender device id: $($Row.DeviceId)" }
     $patterns = @(Get-LocalAgentBlockPaths -Row $Row -Raw | ForEach-Object { ConvertTo-PathRegex $_ } | Get-Distinct)
-    $regex = '(?i)^(' + ($patterns -join '|') + ')$'
+    $regex = ('(?i)^(' + ($patterns -join '|') + ')$') -replace '"', '""'
 @"
 DeviceProcessEvents
 | where DeviceId == "$($Row.DeviceId)"
@@ -2057,7 +2075,7 @@ function Get-AgentIdentityIds {
         if ($map[$id].Blueprint) { $blueprints[$map[$id].Blueprint] = $true }
     }
     if ($blueprints.Count) {
-        $pr = Invoke-GraphBatch -Version beta -Requests @($blueprints.Keys | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals?$filter=appId eq ''{0}''&$select=id' -f $_) } })
+        $pr = Invoke-GraphBatch -Version beta -Requests @($blueprints.Keys | Where-Object { $_ -match $script:GuidPattern } | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals?$filter=appId eq ''{0}''&$select=id' -f $_) } })
         foreach ($id in $ids) {
             $bp = $map[$id].Blueprint
             $r = if ($bp) { $pr[$bp] } else { $null }
@@ -3338,10 +3356,17 @@ function Find-McpBlockPolicy {
 }
 
 function New-McpBlockPolicyBody {
-    param([string]$AppId, [string]$ResourceName, [ValidateSet('Identities', 'Users')][string]$Subject, [string[]]$Ids, [ValidateSet('On', 'Report-only')][string]$Mode, [switch]$ConditionsOnly)
+    param([string]$AppId, [string]$ResourceName, [ValidateSet('Identities', 'Users')][string]$Subject, [string[]]$Ids, [ValidateSet('On', 'Report-only')][string]$Mode, [switch]$ConditionsOnly, [object]$Existing)
     $conditions = if ($Subject -eq 'Identities') {
         @{ users = @{ includeUsers = @('None') }; clientApplications = @{ includeAgentIdServicePrincipals = @($Ids) }; applications = @{ includeApplications = @($AppId) } }
     } else { @{ users = @{ includeUsers = @($Ids) }; applications = @{ includeApplications = @($AppId) } } }
+    # Exclusions an administrator added to an existing policy are sent back unchanged, so an update cannot drop them.
+    if ($Existing) {
+        foreach ($pair in @('users', 'excludeUsers'), @('users', 'excludeGroups'), @('users', 'excludeRoles'), @('clientApplications', 'excludeAgentIdServicePrincipals'), @('applications', 'excludeApplications')) {
+            $kept = @($Existing.conditions.($pair[0]).($pair[1]) | Where-Object { $_ })
+            if ($kept.Count -and $conditions.ContainsKey($pair[0])) { $conditions[$pair[0]][$pair[1]] = $kept }
+        }
+    }
     if ($ConditionsOnly) { return @{ conditions = $conditions } }
     @{
         displayName   = '{0}{1} for {2}{3}' -f $script:McpBlockPrefix, $ResourceName, $(if ($Subject -eq 'Identities') { 'agent identities' } else { 'agent user accounts' }), $(if ($Mode -eq 'Report-only') { ' (report-only)' } else { '' })
@@ -3413,7 +3438,7 @@ function Invoke-McpBlockChange {
             if ($set.Ids.Count -eq 0) {
                 if ($set.Policy) { Invoke-Graph -Method DELETE -Uri ('{0}/{1}' -f $script:CaPolicyBase, $set.Policy.id) | Out-Null }
             } elseif ($set.Policy) {
-                $body = New-McpBlockPolicyBody -AppId $set.AppId -ResourceName $set.Name -Subject $set.Subject -Ids @($set.Ids) -Mode $set.Mode -ConditionsOnly
+                $body = New-McpBlockPolicyBody -AppId $set.AppId -ResourceName $set.Name -Subject $set.Subject -Ids @($set.Ids) -Mode $set.Mode -ConditionsOnly -Existing $set.Policy
                 Invoke-Graph -Method PATCH -Uri ('{0}/{1}' -f $script:CaPolicyBase, $set.Policy.id) -Body ($body | ConvertTo-Json -Depth 8) -ContentType 'application/json' | Out-Null
             } else {
                 $body = New-McpBlockPolicyBody -AppId $set.AppId -ResourceName $set.Name -Subject $set.Subject -Ids @($set.Ids) -Mode $set.Mode
@@ -4011,6 +4036,7 @@ function ConvertTo-PermissionRows {
 function Get-IdentityPermissions {
     param([string]$ServicePrincipalId, [string]$Source)
     $grants = @(); $roles = @()
+    if ($ServicePrincipalId -notmatch $script:GuidPattern) { return }
     try { $grants = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=clientId eq '$ServicePrincipalId'").value) } catch { $null = $_ }
     try { $roles = @((Invoke-Graph -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$ServicePrincipalId/appRoleAssignments?`$top=100").value) } catch { $null = $_ }
     # resolve every resource in one pass before building rows
@@ -4039,11 +4065,11 @@ function Initialize-ResourceCache {
 function Get-PermissionsBulk {
     param([object[]]$Items)
     $out = @{}
-    $Items = @($Items | Where-Object { $_ -and $_.ServicePrincipalId })
+    $Items = @($Items | Where-Object { $_ -and $_.ServicePrincipalId -match $script:GuidPattern })
     if ($Items.Count -eq 0) { return $out }
 
     # blueprint service principals, once per blueprint
-    $bpApps = @($Items | ForEach-Object { $_.BlueprintAppId } | Where-Object { $_ } | Get-Distinct | Where-Object { -not $script:BlueprintPermCache.ContainsKey($_) })
+    $bpApps = @($Items | ForEach-Object { $_.BlueprintAppId } | Where-Object { $_ -match $script:GuidPattern } | Get-Distinct | Where-Object { -not $script:BlueprintPermCache.ContainsKey($_) })
     $bpSp = @{}
     if ($bpApps.Count) {
         $res = Invoke-GraphBatch -Requests @($bpApps | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals?`$filter=appId eq '$_'&`$select=id" } }) -Activity 'Reading agent blueprints'
@@ -4176,7 +4202,7 @@ $script:BlueprintPermCache = @{}
 function Get-AgentPermissionList {
     param([string]$AgentIdentityId, [string]$BlueprintAppId)
     $perms = @(Get-IdentityPermissions -ServicePrincipalId $AgentIdentityId -Source 'Agent identity')
-    if ($BlueprintAppId) {
+    if ($BlueprintAppId -match $script:GuidPattern) {
         if (-not $script:BlueprintPermCache.ContainsKey($BlueprintAppId)) {
             $inherited = @()
             try {
@@ -4889,12 +4915,112 @@ function Get-AiActivityData {
     $script:AiActivityCache
 }
 
-# Save the per-agent results (and the state each agent had before the run) as CSV or JSON.
+# An undo log is a plain file anyone can edit, so before its rows drive writes their ids are checked. Why a row cannot be
+# undone, or nothing when it can: agents must be in the catalog, Entra ids must be GUIDs, an identity must be the agent's own,
+# values must be ones the tool writes, and a rule must be one the tool made.
+function Get-UndoRowProblem {
+    param([object]$Row, [hashtable]$PackageById)
+    $action = [string]$Row.Action
+    $pkg = if ($Row.Id) { $PackageById[[string]$Row.Id] }
+    if ($action -in 'block', 'unblock', 'reassign', 'restrict', 'confirmcompromised', 'addsponsor', 'addowner' -and -not $pkg) { return 'the agent is not in the catalog' }
+    $ids = switch ($action) {
+        'reassign' { 'WasOwner' }
+        { $_ -in 'addsponsor', 'addowner' } { 'IdentityId', 'UserId' }
+        'confirmcompromised' { 'IdentityId' }
+        { $_ -in 'blockmcp', 'unblockmcp' } { 'IdentityId', 'ResourceAppId' }
+    }
+    foreach ($f in @($ids)) { if ([string]$Row.$f -notmatch $script:GuidPattern) { return "$f is not an Entra id" } }
+    if ($action -in 'confirmcompromised', 'addsponsor', 'addowner' -and [string]$Row.IdentityId -ne [string]$pkg.agentIdentityId) { return "the identity is not this agent's" }
+    if ($action -eq 'restrict') {
+        if ([string]$Row.WasAvailableTo -notin 'allowedForAll', 'allowedForSome', 'allowedForNone') { return 'the access to restore is not one the tool writes' }
+        if ([string]$Row.WasDeployedTo -notin '', 'acquiredForAll', 'acquiredForSome', 'acquiredForNone') { return 'the deployment to restore is not one the tool writes' }
+        try { $refs = @(foreach ($f in 'WasAllowed', 'WasAcquire') { if ($Row.$f) { ConvertFrom-Json ([string]$Row.$f) } }) } catch { return 'the users and groups to restore cannot be read' }
+        if (@($refs | Where-Object { $_ -and [string]$_.resourceId -notmatch $script:GuidPattern }).Count) { return 'the users and groups to restore are not Entra ids' }
+    }
+    if ($action -in 'blockmcp', 'unblockmcp') {
+        if (@(([string]$Row.AgentUserIds).Split(';', [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { $_ -notmatch $script:GuidPattern }).Count) { return 'AgentUserIds holds something other than Entra ids' }
+        if ([string]$Row.WasMode -notin '', 'On', 'Report-only') { return 'WasMode is not a block mode' }
+    }
+    if ($action -eq 'blocklocalagent' -and [string]$Row.RuleId -notlike "$script:BlockRulePrefix*") { return 'the rule was not made by this tool' }
+}
+
+# The undoable rows of a log that pass Get-UndoRowProblem, named from the catalog rather than from the file.
+function Select-UndoRows {
+    param([object[]]$Rows, [hashtable]$PackageById)
+    $undoable = 'block', 'unblock', 'reassign', 'restrict', 'addsponsor', 'addowner', 'confirmcompromised', 'blocklocalagent', 'blockmcp', 'unblockmcp'
+    foreach ($r in @($Rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in $undoable })) {
+        $problem = Get-UndoRowProblem -Row $r -PackageById $PackageById
+        if ($problem) {
+            $name = @($r.DisplayName, $r.Agent, $r.Tool, $r.Id | Where-Object { $_ })[0]
+            Write-Warning ("Undo leaves out the {0} row for '{1}': {2}." -f $r.Action, $name, $problem); continue
+        }
+        if ($r.Id -and $PackageById.ContainsKey([string]$r.Id) -and $r.PSObject.Properties['DisplayName']) { $r.DisplayName = $PackageById[[string]$r.Id].displayName }
+        $r
+    }
+}
+
+# The MCP undo items Entra confirms: the subject is an agent identity or blueprint, every user an agent user and the resource
+# an MCP server. A log edited to name people or other applications is refused.
+function Select-McpUndoItems {
+    param([object[]]$Items)
+    $items = @($Items)
+    if ($items.Count -eq 0) { return }
+    $subjects = @($items | ForEach-Object { [string]$_.IdentityId } | Get-Distinct)
+    $res = Invoke-GraphBatch -Version beta -Requests @($subjects | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_`?`$select=id" } }) -Activity 'Checking the agents in the log'
+    $agentUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($list in @((Get-AgentUserIdsByIdentity).Values)) { foreach ($u in @($list)) { [void]$agentUsers.Add([string]$u) } }
+    $servers = @{}
+    foreach ($app in @($items | ForEach-Object { [string]$_.ResourceAppId } | Get-Distinct)) {
+        $sp = @((Invoke-Graph -Uri ("https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '{0}'&`$select=appId,oauth2PermissionScopes" -f $app)).value)[0]
+        $servers[$app] = ($app -eq $script:AgentToolsAppId) -or ($sp -and @($sp.oauth2PermissionScopes | ForEach-Object { $_.value }) -contains 'Tools.ListInvoke.All')
+    }
+    foreach ($it in $items) {
+        $r = $res[[string]$it.IdentityId]
+        $type = if ($r -and $r.Status -eq 200) { [string]$r.Body.'@odata.type' } else { '' }
+        $why = if ($type -notmatch 'agentIdentity(BlueprintPrincipal)?$') { 'the subject is not an agent identity or blueprint' }
+               elseif (@($it.AgentUserIds | Where-Object { -not $agentUsers.Contains([string]$_) }).Count) { 'a user in it is not an agent user' }
+               elseif (-not $servers[[string]$it.ResourceAppId]) { 'the resource is not an MCP server' }
+        if ($why) { Write-Warning ("Undo leaves out {0} / {1}: {2}." -f $it.Agent, $it.Server, $why); continue }
+        $it
+    }
+}
+# A cell Excel would read as a formula (it starts with = + - @, a tab or a carriage return) gets a leading apostrophe, so names
+# and titles that come from the tenant cannot run as formulas when an export is opened. Plain negative numbers are left alone.
+function Protect-CsvCell {
+    param([object]$Value)
+    if ($Value -is [string] -and $Value -match '^[=+\-@\t\r]' -and $Value -notmatch '^-?\d+(\.\d+)?$' -and $Value -ne '-') { return "'$Value" }
+    $Value
+}
+
+# Rows ready for Export-Csv: the columns of every row, since rows of different actions can share one file, and safe cells.
+function ConvertTo-CsvRows {
+    param([object[]]$Rows)
+    $columns = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in $Rows) { foreach ($prop in $r.PSObject.Properties) { if ($seen.Add($prop.Name)) { $columns.Add($prop.Name) } } }
+    foreach ($r in $Rows) {
+        $o = [ordered]@{}
+        foreach ($c in $columns) { $o[$c] = Protect-CsvCell $r.$c }
+        [pscustomobject]$o
+    }
+}
+
+# Save the per-agent results (and the state each agent had before the run) as CSV or JSON. A run that writes the same file
+# more than once adds to it, so every change the run made stays undoable from one log.
+$script:LogsWritten = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 function Export-ActionLog {
     param([object[]]$Records)
     if (-not $OutFile -or $Records.Count -eq 0) { return }
-    if ($OutFile -match '\.json$') { $Records | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $OutFile -Encoding utf8 }
-    else { $Records | Export-Csv -LiteralPath $OutFile -NoTypeInformation -Encoding utf8 }
+    $path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
+    $json = $path -match '\.json$'
+    $all = @($Records)
+    if ($script:LogsWritten.Contains($path) -and (Test-Path -LiteralPath $path)) {
+        $earlier = if ($json) { @(Get-Content -Raw -LiteralPath $path | ConvertFrom-Json) } else { @(Import-Csv -LiteralPath $path) }
+        $all = @($earlier) + $all
+    }
+    if ($json) { ConvertTo-Json -InputObject $all -Depth 3 | Set-Content -LiteralPath $path -Encoding utf8 }
+    else { ConvertTo-CsvRows $all | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding utf8 }
+    [void]$script:LogsWritten.Add($path)
     Write-Host "Result log: $OutFile" -ForegroundColor Cyan
 }
 
@@ -4910,7 +5036,7 @@ function Set-AgentIdentityState {
 # ourselves for agents the platform left in the wrong state.
 function Confirm-AgentIdentityState {
     param([object[]]$Records, [hashtable]$PackageById, [bool]$WantDisabled, [int]$WaitSeconds = 30)
-    $pending = @($Records | Where-Object { $_.Result -in 'Done', 'Skipped' -and $PackageById[$_.Id].agentIdentityId })
+    $pending = @($Records | Where-Object { $_.Result -eq 'Done' -and $PackageById[$_.Id].agentIdentityId })
     if ($pending.Count -eq 0) { return }
     $wantEnabled = -not $WantDisabled
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
@@ -6121,7 +6247,10 @@ function Set-DetailWindowContent {
 function Test-GraphScope { param([string]$Scope) @((Get-MgContext).Scopes) -contains $Scope }
 function Request-GraphScope {
     param([string]$Scope)
-    Connect-GraphSession -Connect @{ Scopes = @(@((Get-MgContext).Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
+    $context = Get-MgContext
+    $connect = @{ Scopes = @(@($context.Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
+    if ($context.TenantId) { $connect['TenantId'] = $context.TenantId }
+    Connect-GraphSession -Connect $connect
 }
 
 # Fill the pane under the events with everything known about the highlighted one.
@@ -6353,7 +6482,7 @@ function New-EndpointAiWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object Tool, Vendor, Category, Device, User, Version, Status, Blocked, Risk, Why, Runs, Sources, FirstSeen, LastSeen)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d.Add_ContentRendered({ if (-not $script:epWindow.Tag) { Update-EndpointAiWindow -Window $script:epWindow -Load } })
     $d
@@ -6595,7 +6724,7 @@ function New-AgentUsersWindow {
         $out = @($shown | Select-Object Agent, User, Upn, Kind, @{ n = 'Interactions'; e = { $_.Interactions } }, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } },
                                         Last, Licensed, License, LicenseDetail)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d.Add_ContentRendered({ if (-not $script:auWindow.Tag) { Update-AgentUsersWindow -Window $script:auWindow -Load } })
     $d
@@ -6737,7 +6866,7 @@ function New-PolicyHitsWindow {
         $out = @($shown | Select-Object Agent, Source, Policy, Rule, @{ n = 'WhatItDid'; e = { $_.Did } }, Actions, Severity, Where, Item, ItemPath, User, @{ n = 'ApplicationId'; e = { $_.App } }, @{ n = 'TiedBy'; e = { $_.Tied } },
                                         Hits, @{ n = 'Last7Days'; e = { $_.N7 } }, @{ n = 'Last14Days'; e = { $_.N14 } }, @{ n = 'Last30Days'; e = { $_.N30 } }, Last, Link)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d.Add_ContentRendered({ if (-not $script:phWindow.Tag) { Update-PolicyHitsWindow -Window $script:phWindow -Load } })
     $d
@@ -6898,7 +7027,7 @@ function New-AgentAlertsWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($shown | Select-Object @{ n = 'Raised'; e = { $_.Time } }, Agent, @{ n = 'Alert'; e = { $_.Title } }, Severity, Category, Source, @{ n = 'TiedBy'; e = { $_.Via } }, InInventory, AlertId, Link)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d.Add_ContentRendered({ if ($null -eq $script:aaWindow.Tag) { Update-AgentAlertsWindow -Window $script:aaWindow -Load } })
     $d
@@ -7133,7 +7262,7 @@ function New-McpAccessWindow {
         $out = @($shown | Select-Object Agent, AgentId, Kind, Platform, Server, @{ n = 'EntraApplication'; e = { $_.ResourceAppId } }, Permission, @{ n = 'PermissionDetail'; e = { $_.PermParts -join ' | ' } },
             @{ n = 'SetUp'; e = { $_.Declared } }, Calls, Calls7, Calls14, Calls30, Connects, Errors, LastCall, Tools, Via, Block, BlockText, BlockPolicies, @{ n = 'CannotBlockBecause'; e = { $_.CanBlock } }, Note)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d.Add_ContentRendered({ if (-not $script:mcWindow.Tag) { Update-McpAccessWindow -Window $script:mcWindow -Load } })
     $d
@@ -8627,7 +8756,7 @@ function New-HuntingWindow {
         if (-not $dlg.ShowDialog()) { return }
         if ($dlg.FileName -match '\.json$') { $res.Rows | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
         else {
-            @(foreach ($dr in $res.Table.Rows) { $o = [ordered]@{}; foreach ($c in $res.Columns) { $o[$c] = $dr[$c] }; [pscustomobject]$o }) |
+            ConvertTo-CsvRows @(foreach ($dr in $res.Table.Rows) { $o = [ordered]@{}; foreach ($c in $res.Columns) { $o[$c] = $dr[$c] }; [pscustomobject]$o }) |
                 Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8
         }
     })
@@ -8782,7 +8911,7 @@ function New-PurviewAuditWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($acts | Select-Object Time, Agent, User, App, Kind, Risk, Summary, Signals, Detail, Tools, Files, Web, Model, Conversation, RecordId)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
     })
     $d
 }
@@ -9503,10 +9632,16 @@ function New-ConsoleWindow {
     $script:ctx.ReadRisk = {
         param([object[]]$Rows)
         try {
-            if (-not (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All')) { & $script:ctx.Busy 'Granting access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.ReadWrite.All' }
+            if (-not ((Test-GraphScope 'IdentityRiskyAgent.Read.All') -or (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All'))) { & $script:ctx.Busy 'Granting read access to agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.Read.All' }
             & $script:ctx.Busy 'Reading the Entra risk of the selected agents...'
             Get-AgentRiskStates @($Rows | ForEach-Object { $_.Package.agentIdentityId })
         } catch { & $script:ctx.Idle 'Could not read agent risk.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Entra agent risk', 'OK', 'Error'); $null }
+    }
+    # Changing agent risk needs the write scope; ask for it only after the change is confirmed.
+    $script:ctx.GrantRiskWrite = {
+        if (Test-GraphScope 'IdentityRiskyAgent.ReadWrite.All') { return $true }
+        try { & $script:ctx.Busy 'Granting access to change agent risk: finish the sign-in window...'; Request-GraphScope 'IdentityRiskyAgent.ReadWrite.All'; $true }
+        catch { & $script:ctx.Idle 'Could not get access to change agent risk.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Entra agent risk', 'OK', 'Error'); $false }
     }
     $script:ctx.RiskList = {
         param([object[]]$Rows, [hashtable]$States)
@@ -9525,6 +9660,7 @@ function New-ConsoleWindow {
         if ($pending.Count -eq 0) { & $script:ctx.Idle 'Those agents are already confirmed as compromised.'; return }
         $text = "Confirm $($pending.Count) agent$(if ($pending.Count -ne 1) { 's' }) as compromised in Microsoft Entra?`n`n$(& $script:ctx.RiskList $pending $states)`n`nEntra sets the risk level to High. A Conditional Access policy that blocks high agent risk then blocks them. Undo last run dismisses the risk."
         if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Warning', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
+        if (-not (& $script:ctx.GrantRiskWrite)) { return }
         & $script:ctx.NewLogPath 'compromise'
         & $script:ctx.Busy ("Confirming {0} agent(s) as compromised..." -f $pending.Count)
         $recs = @(Invoke-AgentRiskAction -Packages @($pending | ForEach-Object { $_.Package }) -Action confirmCompromised -WaitSeconds 0 -PassThru)
@@ -9551,6 +9687,7 @@ function New-ConsoleWindow {
         if ($pending.Count -eq 0) { & $script:ctx.Idle 'None of the selected agents has an active Entra risk to clear.'; return }
         $text = "Clear the Entra risk of $($pending.Count) agent$(if ($pending.Count -ne 1) { 's' })?`n`n$(& $script:ctx.RiskList $pending $states)`n`nThis dismisses the risk, whether it was confirmed by an administrator or raised by Entra, so a Conditional Access policy that blocks high agent risk stops blocking them. Entra then shows them as dismissed, and the earlier detection stays in its history. Entra applies it within a few minutes."
         if ([Windows.MessageBox]::Show($text, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
+        if (-not (& $script:ctx.GrantRiskWrite)) { return }
         & $script:ctx.NewLogPath 'clear-risk'
         & $script:ctx.Busy ("Clearing the Entra risk of {0} agent(s)..." -f $pending.Count)
         $recs = @(Invoke-AgentRiskAction -Packages @($pending | ForEach-Object { $_.Package }) -Action dismiss -WaitSeconds 0 -PassThru)
@@ -9618,6 +9755,9 @@ function New-ConsoleWindow {
         if ($checked.Count -gt $rows.Count) {
             [void][Windows.MessageBox]::Show(("{0} of the {1} selected agents are not shared agents and were left out: the service only reassigns Copilot Studio shared agents that already have an owner." -f ($checked.Count - $rows.Count), $checked.Count), 'Assign owner', 'OK', 'Information')
         }
+        $names = ($items | Select-Object -First 12 | ForEach-Object { "  - $($_.DisplayName)" }) -join "`n"
+        if ($items.Count -gt 12) { $names += "`n  ... and $($items.Count - 12) more" }
+        if ([Windows.MessageBox]::Show("Make $($owner.Upn) the owner of $($items.Count) agent(s)?`n`n$names", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { & $script:ctx.Idle 'Cancelled.'; return }
         & $script:ctx.ReassignRows $items 'Assign owner'
     })
     $script:ui.BtnReset.Add_Click({ & $script:ctx.ResetFilters; & $script:ctx.Refilter; & $script:ctx.Idle 'Filters reset. Showing all agents.' })
@@ -9636,6 +9776,7 @@ function New-ConsoleWindow {
         $done = @($script:ctx.LastRun | Where-Object { $_.Result -eq 'Done' })
         if ($done.Count -gt 0 -and $done[0].Action -eq 'restrict') {
             if ([Windows.MessageBox]::Show("Restore the previous access of $($done.Count) agent(s)?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            & $script:ctx.NewLogPath 'access-undo'
             $recs = @(Invoke-AccessRestore -Records $done -PassThru)
             foreach ($rec in @($recs | Where-Object { $_.Result -eq 'Done' })) {
                 $row = $script:ctx.RowById[[string]$rec.Id]
@@ -9662,6 +9803,7 @@ function New-ConsoleWindow {
             $note = Get-DismissNote $done
             $ask = "Dismiss the compromised flag of $($done.Count) agent$(if ($done.Count -ne 1) { 's' }) in Microsoft Entra?" + $(if ($note) { "`n`n$note" } else { '' })
             if ([Windows.MessageBox]::Show($ask, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            & $script:ctx.NewLogPath 'compromise-undo'
             $recs = @(Invoke-AgentRiskDismiss -Records $done -WaitSeconds 0 -PassThru)
             $script:ctx.LastRun = @()
             & $script:ctx.Refilter
@@ -9670,6 +9812,7 @@ function New-ConsoleWindow {
         }
         if ($done.Count -gt 0 -and $done[0].Action -in 'addsponsor', 'addowner') {
             if ([Windows.MessageBox]::Show("Remove the sponsor or owner added to $($done.Count) agent identit$(if ($done.Count -eq 1) { 'y' } else { 'ies' })?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            & $script:ctx.NewLogPath 'accountability-undo'
             Invoke-AccountabilityRemove -Records $done
             $script:ctx.LastRun = @()
             & $script:ctx.Refilter
@@ -9688,7 +9831,7 @@ function New-ConsoleWindow {
         if (-not $dlg.ShowDialog()) { return }
         $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, Availability, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
         if ($dlg.FileName -match '\.json$') { $out | ConvertTo-Json | Set-Content -LiteralPath $dlg.FileName -Encoding utf8 }
-        else { $out | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
+        else { ConvertTo-CsvRows @($out) | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding utf8 }
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
     })
 
@@ -10134,6 +10277,9 @@ switch ($PSCmdlet.ParameterSetName) {
         if (-not (Test-Path -LiteralPath $Undo)) { throw "Log not found: $Undo" }
         $rows = if ($Undo -match '\.json$') { @(Get-Content -Raw -LiteralPath $Undo | ConvertFrom-Json) }
                 else { @(Import-Csv -LiteralPath $Undo) }
+        $byId = @{}
+        foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
+        $rows = @(Select-UndoRows -Rows $rows -PackageById $byId)
         $changed = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'unblock' })
         $ownerChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'reassign' })
         $accessChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'restrict' })
@@ -10141,9 +10287,10 @@ switch ($PSCmdlet.ParameterSetName) {
         $riskChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'confirmcompromised' })
         $blockRules = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'blocklocalagent' })
         $mcpChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'blockmcp', 'unblockmcp' })
-        if ($mcpChanges.Count -gt 0) {
-            $mcpChanges | Select-Object Agent, Server, @{ n = 'now'; e = { $_.Mode } }, @{ n = 'restoreTo'; e = { if ($_.WasMode) { $_.WasMode } else { 'Not blocked' } } } | Format-Table -AutoSize | Out-Host
-            if (Confirm-Batch -Count $mcpChanges.Count -Action 'restore the MCP block state of') { Invoke-McpBlockChange -Items @(ConvertTo-McpUndoItems $mcpChanges) }
+        $mcpItems = @(Select-McpUndoItems (ConvertTo-McpUndoItems $mcpChanges))
+        if ($mcpItems.Count -gt 0) {
+            $mcpItems | Select-Object Agent, Server, IdentityId, @{ n = 'agentUsers'; e = { @($_.AgentUserIds).Count } }, @{ n = 'restoreTo'; e = { if ($_.Target) { $_.Target } else { 'Not blocked' } } } | Format-Table -AutoSize | Out-Host
+            if (Confirm-Batch -Count $mcpItems.Count -Action 'restore the MCP block state of') { Invoke-McpBlockChange -Items $mcpItems }
         }
         if ($accessChanges.Count -gt 0) {
             $accessChanges | Select-Object DisplayName, @{ n = 'now'; e = { Get-AccessLabel $_.NewAvailableTo } }, @{ n = 'restoreTo'; e = { Get-AccessLabel $_.WasAvailableTo } } | Format-Table -AutoSize | Out-Host
@@ -10154,10 +10301,15 @@ switch ($PSCmdlet.ParameterSetName) {
             if (Confirm-Batch -Count $accountChanges.Count -Action 'remove accountability for') { Invoke-AccountabilityRemove -Records $accountChanges }
         }
         if ($blockRules.Count -gt 0) {
+            $live = Get-LocalAgentBlocks
+            foreach ($r in @($blockRules | Where-Object { -not $live.ContainsKey([string]$_.RuleId) })) { Write-Warning ("Undo leaves out rule {0}: this tool has no such block rule now." -f $r.RuleId) }
+            $blockRules = @($blockRules | Where-Object { $live.ContainsKey([string]$_.RuleId) })
+        }
+        if ($blockRules.Count -gt 0) {
             $blockRules | Select-Object Tool, Device, RuleId | Format-Table -AutoSize | Out-Host
             Write-Warning 'Removing the rule stops further quarantines. Files Defender already quarantined stay quarantined until restored in Microsoft Defender.'
             if (Confirm-Batch -Count $blockRules.Count -Action 'remove the block rule of') {
-                Invoke-LocalAgentUnblock -Rules @($blockRules | ForEach-Object { [pscustomobject]@{ id = $_.RuleId; displayName = ('Agent365 Bulk Actions: block {0} on {1}' -f $_.Tool, $_.Device) } })
+                Invoke-LocalAgentUnblock -Rules @($blockRules | ForEach-Object { $live[[string]$_.RuleId] })
             }
         }
         if ($riskChanges.Count -gt 0) {
@@ -10177,8 +10329,6 @@ switch ($PSCmdlet.ParameterSetName) {
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
         if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0 -and $mcpChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
-        $byId = @{}
-        foreach ($p in @(Get-Packages)) { if (-not $byId.ContainsKey([string]$p.id)) { $byId[[string]$p.id] = $p } }
         $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
         foreach ($r in $changed) {
             $pkg = $byId[[string]$r.Id]

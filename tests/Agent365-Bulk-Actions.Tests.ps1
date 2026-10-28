@@ -482,8 +482,8 @@ Describe 'Permission and risk helpers' {
         $script:BlueprintPermCache = @{}
         Mock Get-IdentityPermissions { param($ServicePrincipalId, $Source) @([pscustomobject]@{ Source = $Source; Kind = 'Delegated'; Resource = 'R'; Permission = "p-$ServicePrincipalId"; Consent = 'x' }) }
         Mock Invoke-Graph { $script:script_bpCalls++; [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-sp'; displayName = 'BP' }) } }
-        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'bp-app')
-        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'bp-app')
+        $first = @(Get-AgentPermissionList -AgentIdentityId 'id1' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
+        $second = @(Get-AgentPermissionList -AgentIdentityId 'id2' -BlueprintAppId 'b0000000-0000-0000-0000-0000000000b1')
         $first.Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
         $second.Count | Should -Be 2
         $script:script_bpCalls | Should -Be 1
@@ -652,7 +652,7 @@ Describe 'Bulk permission, detail and identity-state reads' {
             }
             $h
         }
-        $items = 1..30 | ForEach-Object { @{ Key = "k$_"; ServicePrincipalId = "sp$_"; BlueprintAppId = 'bp-app' } }
+        $items = 1..30 | ForEach-Object { @{ Key = "k$_"; ServicePrincipalId = ('00000000-0000-0000-0000-{0:d12}' -f $_); BlueprintAppId = 'b0000000-0000-0000-0000-0000000000b1' } }
         $got = Get-PermissionsBulk -Items $items
         $got.Count | Should -Be 30
         $got['k7'].Source | Should -Be @('Agent identity', 'Blueprint (inherited)')
@@ -2211,11 +2211,11 @@ Describe 'Conditional Access check for agents' {
     }
     It 'finds each agent identity''s app id, blueprint and blueprint principal in two batches' {
         Mock Invoke-GraphBatch {
-            if ($Requests[0].url -match '\?\$filter') { @{ 'bp-app' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-principal' }) } } } }
-            else { @{ 'ag1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ appId = 'ag1-app'; agentIdentityBlueprintId = 'bp-app' } }; 'ag2' = [pscustomobject]@{ Status = 404; Body = $null } } }
+            if ($Requests[0].url -match '\?\$filter') { @{ 'b0000000-0000-0000-0000-0000000000b1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ value = @([pscustomobject]@{ id = 'bp-principal' }) } } } }
+            else { @{ 'ag1' = [pscustomobject]@{ Status = 200; Body = [pscustomobject]@{ appId = 'ag1-app'; agentIdentityBlueprintId = 'b0000000-0000-0000-0000-0000000000b1' } }; 'ag2' = [pscustomobject]@{ Status = 404; Body = $null } } }
         }
         $m = Get-AgentIdentityIds @('ag1', 'ag2', 'ag1')
-        $m['ag1'].AppId | Should -Be 'ag1-app'; $m['ag1'].Blueprint | Should -Be 'bp-app'; $m['ag1'].Principal | Should -Be 'bp-principal'
+        $m['ag1'].AppId | Should -Be 'ag1-app'; $m['ag1'].Blueprint | Should -Be 'b0000000-0000-0000-0000-0000000000b1'; $m['ag1'].Principal | Should -Be 'bp-principal'
         $m['ag2'].Blueprint | Should -Be ''
         Should -Invoke Invoke-GraphBatch -Times 2
     }
@@ -3201,5 +3201,149 @@ Describe 'Security pages' {
         @(Select-PurviewAuditActivities -Activities $a -Days 30).Count | Should -Be 3
         @(Select-PurviewAuditActivities -Activities $a -Days 30 -OnlyIds @('t_a')).Count | Should -Be 2
         @(Select-PurviewAuditActivities -Activities $a -Days 30 -RiskyOnly).Count | Should -Be 1
+    }
+}
+
+Describe 'Security hardening' {
+    BeforeAll {
+        $script:idA = '11111111-1111-1111-1111-111111111111'
+        $script:idB = '22222222-2222-2222-2222-222222222222'
+        $script:user = '33333333-3333-3333-3333-333333333333'
+        $script:app = '44444444-4444-4444-4444-444444444444'
+        $script:catalog = @{ 'T_1' = (New-Pkg 'T_1' 'Alpha' -IdentityId $script:idA); 'T_2' = (New-Pkg 'T_2' 'Beta' -IdentityId $script:idB) }
+    }
+
+    Context 'undo logs' {
+        It 'accepts rows whose ids are well formed: <Action>' -ForEach @(
+            @{ Action = 'block'; Row = @{ Id = 'T_1' } }
+            @{ Action = 'reassign'; Row = @{ Id = 'T_1'; WasOwner = '55555555-5555-5555-5555-555555555555' } }
+            @{ Action = 'addowner'; Row = @{ Id = 'T_1'; IdentityId = '11111111-1111-1111-1111-111111111111'; UserId = '33333333-3333-3333-3333-333333333333' } }
+            @{ Action = 'confirmcompromised'; Row = @{ Id = 'T_2'; IdentityId = '22222222-2222-2222-2222-222222222222' } }
+            @{ Action = 'restrict'; Row = @{ Id = 'T_1'; WasAvailableTo = 'allowedForSome'; WasDeployedTo = ''; WasAllowed = '[{"resourceType":"user","resourceId":"33333333-3333-3333-3333-333333333333"}]' } }
+            @{ Action = 'blockmcp'; Row = @{ IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = '33333333-3333-3333-3333-333333333333'; WasMode = 'Report-only' } }
+            @{ Action = 'blocklocalagent'; Row = @{ RuleId = 'a365ba-block-ollama-abc' } }
+        ) {
+            $Row['Action'] = $Action
+            Get-UndoRowProblem -Row ([pscustomobject]$Row) -PackageById $script:catalog | Should -BeNullOrEmpty
+        }
+
+        It 'refuses an edited row: <Why>' -ForEach @(
+            @{ Why = 'a path in place of a user id'; Row = @{ Action = 'addowner'; Id = 'T_1'; IdentityId = '11111111-1111-1111-1111-111111111111'; UserId = '../../../identity/conditionalAccess/policies/x#' }; Expect = 'UserId' }
+            @{ Why = 'the identity of another agent'; Row = @{ Action = 'confirmcompromised'; Id = 'T_1'; IdentityId = '22222222-2222-2222-2222-222222222222' }; Expect = "not this agent's" }
+            @{ Why = 'an agent not in the catalog'; Row = @{ Action = 'reassign'; Id = 'T_9'; WasOwner = '55555555-5555-5555-5555-555555555555' }; Expect = 'catalog' }
+            @{ Why = 'All as the users of an MCP block'; Row = @{ Action = 'blockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = 'All'; WasMode = 'On' }; Expect = 'AgentUserIds' }
+            @{ Why = 'All as the MCP resource'; Row = @{ Action = 'blockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = 'All'; AgentUserIds = ''; WasMode = 'On' }; Expect = 'ResourceAppId' }
+            @{ Why = 'an unknown block mode'; Row = @{ Action = 'unblockmcp'; IdentityId = '11111111-1111-1111-1111-111111111111'; ResourceAppId = '44444444-4444-4444-4444-444444444444'; AgentUserIds = ''; WasMode = 'Everything' }; Expect = 'WasMode' }
+            @{ Why = 'an unknown access value'; Row = @{ Action = 'restrict'; Id = 'T_1'; WasAvailableTo = 'allowedForEveryoneAndMore'; WasDeployedTo = '' }; Expect = 'access' }
+            @{ Why = 'a name in place of a group id'; Row = @{ Action = 'restrict'; Id = 'T_1'; WasAvailableTo = 'allowedForSome'; WasDeployedTo = ''; WasAllowed = '[{"resourceType":"group","resourceId":"All Staff"}]' }; Expect = 'Entra ids' }
+            @{ Why = 'a rule the tool did not make'; Row = @{ Action = 'blocklocalagent'; RuleId = '1234' }; Expect = 'not made by this tool' }
+        ) {
+            Get-UndoRowProblem -Row ([pscustomobject]$Row) -PackageById $script:catalog | Should -Match ([regex]::Escape($Expect))
+        }
+
+        It 'keeps only undoable rows that pass, named from the catalog' {
+            Mock Write-Warning { }
+            $rows = @(
+                [pscustomobject]@{ Action = 'block'; Result = 'Done'; Id = 'T_1'; DisplayName = '=HYPERLINK("x")' }
+                [pscustomobject]@{ Action = 'block'; Result = 'Failed'; Id = 'T_2'; DisplayName = 'Beta' }
+                [pscustomobject]@{ Action = 'addowner'; Result = 'Done'; Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = $script:idA; UserId = 'nope' }
+            )
+            $kept = @(Select-UndoRows -Rows $rows -PackageById $script:catalog)
+            $kept.Count | Should -Be 1
+            $kept[0].DisplayName | Should -Be 'Alpha'
+            Should -Invoke Write-Warning -Times 1
+        }
+
+        It 'keeps MCP undo items only when Entra confirms an agent subject, agent users and an MCP server' {
+            Mock Write-Warning { }
+            Mock Invoke-GraphBatch { @{ $script:idA = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.agentIdentity' } }
+                                         $script:idB = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.servicePrincipal' } } } }
+            Mock Get-AgentUserIdsByIdentity { @{ $script:idA = @($script:user) } }
+            Mock Invoke-Graph { [pscustomobject]@{ value = @([pscustomobject]@{ appId = $script:app; oauth2PermissionScopes = @([pscustomobject]@{ value = 'Tools.ListInvoke.All' }) }) } }
+            $ok = [pscustomobject]@{ Agent = 'Alpha'; Server = 'Mail'; IdentityId = $script:idA; AgentUserIds = @($script:user); ResourceAppId = $script:app; Target = '' }
+            $person = [pscustomobject]@{ Agent = 'Alpha'; Server = 'Mail'; IdentityId = $script:idA; AgentUserIds = @('66666666-6666-6666-6666-666666666666'); ResourceAppId = $script:app; Target = 'On' }
+            $notAgent = [pscustomobject]@{ Agent = 'Beta'; Server = 'Mail'; IdentityId = $script:idB; AgentUserIds = @(); ResourceAppId = $script:app; Target = 'On' }
+            $kept = @(Select-McpUndoItems @($ok, $person, $notAgent))
+            $kept.Count | Should -Be 1
+            $kept[0].Agent | Should -Be 'Alpha'
+            Should -Invoke Write-Warning -Times 2
+        }
+
+        It 'logs removed sponsors and owners, and escapes the ids it puts in the path' {
+            Mock Invoke-Graph { }
+            Mock Test-Proceed { $true }
+            Mock Write-Host { }
+            $OutFile = Join-Path $TestDrive 'remove.csv'
+            $script:LogsWritten.Clear()
+            Invoke-AccountabilityRemove -Records @([pscustomobject]@{ Action = 'addsponsor'; Id = 'T_1'; DisplayName = 'Alpha'; IdentityId = $script:idA; UserId = $script:user; User = 'u@contoso.com' })
+            Should -Invoke Invoke-Graph -Times 1 -ParameterFilter { $Method -eq 'DELETE' -and $Uri -like "*/$($script:idA)/microsoft.graph.agentIdentity/sponsors/$($script:user)/`$ref" }
+            $log = @(Import-Csv $OutFile)
+            $log[0].Action | Should -Be 'remove-sponsor'
+            $log[0].Result | Should -Be 'Done'
+            $script:LogsWritten.Clear()
+        }
+    }
+
+    Context 'exports' {
+        It 'neutralizes a cell Excel would run as a formula: <Value>' -ForEach @(
+            @{ Value = '=HYPERLINK("https://x","open")' }
+            @{ Value = '+cmd' }
+            @{ Value = '@SUM(A1)' }
+            @{ Value = "`t=1" }
+            @{ Value = '-2+3' }
+        ) {
+            Protect-CsvCell $Value | Should -Be "'$Value"
+        }
+        It 'leaves an ordinary value alone: <Value>' -ForEach @(
+            @{ Value = 'Contoso agent' }
+            @{ Value = '-5' }
+            @{ Value = '-' }
+            @{ Value = '2026-10-28' }
+        ) {
+            Protect-CsvCell $Value | Should -Be $Value
+        }
+        It 'keeps every column when rows of different actions share a file' {
+            $rows = @(ConvertTo-CsvRows @([pscustomobject]@{ Action = 'block'; Id = 'T_1' }, [pscustomobject]@{ Action = 'restore-access'; Id = 'T_2'; RestoredTo = 'allowedForAll' }))
+            $rows[0].PSObject.Properties.Name | Should -Be @('Action', 'Id', 'RestoredTo')
+        }
+        It 'adds to a log the same run already wrote instead of replacing it' {
+            Mock Write-Host { }
+            $OutFile = Join-Path $TestDrive 'run.csv'
+            $script:LogsWritten.Clear()
+            Export-ActionLog -Records @([pscustomobject]@{ Action = 'block'; Result = 'Done'; Id = 'T_1' })
+            Export-ActionLog -Records @([pscustomobject]@{ Action = 'restrict'; Result = 'Done'; Id = 'T_2'; WasAvailableTo = 'allowedForAll' })
+            $log = @(Import-Csv $OutFile)
+            $log.Count | Should -Be 2
+            $log[1].WasAvailableTo | Should -Be 'allowedForAll'
+            $script:LogsWritten.Clear()
+        }
+    }
+
+    Context 'writes' {
+        It 'leaves the identity of an agent the run did not change alone, so -WhatIf writes nothing' {
+            Mock Start-Sleep { }
+            Mock Set-AgentIdentityState { }
+            Mock Get-AgentIdentityStateMap { @{ $script:idA = $true } }
+            $records = @([pscustomobject]@{ Id = 'T_1'; Result = 'Skipped'; Identity = ''; Error = '' }, [pscustomobject]@{ Id = 'T_1'; Result = 'WhatIf'; Identity = ''; Error = '' })
+            Confirm-AgentIdentityState -Records $records -PackageById $script:catalog -WantDisabled $true -WaitSeconds 0
+            Should -Invoke Set-AgentIdentityState -Times 0
+        }
+        It 'keeps exclusions an administrator added to a block policy' {
+            $existing = [pscustomobject]@{ conditions = [pscustomobject]@{ users = [pscustomobject]@{ excludeUsers = @($script:user) }; clientApplications = [pscustomobject]@{ excludeAgentIdServicePrincipals = @($script:idB) } } }
+            $body = New-McpBlockPolicyBody -AppId $script:app -ResourceName 'Mail' -Subject Identities -Ids @($script:idA) -Mode 'Report-only' -ConditionsOnly -Existing $existing
+            $body.conditions.users.excludeUsers | Should -Be @($script:user)
+            $body.conditions.clientApplications.excludeAgentIdServicePrincipals | Should -Be @($script:idB)
+            $body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @($script:idA)
+        }
+        It 'refuses a device id that could change the detection rule query' {
+            $row = [pscustomobject]@{ ToolKey = 'ollama'; Tool = 'Ollama'; Device = 'lab'; DeviceId = 'abc" or 1==1 //'; Blocked = ''
+                                      Evidence = [pscustomobject]@{ Processes = @([pscustomobject]@{ File = 'ollama.exe'; Path = 'C:\Users\alice\AppData\Local\Programs\Ollama\ollama.exe' }) } }
+            { New-LocalAgentBlockQuery $row } | Should -Throw '*device id*'
+        }
+        It 'hides tokens in environment variables, headers and known formats' {
+            $t = Protect-CommandLine 'GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 node server.js -H "X-Api-Key: s3cr3t" xoxb-123456789012-abcdef'
+            $t | Should -Not -Match 'ghp_|s3cr3t|xoxb-'
+            $t | Should -Match 'node server\.js'
+        }
     }
 }
