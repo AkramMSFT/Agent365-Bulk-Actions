@@ -11,6 +11,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Permissions](#permissions)
+  - [Use your own app registration](#use-your-own-app-registration)
 - [Safety model](#safety-model)
 - [How it works](#how-it-works)
 - [Guides](#guides)
@@ -120,6 +121,25 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
 | `Application.Read.All`, `DelegatedPermissionGrant.Read.All` | Reading the permissions an agent identity holds (`-Detail`, `-Inventory -WithPermissions`, `-McpAccess`). The console shows the same data when these permissions have been consented for your account. |
 | `AuditLogsQuery.Read.All` | AI activity (`-AiActivity`, the console's AI activity tab, `aiActivity` policy rules). Needs admin consent and a Purview audit role such as Audit Reader. |
+
+### Use your own app registration
+
+By default the tool signs in through the shared **Microsoft Graph Command Line Tools** app. Entra puts every permission consented to that app into each token it issues, so after `-SignIn` every run, and any other Graph PowerShell script you run, carries the write permissions too. An app registration of your own keeps the tool's rights separate and limited to what you grant it. You can register two: a read-only app for reporting, and one with write permissions for the administrators who make changes.
+
+1. In the Microsoft Entra admin center, open **App registrations > New registration**. Choose **Accounts in this organizational directory only**.
+2. Under **Authentication**, add the platform **Mobile and desktop applications** with the redirect URI `http://localhost`. To sign in with `-DeviceCode`, also turn on **Allow public client flows**.
+3. Under **API permissions**, add the **Microsoft Graph** delegated permissions from the table above that the app should have, then **Grant admin consent**.
+4. Run the tool with the app:
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -SignIn -ClientId <application-id> -TenantId <tenant-id>
+
+# Or set both once for every run, scheduled runs included
+$env:A365_BULK_ACTIONS_CLIENT_ID = '<application-id>'
+$env:A365_BULK_ACTIONS_TENANT_ID = '<tenant-id>'
+```
+
+With your own app, `-SignIn` asks only for what the app was granted. A mode that needs a permission the app lacks fails at sign-in with a message naming the missing setup.
 
 ## Safety model
 
@@ -696,6 +716,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | `-WhatIf` | any write | switch | Show what would change; change nothing. |
 | `-OutFile` | most modes | path (.csv or .json) | Write a result log, or export the result. |
 | `-TenantId` | all | GUID or domain | Target a specific tenant. |
+| `-ClientId` | all | GUID | Sign in with your own app registration instead of the shared Graph PowerShell app; needs `-TenantId`. See [Use your own app registration](#use-your-own-app-registration). |
 | `-DeviceCode` | all | switch | Sign in with a device code from the start, instead of a sign-in window. Without it the window comes first and the tool falls back to a code only where it cannot be shown. A code works for about two minutes; the tool asks for a new one up to three times. A session made with a code is reused with a code, which the tool does by itself. |
 | `-DisableIdentity` | block, unblock | switch | Verify the Entra identity is disabled (enabled after unblock); force it only if the platform did not. |
 | `-Impact` | block, unblock, stale, risky | switch | Show active users, sessions and last use before acting. |

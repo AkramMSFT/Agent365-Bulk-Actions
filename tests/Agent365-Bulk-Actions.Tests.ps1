@@ -3350,3 +3350,44 @@ Describe 'Security hardening' {
         }
     }
 }
+
+Describe 'Own app registration' {
+    BeforeAll {
+        $script:app = '55555555-5555-5555-5555-555555555555'
+        $script:tenant = '66666666-6666-6666-6666-666666666666'
+    }
+    It 'asks for the mode''s scopes on the shared app' {
+        $c = New-ConnectSettings -Scopes @('A.Read.All', 'A.Read.All', 'B.Read.All')
+        $c.Scopes | Should -Be @('A.Read.All', 'B.Read.All')
+        $c.ContainsKey('ClientId') | Should -BeFalse
+    }
+    It 'passes the app and its tenant, and asks only for what the app was granted at -SignIn' {
+        $c = New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client $script:app
+        $c.ClientId | Should -Be $script:app
+        $c.TenantId | Should -Be $script:tenant
+        $c.Scopes | Should -Be @('A.Read.All')
+        $s = New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client $script:app -SignIn
+        $s.ContainsKey('Scopes') | Should -BeFalse
+    }
+    It 'refuses an app without a tenant, or an id that is not a GUID' {
+        { New-ConnectSettings -Scopes @('A.Read.All') -Client $script:app } | Should -Throw '*needs -TenantId*'
+        { New-ConnectSettings -Scopes @('A.Read.All') -Tenant $script:tenant -Client 'my-app' } | Should -Throw '*GUID*'
+    }
+    It 'keeps the app and the tenant when the console asks for one more permission' {
+        Mock Get-MgContext { [pscustomobject]@{ Scopes = @('A.Read.All'); TenantId = $script:tenant } }
+        Mock Connect-GraphSession { $script:sent = $Connect }
+        $script:ClientId = $script:app
+        try { Request-GraphScope 'B.Read.All' } finally { $script:ClientId = '' }
+        $script:sent.ClientId | Should -Be $script:app
+        $script:sent.TenantId | Should -Be $script:tenant
+        $script:sent.Scopes | Should -Be @('A.Read.All', 'B.Read.All')
+    }
+    It 'explains app registration errors: <Code>' -ForEach @(
+        @{ Code = 'AADSTS700016'; Says = 'not found in that tenant' }
+        @{ Code = 'AADSTS50011'; Says = 'redirect URI' }
+        @{ Code = 'AADSTS7000218'; Says = 'public client flows' }
+        @{ Code = 'AADSTS65001'; Says = 'admin consent' }
+    ) {
+        Get-SignInHelp "$($Code): something went wrong" | Should -Match ([regex]::Escape($Says))
+    }
+}

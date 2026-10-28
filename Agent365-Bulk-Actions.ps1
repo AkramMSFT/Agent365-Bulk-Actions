@@ -25,6 +25,11 @@
 .PARAMETER TenantId
   Optional. Target a specific tenant (GUID or domain). If omitted, sign-in uses your account's home tenant.
 
+.PARAMETER ClientId
+  Optional. The application (client) id of your own Entra app registration, used to sign in instead of the shared Microsoft Graph
+  Command Line Tools app, so tokens carry only the permissions granted to that app. Needs -TenantId. The environment variables
+  A365_BULK_ACTIONS_CLIENT_ID and A365_BULK_ACTIONS_TENANT_ID set both for every run.
+
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -SignIn
   Sign in once from a terminal with every permission the tool can use. Later runs, scheduled ones included, reuse the saved session without a prompt.
@@ -396,6 +401,8 @@ param(
 
     [string]$TenantId,                        # optional: target a specific tenant (default = home tenant)
 
+    [string]$ClientId,                        # optional: sign in with your own app registration instead of the shared Graph PowerShell app
+
     [switch]$DeviceCode
 )
 
@@ -447,6 +454,15 @@ function Get-SignInHelp {
     if ($Message -match 'timed out') {
         return ($Message.Trim() + ' A device code must be entered within two minutes. Run .\Agent365-Bulk-Actions.ps1 -SignIn in a terminal instead, which has no such limit.')
     }
+    $first = $Message.Split("`n")[0].Trim()
+    $app = switch -Regex ($Message) {
+        'AADSTS700016' { 'The app registration named by -ClientId was not found in that tenant. Check the application (client) id and -TenantId.' }
+        'AADSTS50194' { 'The app registration is single-tenant, so sign-in needs -TenantId.' }
+        'AADSTS50011' { 'The app registration has no matching redirect URI. Add http://localhost under Authentication > Mobile and desktop applications.' }
+        'AADSTS7000218|AADSTS70002\b' { 'Device code sign-in needs "Allow public client flows" turned on in the app registration (Authentication).' }
+        'AADSTS65001|AADSTS90094|AADSTS90008' { 'The app registration has not been granted a permission this mode needs. Add it under API permissions and grant admin consent.' }
+    }
+    if ($app) { return "$app (Original error: $first)" }
     $Message
 }
 
@@ -526,6 +542,19 @@ function Connect-GraphSession {
         throw (Get-SignInHelp $msg)
     }
 }
+# What Connect-MgGraph is given: the mode's scopes, plus the tenant and the app registration when chosen. With an app of your own,
+# -SignIn asks for what that app was granted rather than for every permission the tool can use.
+function New-ConnectSettings {
+    param([string[]]$Scopes, [string]$Tenant, [string]$Client, [switch]$SignIn)
+    if ($Client -and $Client -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw "-ClientId must be the application (client) id of an app registration, a GUID. Got: $Client" }
+    if ($Client -and -not $Tenant) { throw '-ClientId needs -TenantId: an app registration signs in through its own tenant.' }
+    $connect = @{ NoWelcome = $true }
+    if (-not ($Client -and $SignIn)) { $connect['Scopes'] = @($Scopes | Select-Object -Unique) }
+    if ($Tenant) { $connect['TenantId'] = $Tenant }
+    if ($Client) { $connect['ClientId'] = $Client }
+    $connect
+}
+
 # --- sign in (delegated). Read-only paths need .Read.All; writes need .ReadWrite.All;
 #     activity-based staleness also needs ThreatHunting.Read.All for Advanced Hunting ---
 $readOnly = ($PSCmdlet.ParameterSetName -in @('List', 'Snapshot', 'Detail', 'Inventory', 'Compromise', 'DismissRisk', 'DeleteCandidates', 'AiActivity', 'AddSponsor', 'Accountability')) -or
@@ -568,9 +597,13 @@ if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp') { $scopes = @('Copi
 if ($RevokeSessions) { $scopes += 'User.RevokeSessions.All', 'User.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess', 'Application.Read.All', 'User.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
-$connect = @{ Scopes = @($scopes | Select-Object -Unique); NoWelcome = $true }
-if ($TenantId)   { $connect['TenantId'] = $TenantId }
-if (-not $script:LoadOnly) { Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode -Fresh:($PSCmdlet.ParameterSetName -eq 'SignIn') }
+if (-not $ClientId -and $env:A365_BULK_ACTIONS_CLIENT_ID) { $ClientId = $env:A365_BULK_ACTIONS_CLIENT_ID }
+if (-not $TenantId -and $env:A365_BULK_ACTIONS_TENANT_ID) { $TenantId = $env:A365_BULK_ACTIONS_TENANT_ID }
+$script:ClientId = $ClientId
+if (-not $script:LoadOnly) {
+    $connect = New-ConnectSettings -Scopes $scopes -Tenant $TenantId -Client $ClientId -SignIn:($PSCmdlet.ParameterSetName -eq 'SignIn')
+    Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode -Fresh:($PSCmdlet.ParameterSetName -eq 'SignIn')
+}
 
 $script:ThrottleHits = 0   # incremented on every throttled retry; write loops watch it to adapt their pace
 function Add-ThrottleHit { $script:ThrottleHits++ }
@@ -6302,6 +6335,7 @@ function Request-GraphScope {
     $context = Get-MgContext
     $connect = @{ Scopes = @(@($context.Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
     if ($context.TenantId) { $connect['TenantId'] = $context.TenantId }
+    if ($script:ClientId) { $connect['ClientId'] = $script:ClientId }
     Connect-GraphSession -Connect $connect
 }
 
