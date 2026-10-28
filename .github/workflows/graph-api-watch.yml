@@ -1,0 +1,50 @@
+name: Graph API watch
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Days of the Graph changelog to read
+        default: '7'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the Graph endpoints, surface and changelog
+        id: watch
+        shell: pwsh
+        env:
+          DAYS: ${{ github.event.inputs.days }}
+        run: |
+          $days = if ($env:DAYS) { [int]$env:DAYS } else { 7 }
+          $report = ./tools/Watch-GraphApi.ps1 -Days $days -OutFile graph-api-watch.md -PassThru
+          Get-Content graph-api-watch.md -Raw | Add-Content -Path $env:GITHUB_STEP_SUMMARY
+          "findings=$($report.HasFindings.ToString().ToLowerInvariant())" | Add-Content -Path $env:GITHUB_OUTPUT
+
+      - name: Open or update the tracking issue
+        if: steps.watch.outputs.findings == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $title = 'Microsoft Graph API watch'
+          $body = Get-Content graph-api-watch.md -Raw
+          if ($body.Length -gt 60000) { $body = $body.Substring(0, 60000) + "`n`nTruncated. The full report is in the run summary: $env:RUN_URL" }
+          Set-Content -Path issue.md -Value $body
+          $number = gh issue list --state open --search "in:title `"$title`"" --json number,title --jq ".[] | select(.title == `"$title`") | .number" | Select-Object -First 1
+          if ($number) {
+            gh issue edit $number --body-file issue.md
+            gh issue comment $number --body "Report updated by $env:RUN_URL"
+          } else {
+            gh issue create --title $title --body-file issue.md
+          }

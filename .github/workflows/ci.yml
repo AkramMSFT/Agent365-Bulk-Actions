@@ -20,14 +20,16 @@ jobs:
       - name: Syntax check
         shell: pwsh
         run: |
-          $errors = $null
-          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD/Agent365-Bulk-Actions.ps1", [ref]$null, [ref]$errors)
-          if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          foreach ($file in './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1') {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
+            if ($errors) { $errors | ForEach-Object { Write-Error "$file $($_.Message)" }; exit 1 }
+          }
 
       - name: Lint
         shell: pwsh
         run: |
-          $findings = Invoke-ScriptAnalyzer -Path ./Agent365-Bulk-Actions.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+          $findings = './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1' | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }
           $findings | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap
           if ($findings) { exit 1 }
 

@@ -38,6 +38,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 - [Troubleshooting](#troubleshooting)
 - [Appendix: hunting queries](#appendix-hunting-queries)
 - [Development](#development)
+  - [Graph API watch](#graph-api-watch)
 - [Disclaimer](#disclaimer)
 
 ## Features
@@ -866,9 +867,34 @@ union alerts, rtp, shield
 # Tests (Pester 5 or later) and lint (PSScriptAnalyzer); CI runs the same on every pull request
 Invoke-Pester -Path .\tests
 Invoke-ScriptAnalyzer -Path .\Agent365-Bulk-Actions.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+Invoke-ScriptAnalyzer -Path .\tools\Watch-GraphApi.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
 ```
 
 Dot-sourcing the script (`. .\Agent365-Bulk-Actions.ps1`) loads its functions without signing in or running anything, which is how the tests exercise them with mocked Graph calls.
+
+### Graph API watch
+
+Part of the tool runs on Graph beta, and Microsoft adds, promotes and retires Graph APIs regularly. `tools/Watch-GraphApi.ps1` checks the kit against the published API without signing in:
+
+| Check | What it reports |
+| --- | --- |
+| Endpoints | Each endpoint in `tools/graph-endpoints.json`, resolved against the live `$metadata` of its version: not found, or marked deprecated with the removal date |
+| Beta endpoints in v1.0 | Beta endpoints the kit calls that also exist in v1.0, with the beta properties v1.0 still lacks, nested ones included (such as `conditions.agents` on Conditional Access policies). Changes since the baseline are flagged |
+| Endpoint list | Graph calls in the script that `graph-endpoints.json` does not list. The tests fail on these too |
+| Agent, Copilot and MCP surface | Types, properties, relationships, actions, functions and enum members added or removed since `tools/graph-api-baseline.json` |
+| Changelog | Entries from the [Graph changelog](https://developer.microsoft.com/graph/changelog) about agents, Copilot, MCP and the APIs the kit calls |
+
+```powershell
+# Report, reading the last 30 days of the changelog
+./tools/Watch-GraphApi.ps1 -OutFile graph-api-watch.md
+
+# After acting on a report, record the current state as the new baseline and commit it
+./tools/Watch-GraphApi.ps1 -UpdateBaseline
+```
+
+The [Graph API watch workflow](.github/workflows/graph-api-watch.yml) runs it every Monday and, when there is something to review, keeps one open issue named **Microsoft Graph API watch** up to date. It can also be started from the Actions tab. GitHub pauses scheduled workflows in a public repository after 60 days without activity.
+
+When adding a Graph call to the script, add its endpoint to `tools/graph-endpoints.json`.
 
 ## Disclaimer
 
