@@ -2343,6 +2343,14 @@ function Get-AgentUsersReport {
     [pscustomobject]@{ Rows = @($rows) }
 }
 
+# The rows of chosen catalog agents (by AgentId), or every row when none is chosen. A row tied to no agent belongs to none.
+function Select-ChosenAgentRows {
+    param([object[]]$Rows, [string[]]$OnlyIds)
+    $only = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $OnlyIds) { if ($id) { [void]$only.Add($id) } }
+    @(foreach ($r in $Rows) { if (-not $only.Count -or ($r.AgentId -and $only.Contains([string]$r.AgentId))) { $r } })
+}
+
 # The rows of one period (7, 14 or 30 days): users with at least one interaction in it, the count for that period in Interactions,
 # optionally only users without an Agent 365 or E7 license, or whose agent, name or account contains the text.
 function Select-AgentUserRows {
@@ -2637,9 +2645,7 @@ function Get-AgentPolicyHitsReport {
             -N7 (& $age 7) -N14 (& $age 14) -N30 $g.Count -Last ($when | Sort-Object -Descending | Select-Object -First 1) -App ([string]@($f.Alert.AppIds)[0]) -Where $newest.Category -Link $newest.Link))
     }
     $all = $rows.ToArray()
-    $keep = $all
-    if ($OnlyIds) { $only = @($OnlyIds | ForEach-Object { ([string]$_).ToLowerInvariant() }); $keep = @($all | Where-Object { $_.AgentId -and ($only -contains $_.AgentId.ToLowerInvariant()) }) }
-    [pscustomobject]@{ Rows = $keep; AllRows = $all; Note = $userNote; AlertCount = $alerts.Count }
+    [pscustomobject]@{ Rows = @(Select-ChosenAgentRows -Rows $all -OnlyIds $OnlyIds); AllRows = $all; Note = $userNote; AlertCount = $alerts.Count }
 }
 
 # DLP and Insider Risk alerts of the last 30 days from the Microsoft Graph alerts API.
@@ -4237,15 +4243,22 @@ function Get-AgentDetail {
     }
 }
 
-# Risk signals per agent come from one hunting run, cached for ten minutes so the details window is quick.
-$script:RiskCache = $null
-$script:RiskCacheAt = [datetime]::MinValue
-function Get-RiskCached {
-    if (-not $script:RiskCache -or ((Get-Date) - $script:RiskCacheAt).TotalMinutes -gt 10) {
-        $script:RiskCache = Get-RiskyIndex -Days 30
-        $script:RiskCacheAt = Get-Date
+# Hunting results that do not depend on a threshold are cached for ten minutes, keyed by the inputs of the query, so the
+# details window, every threshold of a console filter and every rule of a policy share one run.
+$script:HuntingCache = @{}
+function Get-HuntingCached {
+    param([string]$Key, [scriptblock]$Read)
+    $hit = $script:HuntingCache[$Key]
+    if (-not $hit -or ((Get-Date) - $hit.At).TotalMinutes -gt 10) {
+        $hit = @{ Value = (& $Read); At = Get-Date }
+        $script:HuntingCache[$Key] = $hit
     }
-    $script:RiskCache
+    $hit.Value
+}
+
+function Get-RiskCached {
+    param([int]$Days = 30, [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both')
+    Get-HuntingCached "risky|$Days|$Source" { Get-RiskyIndex -Days $Days -Source $Source }
 }
 
 # The risk entry for one package (severity, alert and detection counts, reasons), or $null when it has none.
@@ -4439,7 +4452,7 @@ function Get-StalePackages {
         return @($out | Sort-Object StaleSince)
     }
 
-    $idx = Get-ActivityIndex
+    $idx = Get-HuntingCached 'activity' { Get-ActivityIndex }
     $out = foreach ($p in $pkgs) {
         $last = $null
         foreach ($k in (Get-PackageKeys $p)) {
@@ -4614,7 +4627,7 @@ function Get-SevRank { param([string]$S)
 function Get-RiskyPackages {
     param([int]$Days, [int]$MinAlerts, [string]$MinSeverity, [switch]$AgentsOnly,
           [ValidateSet('Both', 'Alerts', 'Detections')][string]$Source = 'Both', [object[]]$Packages)
-    $idx = Get-RiskyIndex -Days $Days -Source $Source
+    $idx = Get-RiskCached -Days $Days -Source $Source
     $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Select-PackageSet -Packages $Packages -Supplied:$PSBoundParameters.ContainsKey('Packages') -AgentsOnly:$AgentsOnly)) {
         $hit = $null
@@ -5242,8 +5255,9 @@ function Get-DeleteCandidates {
         }
     }
     try {
-        $audit = Invoke-HuntingQuery -Hint 'Audit events unavailable; relying on kit logs.' -Query ('CloudAppEvents | where Timestamp > ago(30d) and ActionType in ("BlockedAgent", "UnblockedAgent")' +
-            ' | extend d = todynamic(RawEventData) | project Timestamp, ActionType, AgentId = tostring(d.AgentId)')
+        $audit = Get-HuntingCached 'blocked' {
+            Invoke-HuntingQuery -Hint 'Audit events unavailable; relying on kit logs.' -Query ('CloudAppEvents | where Timestamp > ago(30d) and ActionType in ("BlockedAgent", "UnblockedAgent")' +
+                ' | extend d = todynamic(RawEventData) | project Timestamp, ActionType, AgentId = tostring(d.AgentId)') }
         foreach ($a in $audit) {
             $events.Add([pscustomobject]@{ Id = [string]$a.AgentId; At = [datetimeoffset]$a.Timestamp; Action = $(if ($a.ActionType -eq 'BlockedAgent') { 'block' } else { 'unblock' }); Source = 'audit' })
         }
@@ -6761,8 +6775,8 @@ $AgentUsersXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read the report first (-Load). The period, the license filter and the search only
-# change what is shown; all three periods come from the one read.
+# Fill the window from the report it holds, or read the report first (-Load). The report covers every agent, so the ticked agents,
+# the period, the license filter and the search only change what is shown; all three periods come from the one read.
 function Update-AgentUsersWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('AuNote'); $grid = $Window.FindName('AuGrid'); $btn = $Window.FindName('BtnAuLoad'); $summary = $Window.FindName('AuSummary')
@@ -6771,7 +6785,7 @@ function Update-AgentUsersWindow {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
             $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
             $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
-            $Window.Tag = Get-AgentUsersReport -Packages $script:auState.Packages -OnlyIds $script:auState.OnlyIds -OnStatus $pump
+            $Window.Tag = Get-AgentUsersReport -Packages $script:auState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read the agent interactions: ' + $_.Exception.Message
             return
@@ -6780,8 +6794,9 @@ function Update-AgentUsersWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
     $days = [int]$Window.FindName('AuDaysBox').SelectedItem.Tag
-    $inPeriod = @(Select-AgentUserRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-AgentUserRows -Rows $report.Rows -Days $days -UnlicensedOnly:([bool]$Window.FindName('AuUnlicensed').IsChecked) -Text $Window.FindName('AuSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.Rows -OnlyIds $script:auState.OnlyIds)
+    $inPeriod = @(Select-AgentUserRows -Rows $rows -Days $days)
+    $shown = @(Select-AgentUserRows -Rows $rows -Days $days -UnlicensedOnly:([bool]$Window.FindName('AuUnlicensed').IsChecked) -Text $Window.FindName('AuSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-AgentUserSummary $inPeriod
     $summary.Text = ("Last {0} days: {1} user(s) with {2} agent(s), {3} interaction(s). {4} user(s) have no Agent 365 or E7 license.{5}" -f $days, $s.Users, $s.Agents, $s.Interactions, $s.Unlicensed,
@@ -6884,8 +6899,8 @@ $PolicyHitsXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read the report first (-Load). The period, the unattributed switch and the search only
-# change what is shown; all three periods come from the one read.
+# Fill the window from the report it holds, or read the report first (-Load). The report covers every agent, so the ticked agents,
+# the period, the unattributed switch and the search only change what is shown; all three periods come from the one read.
 function Update-PolicyHitsWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('PhNote'); $grid = $Window.FindName('PhGrid'); $btn = $Window.FindName('BtnPhLoad'); $summary = $Window.FindName('PhSummary'); $detail = $Window.FindName('PhDetailGrid')
@@ -6894,7 +6909,7 @@ function Update-PolicyHitsWindow {
             $btn.IsEnabled = $false; $Window.Cursor = [Windows.Input.Cursors]::Wait
             $dispatcher = $Window.Dispatcher   # a closure cannot see $script: variables, so hand it what it needs
             $pump = { param($m) if ($m) { $note.Text = $m }; $dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }.GetNewClosure()
-            $Window.Tag = Get-AgentPolicyHitsReport -Packages $script:phState.Packages -OnlyIds $script:phState.OnlyIds -OnStatus $pump
+            $Window.Tag = Get-AgentPolicyHitsReport -Packages $script:phState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read the policy hits: ' + $_.Exception.Message
             return
@@ -6903,8 +6918,9 @@ function Update-PolicyHitsWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $detail.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; return }
     $days = [int]$Window.FindName('PhDaysBox').SelectedItem.Tag
-    $inPeriod = @(Select-PolicyHitRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-PolicyHitRows -Rows $report.Rows -Days $days -AttributedOnly:(-not [bool]$Window.FindName('PhAll').IsChecked) -Text $Window.FindName('PhSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.AllRows -OnlyIds $script:phState.OnlyIds)
+    $inPeriod = @(Select-PolicyHitRows -Rows $rows -Days $days)
+    $shown = @(Select-PolicyHitRows -Rows $rows -Days $days -AttributedOnly:(-not [bool]$Window.FindName('PhAll').IsChecked) -Text $Window.FindName('PhSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-PolicyHitSummary $inPeriod
     $tenant = Get-PolicyHitSummary @(Select-PolicyHitRows -Rows $report.AllRows -Days $days)
@@ -7200,7 +7216,9 @@ $McpAccessXaml = @'
 </Window>
 '@
 
-# Fill the window from the report it holds, or read it first (-Load). The period, the filter and the search only change what is shown.
+# Fill the window from the report it holds, or read it first (-Load). The report covers every agent, so the ticked agents, the
+# period, the filter and the search only change what is shown. With agents ticked, applications and blueprints that are not
+# catalog agents carry no agent id and drop out, as they do from a report read for those agents.
 function Update-McpAccessWindow {
     param([System.Windows.Window]$Window, [switch]$Load)
     $note = $Window.FindName('McNote'); $grid = $Window.FindName('McGrid'); $btn = $Window.FindName('BtnMcLoad'); $summary = $Window.FindName('McSummary'); $detail = $Window.FindName('McDetailGrid')
@@ -7212,7 +7230,7 @@ function Update-McpAccessWindow {
             foreach ($s in 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'Policy.Read.All') {
                 if (-not (Test-GraphScope $s)) { & $pump "Granting $s`: finish the sign-in window..."; Request-GraphScope $s }
             }
-            $Window.Tag = Get-McpAccessReport -Packages $script:mcpState.Packages -OnlyIds $script:mcpState.OnlyIds -OnStatus $pump
+            $Window.Tag = Get-McpAccessReport -Packages $script:mcpState.Packages -OnStatus $pump
         } catch {
             $note.Text = 'Could not read MCP access: ' + $_.Exception.Message
             return
@@ -7221,8 +7239,9 @@ function Update-McpAccessWindow {
     $report = $Window.Tag
     if (-not $report) { $grid.ItemsSource = @(); $detail.ItemsSource = @(); $note.Text = 'Not loaded yet. Press Refresh.'; Update-McpButtons -Window $Window; return }
     $days = [int]$Window.FindName('McDaysBox').SelectedItem.Tag
-    $all = @(Select-McpAccessRows -Rows $report.Rows -Days $days)
-    $shown = @(Select-McpAccessRows -Rows $report.Rows -Days $days -Show ([string]$Window.FindName('McShowBox').SelectedItem.Tag) -Text $Window.FindName('McSearch').Text)
+    $rows = @(Select-ChosenAgentRows -Rows $report.Rows -OnlyIds $script:mcpState.OnlyIds)
+    $all = @(Select-McpAccessRows -Rows $rows -Days $days)
+    $shown = @(Select-McpAccessRows -Rows $rows -Days $days -Show ([string]$Window.FindName('McShowBox').SelectedItem.Tag) -Text $Window.FindName('McSearch').Text)
     $grid.ItemsSource = $shown
     $s = Get-McpAccessSummary -Rows $all -Days $days
     $scope = if ($script:mcpState.OnlyIds.Count) { "the $($script:mcpState.OnlyIds.Count) ticked agent(s)" } else { 'all agents' }
@@ -9022,7 +9041,8 @@ function Invoke-AlertResponse {
 # Console shell: navigation on the left grouped like the Agent 365 portal, one page at a time on the right. All agents is the
 # console's own grid and Home is drawn here; every other page is the content of one of the feature windows above, moved into the
 # shell. The window object stays alive unseen, so its named elements, its Tag (the data it read) and its update functions work
-# unchanged. A page reads its data the first time it opens, and again when the agents ticked on All agents have changed.
+# unchanged. A page reads its data the first time it opens. When the agents ticked on All agents have changed, a page that read
+# data for every agent filters it again, and any other page reads again.
 # ---------------------------------------------------------------------------------------------
 
 # The agents ticked on All agents (catalog ids), and every catalog package, as the pages read them.
@@ -9051,9 +9071,11 @@ function Initialize-Shell {
     & $page 'agents' 'NavAgents' $script:w.FindName('PageAgents') $null $null
     & $page 'shadow' 'NavShadow' $null { Mount-ShellPage 'shadow' (New-EndpointAiWindow) } { Update-EndpointAiWindow -Window $script:epWindow -Load }
     & $page 'tools' 'NavTools' $null { Mount-ShellPage 'tools' (New-McpAccessWindow -Packages @(Get-ShellPackages)) } {
-        $script:mcpState.Packages = @(Get-ShellPackages); $script:mcpState.OnlyIds = @(Get-ShellTicked); Update-McpAccessWindow -Window $script:mcWindow -Load } -Scoped $true
+        param($Reload)
+        $script:mcpState.Packages = @(Get-ShellPackages); $script:mcpState.OnlyIds = @(Get-ShellTicked); Update-McpAccessWindow -Window $script:mcWindow -Load:($Reload -or -not $script:mcWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'users' 'NavUsers' $null { Mount-ShellPage 'users' (New-AgentUsersWindow -Packages @(Get-ShellPackages)) } {
-        $script:auState.Packages = @(Get-ShellPackages); $script:auState.OnlyIds = @(Get-ShellTicked); Update-AgentUsersWindow -Window $script:auWindow -Load } -Scoped $true
+        param($Reload)
+        $script:auState.Packages = @(Get-ShellPackages); $script:auState.OnlyIds = @(Get-ShellTicked); Update-AgentUsersWindow -Window $script:auWindow -Load:($Reload -or -not $script:auWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'alerts' 'NavAlerts' $null { Mount-ShellPage 'alerts' (New-AgentAlertsWindow -Packages @(Get-ShellPackages)) } {
         param($Reload)
         $script:aaState.Packages = @(Get-ShellPackages); $script:aaState.OnlyIds = @(Get-ShellTicked); Update-AgentAlertsWindow -Window $script:aaWindow -Load:$Reload } -Scoped $true -FilterOnly $true
@@ -9061,7 +9083,8 @@ function Initialize-Shell {
     & $page 'purview' 'NavPurview' $null { Mount-ShellPage 'purview' (New-PurviewAuditWindow -Packages @(Get-ShellPackages)) } {
         $script:paState.Packages = @(Get-ShellPackages); $script:paState.OnlyIds = @(Get-ShellTicked); Update-PurviewAuditWindow -Window $script:paWindow } -Scoped $true -FilterOnly $true
     & $page 'hits' 'NavHits' $null { Mount-ShellPage 'hits' (New-PolicyHitsWindow -Packages @(Get-ShellPackages)) } {
-        $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load } -Scoped $true
+        param($Reload)
+        $script:phState.Packages = @(Get-ShellPackages); $script:phState.OnlyIds = @(Get-ShellTicked); Update-PolicyHitsWindow -Window $script:phWindow -Load:($Reload -or -not $script:phWindow.Tag) } -Scoped $true -FilterOnly $true
     & $page 'ca' 'NavCa' $null { Mount-ShellPage 'ca' (New-CaCheckWindow) } {
         $script:caState = @{ Packages = @(Get-ShellPackages); OnlyIds = @(Get-ShellTicked) }; Update-CaCheckWindow -Window $script:caWindow -Load } -Scoped $true
 
@@ -9102,8 +9125,12 @@ function Show-ShellPage {
     $p.Loaded = $true; $p.Scope = $scope
 }
 
-# After the catalog is read again, every page that read data reads it again when it next opens.
-function Reset-ShellPages { if ($script:shell) { foreach ($p in $script:shell.Pages.Values) { if ($p.Load -and -not $p.Always) { $p.Loaded = $false } } } }
+# After the catalog is read again, every page that read data reads it again when it next opens, and so do the filters that
+# use cached hunting results.
+function Reset-ShellPages {
+    $script:HuntingCache = @{}
+    if ($script:shell) { foreach ($p in $script:shell.Pages.Values) { if ($p.Load -and -not $p.Always) { $p.Loaded = $false } } }
+}
 
 # A Home card opens its page, set up for what the card counts.
 function Invoke-ShellCard {
@@ -9137,11 +9164,11 @@ function Update-ShellHome {
         & $set 'HomeCa' @($c | Where-Object { $_.Kind -ne 'Protected' }).Count (('{0} report-only, {1} unprotected, of {2} agent(s) with an identity.' -f @($c | Where-Object { $_.Kind -eq 'Report-only' }).Count, @($c | Where-Object { $_.Kind -eq 'Unprotected' }).Count, $c.Count) + (& $scopeOf $script:caState))
     } else { & $set 'HomeCa' '-' 'Not checked yet. Select to open Conditional Access.' }
     if ($script:mcWindow -and $script:mcWindow.Tag) {
-        $s = Get-McpAccessSummary -Rows @($script:mcWindow.Tag.Rows) -Days 30
+        $s = Get-McpAccessSummary -Rows @(Select-ChosenAgentRows -Rows $script:mcWindow.Tag.Rows -OnlyIds $script:mcpState.OnlyIds) -Days 30
         & $set 'HomeMcp' $s.Unused (('Of {0} agent and server permission(s), no call in 30 days.' -f $s.Granted) + (& $scopeOf $script:mcpState))
     } else { & $set 'HomeMcp' '-' 'Not read yet. Select to open Tools.' }
     if ($script:auWindow -and $script:auWindow.Tag) {
-        $s = Get-AgentUserSummary @(Select-AgentUserRows -Rows $script:auWindow.Tag.Rows -Days 30)
+        $s = Get-AgentUserSummary @(Select-AgentUserRows -Rows @(Select-ChosenAgentRows -Rows $script:auWindow.Tag.Rows -OnlyIds $script:auState.OnlyIds) -Days 30)
         & $set 'HomeUsers' $s.Unlicensed (('Of {0} user(s) who used an agent in 30 days.' -f $s.Users) + (& $scopeOf $script:auState))
     } else { & $set 'HomeUsers' '-' 'Not read yet. Select to open Users.' }
 }

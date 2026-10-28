@@ -235,6 +235,7 @@ Describe 'Risk query' {
 }
 
 Describe 'Get-RiskyPackages' {
+    BeforeEach { $script:HuntingCache = @{} }
     It 'filters on total signals and minimum severity, worst first' {
         Mock Get-Packages { @((New-Pkg 'T_hi' 'Hi'), (New-Pkg 'T_lo' 'Lo'), (New-Pkg 'T_none' 'None')) }
         Mock Get-RiskyIndex { @{
@@ -249,6 +250,7 @@ Describe 'Get-RiskyPackages' {
 
 Describe 'Get-DeleteCandidates' {
     BeforeEach {
+        $script:HuntingCache = @{}
         Mock Write-Warning { }
         $now = [datetimeoffset]::UtcNow
         $script:old = $now.AddDays(-45).ToString('o')
@@ -3389,5 +3391,178 @@ Describe 'Own app registration' {
         @{ Code = 'AADSTS65001'; Says = 'admin consent' }
     ) {
         Get-SignInHelp "$($Code): something went wrong" | Should -Match ([regex]::Escape($Says))
+    }
+}
+
+Describe 'Cached hunting results' {
+    BeforeEach { $script:HuntingCache = @{} }
+    It 'reads once per key for ten minutes, then again' {
+        $script:reads = 0
+        $read = { $script:reads++; @{ Read = $script:reads } }
+        (Get-HuntingCached 'a' $read).Read | Should -Be 1
+        (Get-HuntingCached 'a' $read).Read | Should -Be 1
+        (Get-HuntingCached 'b' $read).Read | Should -Be 2
+        $script:HuntingCache['a'].At = (Get-Date).AddMinutes(-11)
+        (Get-HuntingCached 'a' $read).Read | Should -Be 3
+        $script:reads | Should -Be 3
+    }
+    It 'keeps an empty result but not a failed read' {
+        $script:reads = 0
+        { Get-HuntingCached 'down' { $script:reads++; throw 'service down' } } | Should -Throw '*service down*'
+        $script:HuntingCache.ContainsKey('down') | Should -BeFalse
+        @(Get-HuntingCached 'none' { $script:reads++; @() }).Count | Should -Be 0
+        @(Get-HuntingCached 'none' { $script:reads++; @() }).Count | Should -Be 0
+        $script:reads | Should -Be 2
+    }
+    It 'serves every stale and risk threshold from one query, and reads again for another source or period' {
+        Mock Get-ActivityIndex { @{ 't_a' = [datetimeoffset]::UtcNow.AddDays(-20); 't_b' = [datetimeoffset]::UtcNow.AddDays(-3) } }
+        Mock Get-RiskyIndex { @{ 't_a' = [pscustomobject]@{ AlertCount = 1; DetectionCount = 0; Severity = 'High'; LastAlert = $null; Reasons = ''; Categories = '' } } }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        @(Get-StalePackages -Days 14 -By activity -Packages $pk).id | Should -Be @('T_A')
+        @(Get-StalePackages -Days 2 -By activity -Packages $pk).Count | Should -Be 2
+        Should -Invoke Get-ActivityIndex -Times 1 -Exactly
+        @(Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity High -Packages $pk).id | Should -Be @('T_A')
+        @(Get-RiskyPackages -Days 30 -MinAlerts 2 -MinSeverity Low -Packages $pk).Count | Should -Be 0
+        Should -Invoke Get-RiskyIndex -Times 1 -Exactly
+        $null = Get-RiskyPackages -Days 30 -MinAlerts 1 -MinSeverity Low -Source Alerts -Packages $pk
+        $null = Get-RiskyPackages -Days 7 -MinAlerts 1 -MinSeverity Low -Packages $pk
+        Should -Invoke Get-RiskyIndex -Times 3 -Exactly
+    }
+    It 'reads the block audit once for every blocked-for threshold, and the kit logs each time' {
+        Mock Write-Warning { }
+        $logs = Join-Path $TestDrive 'logs'; New-Item -ItemType Directory -Force $logs | Out-Null
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-40).ToString('o'); ActionType = 'BlockedAgent'; AgentId = 'T_A' }) }
+        $pk = @((New-Pkg 'T_A' 'Alpha' -Blocked $true), (New-Pkg 'T_B' 'Beta' -Blocked $true))
+        @(Get-DeleteCandidates -MinDays 30 -LogDir $logs -Packages $pk).Id | Should -Be @('T_A')
+        [pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-50).ToString('o'); Action = 'block'; Id = 'T_B'; Result = 'Done' } | Export-Csv (Join-Path $logs 'run.csv') -NoTypeInformation
+        @(Get-DeleteCandidates -MinDays 45 -LogDir $logs -Packages $pk).Id | Should -Be @('T_B')
+        Should -Invoke Invoke-HuntingQuery -Times 1 -Exactly
+    }
+    It 'evaluates the stale, risky and blocked-for rules of a policy with one query each' {
+        $pk = @((New-Pkg 'T_A' 'Alpha' -Blocked $true), (New-Pkg 'T_B' 'Beta'))
+        Mock Get-Packages { $pk }
+        Mock Get-ActivityIndex { @{ 't_b' = [datetimeoffset]::UtcNow.AddDays(-20) } }
+        Mock Get-RiskyIndex { @{ 't_b' = [pscustomobject]@{ AlertCount = 2; DetectionCount = 0; Severity = 'Medium'; LastAlert = $null; Reasons = ''; Categories = '' } } }
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-40).ToString('o'); ActionType = 'BlockedAgent'; AgentId = 'T_A' }) }
+        $doc = '{ "rules": [
+            { "name": "s14", "when": { "stale": { "days": 14 } }, "then": { "action": "report" } },
+            { "name": "s7", "when": { "stale": { "days": 7 } }, "then": { "action": "report" } },
+            { "name": "r1", "when": { "risky": { "minSeverity": "Medium" } }, "then": { "action": "report" } },
+            { "name": "r2", "when": { "risky": { "minSeverity": "Low", "minSignals": 2 } }, "then": { "action": "report" } },
+            { "name": "b30", "when": { "blockedDays": 30 }, "then": { "action": "report" } },
+            { "name": "b7", "when": { "blockedDays": 7 }, "then": { "action": "report" } } ] }' | ConvertFrom-Json
+        $appData = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = $TestDrive
+        try { $plan = @(Get-PolicyPlan $doc) } finally { $env:LOCALAPPDATA = $appData }
+        @($plan | ForEach-Object { @($_.Matched).id -join ',' }) | Should -Be @('T_B', 'T_B', 'T_B', 'T_B', 'T_A', 'T_A')
+        Should -Invoke Get-ActivityIndex -Times 1 -Exactly
+        Should -Invoke Get-RiskyIndex -Times 1 -Exactly
+        Should -Invoke Invoke-HuntingQuery -Times 1 -Exactly
+    }
+    It 'forgets cached results and every page''s data when the catalog is read again' {
+        $null = Get-HuntingCached 'activity' { @{ t_a = 1 } }
+        $saved = $script:shell
+        $script:shell = @{ Pages = [ordered]@{ users = @{ Load = { }; Always = $false; Loaded = $true }; home = @{ Load = { }; Always = $true; Loaded = $true } } }
+        try { Reset-ShellPages; $pages = $script:shell.Pages } finally { $script:shell = $saved }
+        $script:HuntingCache.Count | Should -Be 0
+        $pages.users.Loaded | Should -BeFalse
+        $pages.home.Loaded | Should -BeTrue
+    }
+}
+
+Describe 'Pages read once and filter by the ticked agents' {
+    BeforeAll {
+        function ConvertTo-RowText { param([object[]]$Rows) @($Rows | Sort-Object AgentId, ServerKey, UserId, Source, Policy | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress }) -join "`n" }
+    }
+    It 'keeps every row when nothing is ticked, and only rows of ticked agents otherwise, in any case' {
+        $rows = @([pscustomobject]@{ AgentId = 'T_A' }, [pscustomobject]@{ AgentId = 'T_B' }, [pscustomobject]@{ AgentId = '' })
+        @(Select-ChosenAgentRows -Rows $rows).Count | Should -Be 3
+        @(Select-ChosenAgentRows -Rows $rows -OnlyIds @()).Count | Should -Be 3
+        @(Select-ChosenAgentRows -Rows $rows -OnlyIds @('t_a', '')).AgentId | Should -Be @('T_A')
+        @(Select-ChosenAgentRows -Rows $rows -OnlyIds @('T_C')).Count | Should -Be 0
+        @(Select-ChosenAgentRows -Rows @() -OnlyIds @('T_A')).Count | Should -Be 0
+        [object]::ReferenceEquals(@(Select-ChosenAgentRows -Rows $rows -OnlyIds @('T_B'))[0], $rows[1]) | Should -BeTrue
+    }
+    It 'gives the users of the ticked agents that a read for those agents gives' {
+        Mock Get-AgentUserInteractions {
+            @([pscustomobject]@{ CatalogId = 't_a'; UserId = 'u1'; Name = 'Ann'; N7 = 1; N14 = 2; N30 = 3; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ CatalogId = 't_b'; UserId = 'u2'; Name = 'Agent Bot'; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-10-01' },
+              [pscustomobject]@{ CatalogId = 't_b'; UserId = 'u1'; Name = 'Ann'; N7 = 2; N14 = 2; N30 = 2; Last = [datetime]'2026-10-05' },
+              [pscustomobject]@{ CatalogId = 't_gone'; UserId = 'u3'; Name = 'Cy'; N7 = 0; N14 = 1; N30 = 1; Last = [datetime]'2026-09-30' })
+        }
+        Mock Get-AgentUserAccounts {
+            $known = @{ 'u1' = [pscustomobject]@{ Found = $true; Name = 'Ann'; Upn = 'ann@contoso.com'; Kind = 'User'; Has = $false; License = 'None'; Detail = '' }
+                        'u2' = [pscustomobject]@{ Found = $false; Name = ''; Upn = ''; Kind = 'Not a directory user'; Has = $null; License = 'Not applicable'; Detail = '' }
+                        'u3' = [pscustomobject]@{ Found = $true; Name = 'Cy'; Upn = 'cy@contoso.com'; Kind = 'User'; Has = $true; License = 'Agent 365'; Detail = 'AGENT_365' } }
+            $m = @{}; foreach ($id in $UserIds) { $m[$id] = $known[$id] }; $m
+        }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'), (New-Pkg 'T_C' 'Gamma'))
+        $all = Get-AgentUsersReport -Packages $pk
+        foreach ($ticked in @(@('T_A'), @('t_b'), @('T_A', 'T_B'), @('T_C'))) {
+            ConvertTo-RowText (Select-ChosenAgentRows -Rows $all.Rows -OnlyIds $ticked) | Should -Be (ConvertTo-RowText (Get-AgentUsersReport -Packages $pk -OnlyIds $ticked).Rows) -Because ($ticked -join ',')
+        }
+        @(Select-ChosenAgentRows -Rows $all.Rows).Count | Should -Be 4
+    }
+    It 'gives the policy hits of the ticked agents that a read for those agents gives, and keeps the tenant-wide rows' {
+        Mock Get-AgentKeyMap { @{ 'app-1' = @('t_a'); 'app-2' = @('t_b') } }
+        Mock Get-AgentUserMap { @{} }
+        Mock Get-DlpMatchHits {
+            @([pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = 'app-1'; UserId = 'u-1'; User = 'Ann'; Item = 'Card.txt'; ItemPath = ''; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'R'; Severity = ''; Actions = 'RestrictAccess'; N7 = 1; N14 = 1; N30 = 1; Last = [datetime]'2026-10-06' },
+              [pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = 'app-2'; UserId = 'u-2'; User = 'Bob'; Item = ''; ItemPath = ''; PolicyId = 'p1'; Policy = 'Alpha DLP'; Rule = 'R'; Severity = ''; Actions = ''; N7 = 0; N14 = 2; N30 = 2; Last = [datetime]'2026-10-01' },
+              [pscustomobject]@{ Workload = 'W'; Where = 'Microsoft Teams'; App = ''; UserId = 'u-3'; User = 'Cy'; Item = ''; ItemPath = ''; PolicyId = 'p2'; Policy = 'Generic DLP'; Rule = 'G'; Severity = ''; Actions = ''; N7 = 0; N14 = 0; N30 = 4; Last = [datetime]'2026-09-20' })
+        }
+        Mock Get-PurviewAlerts { @() }
+        $pk = @((New-Pkg 'T_A' 'Alpha'), (New-Pkg 'T_B' 'Beta'))
+        $all = Get-AgentPolicyHitsReport -Packages $pk
+        foreach ($ticked in @(@('T_A'), @('t_b'), @('T_A', 'T_B'))) {
+            $fresh = Get-AgentPolicyHitsReport -Packages $pk -OnlyIds $ticked
+            ConvertTo-RowText (Select-ChosenAgentRows -Rows $all.AllRows -OnlyIds $ticked) | Should -Be (ConvertTo-RowText $fresh.Rows) -Because ($ticked -join ',')
+            ConvertTo-RowText $all.AllRows | Should -Be (ConvertTo-RowText $fresh.AllRows)
+        }
+        @(Select-ChosenAgentRows -Rows $all.AllRows -OnlyIds @('T_A', 'T_B') | Where-Object { -not $_.AgentId }).Count | Should -Be 0
+        @(Select-ChosenAgentRows -Rows $all.AllRows).Count | Should -Be 3
+    }
+    It 'gives the MCP rows of the ticked agents that a read for those agents gives, other holders only with nothing ticked, and block state on the rows it holds' {
+        $mail = 'app-mail'
+        $pk = @(
+            [pscustomobject]@{ id = 'P_A'; displayName = 'Alpha'; agentIdentityId = 'id-a'; platform = 'Not Available'; manifestId = $null; elementTypes = @('AgentMetadatas') },
+            [pscustomobject]@{ id = 'P_C'; displayName = 'Studio'; agentIdentityId = 'id-c'; platform = 'Copilot Studio'; manifestId = $null; elementTypes = @() },
+            [pscustomobject]@{ id = 'T_B'; displayName = 'Beta Blueprint'; agentIdentityId = $null; platform = 'Not Available'; manifestId = 'bp-b'; elementTypes = @('AgenticUserTemplates') })
+        $g = { param($c, $app, $name, [string[]]$s, $consent = 'AllPrincipals') [pscustomobject]@{ ClientId = $c; ResourceAppId = $app; ResourceName = $name; Scopes = $s; Consent = $consent } }
+        $script:mcpData = @{
+            Grants = @((& $g 'bpsp-a' $mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')), (& $g 'bpsp-a' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Calendar.All')),
+                       (& $g 'id-c' $mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')), (& $g 'bpsp-b' $mail 'Work IQ Mail MCP' @('Tools.ListInvoke.All')),
+                       (& $g 'cli' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Mail.All') 'Principal'), (& $g 'bpsp-x' $script:AgentToolsAppId 'Agent Tools' @('McpServers.Excel.All')))
+            Clients = @{ 'bpsp-a' = [pscustomobject]@{ Id = 'bpsp-a'; Name = 'Alpha Blueprint'; AppId = 'bp-a'; Type = 'blueprint' }; 'id-c' = [pscustomobject]@{ Id = 'id-c'; Name = 'Studio'; AppId = 'app-c'; Type = 'identity' }
+                         'bpsp-b' = [pscustomobject]@{ Id = 'bpsp-b'; Name = 'Beta Blueprint'; AppId = 'bp-b'; Type = 'blueprint' }; 'bpsp-x' = [pscustomobject]@{ Id = 'bpsp-x'; Name = 'Lonely Blueprint'; AppId = 'bp-x'; Type = 'blueprint' }
+                         'cli' = [pscustomobject]@{ Id = 'cli'; Name = 'Some CLI'; AppId = 'app-cli'; Type = 'app' } }
+            Declared = @([pscustomobject]@{ CatalogId = 'p_c'; Agent = 'Studio'; Server = 'Work IQ Mail (Preview)'; Endpoint = '' }, [pscustomobject]@{ CatalogId = ''; Agent = 'Stranger'; Server = 'Work IQ Word (Preview)'; Endpoint = '' })
+            Usage = @([pscustomobject]@{ AgentId = 'id-a'; PlatformAgentId = ''; BlueprintId = ''; AgentName = ''; Server = 'mcp_MailTools'; Calls = 4; Calls7 = 1; Calls14 = 2; Connects = 0; Errors = 0; Last = (Get-Date).AddDays(-1).ToString('o'); LastCall = (Get-Date).AddDays(-1).ToString('o'); Tools = @('SendEmail'); Via = @('Agent 365 gateway') },
+                      [pscustomobject]@{ AgentId = 'id-b1'; PlatformAgentId = ''; BlueprintId = 'bp-b'; AgentName = ''; Server = 'mcp_MailTools'; Calls = 1; Calls7 = 0; Calls14 = 1; Connects = 0; Errors = 0; Last = (Get-Date).AddDays(-10).ToString('o'); LastCall = (Get-Date).AddDays(-10).ToString('o'); Tools = @('CreateDraft'); Via = @('Agent 365 gateway') },
+                      [pscustomobject]@{ AgentId = 'other-1'; PlatformAgentId = ''; BlueprintId = ''; AgentName = 'Outside agent'; Server = 'mcp_MailTools'; Calls = 2; Calls7 = 2; Calls14 = 2; Connects = 0; Errors = 0; Last = (Get-Date).AddDays(-2).ToString('o'); LastCall = (Get-Date).AddDays(-2).ToString('o'); Tools = @('Read'); Via = @('Agent 365 gateway') })
+        }
+        Mock Get-McpGrantData { [pscustomobject]@{ Grants = $script:mcpData.Grants; Clients = $script:mcpData.Clients } }
+        Mock Get-McpServerApps { @{ mail = [pscustomobject]@{ AppId = 'app-mail'; Name = 'Work IQ Mail MCP' }; agenttools = [pscustomobject]@{ AppId = $script:AgentToolsAppId; Name = 'Agent Tools' } } }
+        Mock Get-AgentIdentityIds { @{ 'id-a' = [pscustomobject]@{ AppId = 'app-a'; Blueprint = 'bp-a'; Principal = 'bpsp-a' }; 'id-c' = [pscustomobject]@{ AppId = 'app-c'; Blueprint = ''; Principal = '' } } }
+        Mock Get-McpBlueprintPackages { $m = @{}; if (@($Packages | Where-Object { $_.id -eq 'T_B' }).Count) { $m['T_B'] = [pscustomobject]@{ AppId = 'bp-b'; Principal = 'bpsp-b'; Identities = @('id-b1') } }; $m }
+        Mock Get-McpInheritance { @{ 'bp-a' = @(@{ resourceAppId = 'app-mail'; inheritableScopes = @{ kind = 'allAllowed' } }); 'bp-b' = @(@{ resourceAppId = 'app-mail'; inheritableScopes = @{ kind = 'allAllowed' } }) } }
+        Mock Get-AgentUserIdsByIdentity { @{ 'id-a' = @('u-a'); 'id-b1' = @('u-b1') } }
+        Mock Get-AgentKeyMap { @{} }
+        Mock Invoke-HuntingQuery { if ($Query -eq $script:McpDeclaredKql) { $script:mcpData.Declared } else { $script:mcpData.Usage } }
+        Mock Get-CaPoliciesRaw { @() }
+        $all = Get-McpAccessReport -Packages $pk
+        foreach ($ticked in @(@('P_A'), @('p_c'), @('T_B'), @('P_A', 't_b', 'P_C'))) {
+            ConvertTo-RowText (Select-ChosenAgentRows -Rows $all.Rows -OnlyIds $ticked) | Should -Be (ConvertTo-RowText (Get-McpAccessReport -Packages $pk -OnlyIds $ticked).Rows) -Because ($ticked -join ',')
+        }
+        $others = @($all.Rows | Where-Object { $_.Kind -ne 'Agent' })
+        @($others | ForEach-Object { $_.Agent } | Sort-Object -Unique) | Should -Be @('Lonely Blueprint', 'Outside agent', 'Some CLI', 'Stranger')
+        @(Select-ChosenAgentRows -Rows $all.Rows).Count | Should -Be @($all.Rows).Count
+        @(Select-ChosenAgentRows -Rows $all.Rows -OnlyIds @('P_A', 'P_C', 'T_B') | Where-Object { $_.Kind -ne 'Agent' }).Count | Should -Be 0
+        $block = @{ id = 'p1'; displayName = 'Block mail'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }
+                    conditions = @{ agentIdRiskLevels = @(); users = @{ includeUsers = @('u-a'); excludeUsers = @() }; applications = @{ includeApplications = @('app-mail'); excludeApplications = @() }
+                                    clientApplications = @{ includeAgentIdServicePrincipals = @('id-a') } } }
+        $shown = @(Select-ChosenAgentRows -Rows $all.Rows -OnlyIds @('P_A'))
+        foreach ($r in $all.Rows) { Set-McpBlockState -Row $r -Policies @($block) }
+        @($shown | Where-Object { $_.ServerKey -eq 'mail' })[0].Block | Should -Be 'Blocked'
     }
 }
