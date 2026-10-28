@@ -9073,7 +9073,7 @@ function Initialize-Shell {
             $kids = $script:w.FindName([string]$s.Tag)
             $open = $kids.Visibility -ne 'Visible'
             $kids.Visibility = if ($open) { 'Visible' } else { 'Collapsed' }
-            $chevron = $script:w.FindName(([string]$s.Tag) -replace 'Kids$', 'Chevron')
+            $chevron = $script:w.FindName((([string]$s.Tag) -replace 'Kids$', 'Chevron'))
             $chevron.Text = [string][char]$(if ($open) { 0xE70E } else { 0xE70D })
         })
     }

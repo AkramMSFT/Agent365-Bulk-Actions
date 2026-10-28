@@ -3391,3 +3391,19 @@ Describe 'Own app registration' {
         Get-SignInHelp "$($Code): something went wrong" | Should -Match ([regex]::Escape($Says))
     }
 }
+
+Describe 'Script hygiene' {
+    It 'passes no -replace, -split, -join or -f expression as a method argument other than the last: <Name>' -ForEach @(
+        @{ Name = 'Agent365-Bulk-Actions.ps1'; Path = (Join-Path $PSScriptRoot '..\Agent365-Bulk-Actions.ps1') }
+        @{ Name = 'tools/Watch-GraphApi.ps1'; Path = (Join-Path $PSScriptRoot '..\tools\Watch-GraphApi.ps1') }
+    ) {
+        # Inside a method call a comma separates arguments, so $x.M($a -replace 'p', 'r') passes two arguments, not one.
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null)
+        $ops = 'Ireplace', 'Creplace', 'Isplit', 'Csplit', 'Join', 'Format'
+        $found = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Arguments.Count -gt 1 }, $true) | Where-Object {
+            $list = @($_.Arguments)
+            @($list[0..($list.Count - 2)] | Where-Object { $_ -is [System.Management.Automation.Language.BinaryExpressionAst] -and [string]$_.Operator -in $ops }).Count
+        } | ForEach-Object { '{0}: {1}' -f $_.Extent.StartLineNumber, $_.Extent.Text })
+        $found | Should -BeNullOrEmpty
+    }
+}
