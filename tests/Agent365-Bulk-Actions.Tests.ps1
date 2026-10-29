@@ -4397,3 +4397,26 @@ Describe 'Script hygiene' {
         $found | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Saved sign-in kept through a failed sign-in' {
+    BeforeEach {
+        $script:keepPath = $script:SavedSignInPath
+        $script:SavedSignInPath = Join-Path $TestDrive 'mg.authrecord.json'
+        Set-Content -LiteralPath $script:SavedSignInPath -Value '{"username":"admin@contoso.com"}' -NoNewline
+    }
+    AfterEach { $script:SavedSignInPath = $script:keepPath }
+
+    It 'puts the record back when a failed attempt deleted it, and still reports the failure' {
+        { Invoke-KeepingSavedSignIn { Remove-Item -LiteralPath $script:SavedSignInPath; throw 'User canceled authentication.' } } | Should -Throw '*canceled*'
+        Get-Content -LiteralPath $script:SavedSignInPath -Raw | Should -Be '{"username":"admin@contoso.com"}'
+    }
+    It 'leaves a record a successful sign-in wrote alone' {
+        Invoke-KeepingSavedSignIn { Set-Content -LiteralPath $script:SavedSignInPath -Value '{"username":"new@contoso.com"}' -NoNewline }
+        Get-Content -LiteralPath $script:SavedSignInPath -Raw | Should -Be '{"username":"new@contoso.com"}'
+    }
+    It 'says an administrator must consent when a permission request fails' {
+        Mock Get-MgContext { [pscustomobject]@{ Scopes = @('User.Read'); TenantId = '66666666-6666-6666-6666-666666666666' } }
+        Mock Connect-GraphSession { throw 'Sign-in was cancelled before it finished.' }
+        { Request-GraphScope 'AgentIdentityBlueprint.ReadWrite.All' } | Should -Throw "*AgentIdentityBlueprint.ReadWrite.All needs an administrator's consent*"
+    }
+}

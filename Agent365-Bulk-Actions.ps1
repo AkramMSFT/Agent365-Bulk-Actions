@@ -511,8 +511,21 @@ function Test-SignInPromptPossible {
 }
 
 # Has this account signed in with the tool or the Graph module before? A saved sign-in is reused without a window or a code.
+$script:SavedSignInPath = Join-Path $HOME '.mg/mg.authrecord.json'
 function Test-SavedSignIn {
-    Test-Path -LiteralPath (Join-Path $HOME '.mg/mg.authrecord.json')
+    Test-Path -LiteralPath $script:SavedSignInPath
+}
+
+# A failed or cancelled sign-in makes the Graph module delete the saved session record, which leaves every later run, scheduled
+# ones included, unable to sign in. Keep a copy and put it back when the attempt fails.
+function Invoke-KeepingSavedSignIn {
+    param([scriptblock]$Connect)
+    $saved = if (Test-Path -LiteralPath $script:SavedSignInPath) { [IO.File]::ReadAllBytes($script:SavedSignInPath) }
+    try { & $Connect }
+    catch {
+        if ($saved -and -not (Test-Path -LiteralPath $script:SavedSignInPath)) { [IO.File]::WriteAllBytes($script:SavedSignInPath, $saved) }
+        throw
+    }
 }
 
 # How the saved sign-in was made. The Graph module keeps a session made with a device code apart from one made with a window, and
@@ -547,7 +560,7 @@ function Connect-GraphSession {
         if (-not (Test-SavedSignIn)) { Write-Host 'Signing in with a device code: open https://microsoft.com/devicelogin on any device and enter the code shown below. A code works for about two minutes.' -ForegroundColor Cyan }
         $tries = if ($person) { 3 } else { 1 }
         for ($try = 1; ; $try++) {
-            try { Connect-MgGraph @c; Set-SignInMethod 'devicecode'; return }
+            try { Invoke-KeepingSavedSignIn { Connect-MgGraph @c }; Set-SignInMethod 'devicecode'; return }
             catch {
                 $lapsed = $_.Exception.Message -match '(?i)timed out|expired|expire'
                 if ($lapsed -and $try -ge $tries) { throw 'No code was entered in time. Run the command again and enter the code within two minutes of it appearing, or sign in on a machine where the Microsoft sign-in window can open (run -SignIn there).' }
@@ -561,7 +574,7 @@ function Connect-GraphSession {
     # shown a window (an unattended run, a remote shell), a window attempt could only fail and delete it, so reuse it with a code.
     if (-not $Fresh -and (Get-SignInMethod) -eq 'devicecode' -and (-not $person -or (Get-NoWindowReason))) { & $viaCode; return }
     if ($person -and -not (Test-SavedSignIn)) { Write-Host 'Signing in: a Microsoft sign-in window should open. If nothing appears, press Ctrl+C and run again with -DeviceCode.' -ForegroundColor DarkGray }
-    try { Connect-MgGraph @Connect; Set-SignInMethod 'window' }
+    try { Invoke-KeepingSavedSignIn { Connect-MgGraph @Connect }; Set-SignInMethod 'window' }
     catch {
         $msg = $_.Exception.Message
         $windowProblem = $msg -match '(?i)window handle|InteractiveBrowserCredential|interactive|browser|DISPLAY|timed out|timeout'
@@ -7112,7 +7125,10 @@ function Request-GraphScope {
     $connect = @{ Scopes = @(@($context.Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
     if ($context.TenantId) { $connect['TenantId'] = $context.TenantId }
     if ($script:ClientId) { $connect['ClientId'] = $script:ClientId }
-    Connect-GraphSession -Connect $connect
+    try { Connect-GraphSession -Connect $connect }
+    catch {
+        throw ('{0} If no consent page appeared, {1} needs an administrator''s consent: a Global Administrator or Privileged Role Administrator can grant it to the Microsoft Graph Command Line Tools app, or to your own app registration used with -ClientId.' -f $_.Exception.Message, $Scope)
+    }
 }
 
 # The callback a long read reports through: it shows the message, if any, in the note and lets the window repaint. A closure
