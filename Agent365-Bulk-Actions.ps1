@@ -14,6 +14,9 @@
     POST  /beta/security/rules/detectionRules                  block a local AI agent on one device (Defender custom detection rule)
     GET   /beta/identity/conditionalAccess/policies            which Conditional Access policies protect an agent
     POST  /beta/identity/conditionalAccess/policies            block an MCP server for chosen agents (and PATCH, DELETE)
+    PATCH /v1.0/oauth2PermissionGrants/{id}                    remove or add an agent's MCP scope (and POST, DELETE)
+    PATCH /v1.0/applications/{id}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions/{appId}
+                                                               stop or resume passing an MCP scope to a blueprint's agent identities
     POST  /v1.0/users/{id}/revokeSignInSessions                end the sessions of an agent's user account
   plus Defender Advanced Hunting (/security/runHuntingQuery), Entra agent identities, owners, sponsors and
   permissions, and the Purview audit search (/security/auditLog/queries).
@@ -90,6 +93,10 @@
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -BlockMcp "Mail" -ForAgent "Java Demo Agent" -ReportOnly
   Block one MCP server for chosen agents with a Conditional Access policy, in report-only mode first. -UnblockMcp or -Undo <log> removes it.
+
+.EXAMPLE
+  .\Agent365-Bulk-Actions.ps1 -BlockMcp All -ExceptMcp "Mail","Calendar" -ForAgent "Contoso HR Agent" -Via Permission -WhatIf
+  Allow only Mail and Calendar: remove the agent's other MCP permissions in Entra, each through the narrowest grant. -UnblockMcp <server> -Via Permission grants one.
 
 .EXAMPLE
   .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -RevokeSessions
@@ -394,7 +401,24 @@ param(
     [switch]$RevokeSessions,                # Block, BlockMcp, ConfirmCompromised: also end the sessions of the agents' user accounts, so the change applies at once
 
     [Parameter(ParameterSetName = 'BlockMcp')]
-    [switch]$ReportOnly,                    # BlockMcp: report-only mode, which blocks nothing and logs what it would have blocked
+    [switch]$ReportOnly,                    # BlockMcp: report-only mode, which blocks nothing and logs what it would have blocked (with -Via Permission, only for the Conditional Access fallback)
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [Parameter(ParameterSetName = 'UnblockMcp')]
+    [ValidateSet('ConditionalAccess', 'Permission')]
+    [string]$Via = 'ConditionalAccess',     # BlockMcp, UnblockMcp: block with Conditional Access, or remove (BlockMcp) and grant (UnblockMcp) the Entra permission itself
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [string[]]$ExceptMcp,                   # BlockMcp All: the MCP servers to leave allowed
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [switch]$IncludeSharedBlueprint,        # BlockMcp -Via Permission: remove a permission from a blueprint that other agents use too, instead of blocking this agent with Conditional Access
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [switch]$GrantMissing,                  # BlockMcp All -Via Permission: also grant the servers in -ExceptMcp that the agent does not hold
+
+    [Parameter(ParameterSetName = 'BlockMcp')]
+    [switch]$FromBlueprintGrant,            # BlockMcp -Via Permission: take a permission out of the blueprint's grant instead of its inheritance (needs an application administrator, not Agent ID Administrator)
 
     [Parameter(ParameterSetName = 'SignIn', Mandatory)]
     [switch]$SignIn,                          # sign in once from a terminal with every permission the tool can use; later runs reuse the saved session
@@ -412,6 +436,8 @@ $script:LoadOnly = ($MyInvocation.InvocationName -eq '.')
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Accountability') -and -not $PSBoundParameters.ContainsKey('Action')) { $Action = 'list' }
 if ($Action -eq 'assign' -and $PSCmdlet.ParameterSetName -ne 'Accountability') { throw '-Action assign is only valid with -Accountability.' }
 if ($Action -eq 'reassign' -and $PSCmdlet.ParameterSetName -ne 'Ownerless') { throw '-Action reassign is only valid with -Ownerless. Use -Reassign <agents> -To <user> for manual assignment.' }
+if (($IncludeSharedBlueprint -or $GrantMissing -or $FromBlueprintGrant) -and $Via -ne 'Permission') { throw '-IncludeSharedBlueprint, -GrantMissing and -FromBlueprintGrant go with -Via Permission.' }
+if (($ExceptMcp -or $GrantMissing) -and @($BlockMcp | ForEach-Object { $_ -split '\s*[,;]\s*' }) -notcontains 'All') { throw '-ExceptMcp and -GrantMissing go with -BlockMcp All.' }
 # Reading packages and changing who can use them are on v1.0. Block, unblock and reassign exist only on beta
 # (v1.0 answers "Resource not found for the segment 'block'").
 $Base = 'https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages'
@@ -431,13 +457,18 @@ if (-not $script:LoadOnly -and -not (Get-Module -ListAvailable -Name Microsoft.G
     Write-Host 'Installing Microsoft.Graph.Authentication 2.39.0 (CurrentUser)...' -ForegroundColor Yellow
     Install-Module Microsoft.Graph.Authentication -RequiredVersion 2.39.0 -Repository PSGallery -Scope CurrentUser
 }
-if (-not $script:LoadOnly) { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop }
+# -WhatIf would otherwise make the module print a preview line for each type it registers. A module reads the global preference, and
+# a run with pwsh -File keeps -WhatIf there, so only the global one is turned off, for the import alone.
+if (-not $script:LoadOnly) {
+    $keepWhatIf = $global:WhatIfPreference
+    try { $global:WhatIfPreference = $false; Import-Module Microsoft.Graph.Authentication -ErrorAction Stop } finally { $global:WhatIfPreference = $keepWhatIf }
+}
 
 # Every permission the tool can use. -SignIn asks for all of them once, so no later mode has to prompt.
 $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
                       'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All',
-                      'Policy.ReadWrite.ConditionalAccess', 'User.RevokeSessions.All')
+                      'Policy.ReadWrite.ConditionalAccess', 'User.RevokeSessions.All', 'DelegatedPermissionGrant.ReadWrite.All')
 
 # A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
@@ -480,8 +511,21 @@ function Test-SignInPromptPossible {
 }
 
 # Has this account signed in with the tool or the Graph module before? A saved sign-in is reused without a window or a code.
+$script:SavedSignInPath = Join-Path $HOME '.mg/mg.authrecord.json'
 function Test-SavedSignIn {
-    Test-Path -LiteralPath (Join-Path $HOME '.mg/mg.authrecord.json')
+    Test-Path -LiteralPath $script:SavedSignInPath
+}
+
+# A failed or cancelled sign-in makes the Graph module delete the saved session record, which leaves every later run, scheduled
+# ones included, unable to sign in. Keep a copy and put it back when the attempt fails.
+function Invoke-KeepingSavedSignIn {
+    param([scriptblock]$Connect)
+    $saved = if (Test-Path -LiteralPath $script:SavedSignInPath) { [IO.File]::ReadAllBytes($script:SavedSignInPath) }
+    try { & $Connect }
+    catch {
+        if ($saved -and -not (Test-Path -LiteralPath $script:SavedSignInPath)) { [IO.File]::WriteAllBytes($script:SavedSignInPath, $saved) }
+        throw
+    }
 }
 
 # How the saved sign-in was made. The Graph module keeps a session made with a device code apart from one made with a window, and
@@ -516,7 +560,7 @@ function Connect-GraphSession {
         if (-not (Test-SavedSignIn)) { Write-Host 'Signing in with a device code: open https://microsoft.com/devicelogin on any device and enter the code shown below. A code works for about two minutes.' -ForegroundColor Cyan }
         $tries = if ($person) { 3 } else { 1 }
         for ($try = 1; ; $try++) {
-            try { Connect-MgGraph @c; Set-SignInMethod 'devicecode'; return }
+            try { Invoke-KeepingSavedSignIn { Connect-MgGraph @c }; Set-SignInMethod 'devicecode'; return }
             catch {
                 $lapsed = $_.Exception.Message -match '(?i)timed out|expired|expire'
                 if ($lapsed -and $try -ge $tries) { throw 'No code was entered in time. Run the command again and enter the code within two minutes of it appearing, or sign in on a machine where the Microsoft sign-in window can open (run -SignIn there).' }
@@ -530,7 +574,7 @@ function Connect-GraphSession {
     # shown a window (an unattended run, a remote shell), a window attempt could only fail and delete it, so reuse it with a code.
     if (-not $Fresh -and (Get-SignInMethod) -eq 'devicecode' -and (-not $person -or (Get-NoWindowReason))) { & $viaCode; return }
     if ($person -and -not (Test-SavedSignIn)) { Write-Host 'Signing in: a Microsoft sign-in window should open. If nothing appears, press Ctrl+C and run again with -DeviceCode.' -ForegroundColor DarkGray }
-    try { Connect-MgGraph @Connect; Set-SignInMethod 'window' }
+    try { Invoke-KeepingSavedSignIn { Connect-MgGraph @Connect }; Set-SignInMethod 'window' }
     catch {
         $msg = $_.Exception.Message
         $windowProblem = $msg -match '(?i)window handle|InteractiveBrowserCredential|interactive|browser|DISPLAY|timed out|timeout'
@@ -594,6 +638,11 @@ if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -a
 if ($PSCmdlet.ParameterSetName -eq 'AgentUsers') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'User.Read.All') }
 if ($PSCmdlet.ParameterSetName -eq 'McpAccess') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All') }
 if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'DelegatedPermissionGrant.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All', 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess') }
+# Which write permission a permission change needs (a grant, a blueprint's inheritance, a Conditional Access fallback) is known
+# only from its plan, so they are asked for once the plan is confirmed.
+if ($PSCmdlet.ParameterSetName -in 'BlockMcp', 'UnblockMcp' -and $Via -eq 'Permission') { $scopes = @($scopes | Where-Object { $_ -ne 'Policy.ReadWrite.ConditionalAccess' }) }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'revokemcpscope|grantmcpscope')) { $scopes += 'DelegatedPermissionGrant.ReadWrite.All', 'Application.Read.All', 'AgentIdentity.Read.All', 'User.Read.All' }
+if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'revokemcpinherit|grantmcpinherit')) { $scopes += 'AgentIdentityBlueprint.ReadWrite.All', 'Application.Read.All' }
 if ($RevokeSessions) { $scopes += 'User.RevokeSessions.All', 'User.Read.All', 'Application.Read.All', 'AgentIdentity.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Undo' -and (Test-Path -LiteralPath $Undo) -and ((Get-Content -Raw -LiteralPath $Undo) -match 'blockmcp')) { $scopes += 'Policy.Read.All', 'Policy.ReadWrite.ConditionalAccess', 'Application.Read.All', 'User.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.Read.All', 'ThreatHunting.Read.All', 'SecurityAlert.Read.All', 'User.Read.All', 'AgentIdentity.Read.All', 'Application.Read.All') }
@@ -2882,14 +2931,85 @@ function Get-McpScopes {
 # Does a blueprint pass one scope of a resource on to its agent identities? Inherit is its inheritablePermissions list.
 function Test-McpInherited {
     param([object[]]$Inherit, [string]$ResourceAppId, [string]$Scope)
-    foreach ($e in @($Inherit | Where-Object { $_ })) {
-        if ([string]$e.resourceAppId -ne $ResourceAppId) { continue }
-        $kind = [string]$e.inheritableScopes.kind
-        if ($kind -eq 'allAllowed') { return $true }
-        if ($kind -like 'enumerated*') { return (@($e.inheritableScopes.scopes) -contains $Scope) }
-        return $false
+    Test-InheritPasses -Pattern (Get-InheritPattern -Inherit $Inherit -ResourceAppId $ResourceAppId) -Scope $Scope
+}
+
+# What a blueprint passes on for one resource, as { Kind = allAllowed, enumerated or noScopes; Scopes }; Present is false when the
+# blueprint has no entry for the resource, which passes nothing.
+function Get-InheritPattern {
+    param([object[]]$Inherit, [string]$ResourceAppId)
+    $e = @($Inherit | Where-Object { $_ -and [string]$_.resourceAppId -eq $ResourceAppId })[0]
+    $s = if ($e) { $e.inheritableScopes } else { $null }
+    $type = [string]$s.'@odata.type'; $kind = [string]$s.kind
+    $k = if ($type -match 'allAllowed' -or $kind -eq 'allAllowed') { 'allAllowed' } elseif ($type -match 'enumerated' -or $kind -like 'enumerated*') { 'enumerated' } else { 'noScopes' }
+    [pscustomobject]@{ Kind = $k; Scopes = @(if ($k -eq 'enumerated') { @($s.scopes) | Where-Object { $_ } | ForEach-Object { [string]$_ } }); Present = [bool]$e }
+}
+
+function Test-InheritPasses {
+    param([object]$Pattern, [string]$Scope)
+    $Pattern.Kind -eq 'allAllowed' -or ($Pattern.Kind -eq 'enumerated' -and @($Pattern.Scopes) -contains $Scope)
+}
+
+# An inheritance with scopes taken out or put back. Only MCP scopes are taken out or put back. Taking one out of allAllowed lists
+# what the blueprint holds for the resource (Held) without it; a list left empty passes nothing.
+function Edit-InheritPattern {
+    param([object]$Pattern, [string[]]$Remove, [string[]]$Add, [string[]]$Held)
+    if ($Add) {
+        if ($Pattern.Kind -eq 'allAllowed') { return $Pattern }
+        $list = Edit-McpScope -Scope (@($Pattern.Scopes) -join ' ') -Add $Add
+    } else {
+        $from = if ($Pattern.Kind -eq 'allAllowed') { @($Held) } else { @($Pattern.Scopes) }
+        $list = Edit-McpScope -Scope ($from -join ' ') -Remove $Remove
     }
-    $false
+    $scopes = @($list.Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+    [pscustomobject]@{ Kind = $(if ($scopes.Count) { 'enumerated' } else { 'noScopes' }); Scopes = $scopes; Present = $true }
+}
+
+# The compact JSON a log keeps for an inheritance, and back. Reading refuses anything the tool would not write.
+function ConvertTo-InheritPatternJson {
+    param([object]$Pattern)
+    $o = [ordered]@{ kind = $Pattern.Kind }
+    if ($Pattern.Kind -eq 'enumerated') { $o.scopes = @($Pattern.Scopes) }
+    $o | ConvertTo-Json -Compress
+}
+function ConvertFrom-InheritPatternJson {
+    param([string]$Json)
+    try { $o = $Json | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    $kind = [string]$o.kind
+    $scopes = @($o.scopes | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+    if ($kind -notin 'allAllowed', 'enumerated', 'noScopes' -or ($kind -eq 'enumerated') -ne [bool]$scopes.Count) { return $null }
+    if (@($scopes | Where-Object { $_ -notmatch '^[A-Za-z0-9._-]+$' }).Count) { return $null }
+    [pscustomobject]@{ Kind = $kind; Scopes = $scopes; Present = $true }
+}
+
+function Test-InheritPatternSame {
+    param([object]$A, [object]$B)
+    $A.Kind -eq $B.Kind -and ((@($A.Scopes) | Sort-Object) -join ' ') -eq ((@($B.Scopes) | Sort-Object) -join ' ')
+}
+
+# The body that sets one resource's inheritance. inheritableRoles is left out, so it keeps its value.
+function New-InheritPatternBody {
+    param([object]$Pattern)
+    $s = switch ($Pattern.Kind) {
+        'allAllowed' { [ordered]@{ '@odata.type' = 'microsoft.graph.allAllowedScopes' } }
+        'enumerated' { [ordered]@{ '@odata.type' = 'microsoft.graph.enumeratedScopes'; scopes = @($Pattern.Scopes) } }
+        default { [ordered]@{ '@odata.type' = 'microsoft.graph.noScopes' } }
+    }
+    @{ inheritableScopes = $s } | ConvertTo-Json -Depth 4 -Compress
+}
+
+# Is a logged change of inheritance one the tool makes? Removing a scope takes it out of allAllowed or a list; putting one back adds it
+# to a list. Lists before and after may differ only by MCP scopes.
+function Test-InheritChangeShape {
+    param([object]$Before, [object]$After, [string]$Scope, [switch]$Removed)
+    if (-not $Before -or -not $After) { return $false }
+    $passBefore = Test-InheritPasses -Pattern $Before -Scope $Scope
+    $passAfter = Test-InheritPasses -Pattern $After -Scope $Scope
+    if ($Removed) { if (-not $passBefore -or $passAfter -or $After.Kind -eq 'allAllowed') { return $false } }
+    elseif ($passBefore -or -not $passAfter -or $Before.Kind -eq 'allAllowed' -or $After.Kind -ne 'enumerated') { return $false }
+    if ($Before.Kind -eq 'allAllowed') { return $true }
+    $diff = @(@($Before.Scopes) | Where-Object { @($After.Scopes) -notcontains $_ }) + @(@($After.Scopes) | Where-Object { @($Before.Scopes) -notcontains $_ })
+    $diff.Count -gt 0 -and @($diff | Where-Object { -not (Test-OneMcpScope $_) }).Count -eq 0
 }
 
 $script:McpDeclaredKql = @'
@@ -2941,9 +3061,9 @@ function Get-AgentUserIdsByIdentity {
 }
 
 # Every delegated grant that carries an MCP scope, with the client and the resource it joins. Grants are read tenant-wide because
-# a BYO server can have any name; only the MCP scopes are kept.
+# a BYO server can have any name. Scopes holds the MCP scopes; Scope keeps the whole list, which a change must preserve.
 function Get-McpGrantData {
-    $raw = @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$select=clientId,resourceId,scope,consentType&$top=999' |
+    $raw = @(Get-GraphAll -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$select=id,clientId,resourceId,principalId,scope,consentType&$top=999' |
              Where-Object { (Get-McpScopes ([string]$_.scope)).Count })
     $ids = @(@($raw | ForEach-Object { [string]$_.clientId; [string]$_.resourceId }) | Where-Object { $_ } | Get-Distinct)
     $sp = if ($ids.Count) { Invoke-GraphBatch -Version beta -Requests @($ids | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/servicePrincipals/{0}?$select=id,appId,displayName' -f $_) } }) -Activity 'Reading MCP permission holders' } else { @{} }
@@ -2955,21 +3075,29 @@ function Get-McpGrantData {
     }
     $grants = @($raw | ForEach-Object {
         $res = $clients[([string]$_.resourceId).ToLowerInvariant()]
-        [pscustomobject]@{ ClientId = ([string]$_.clientId).ToLowerInvariant(); ResourceAppId = [string]$res.AppId; ResourceName = [string]$res.Name
-                           Scopes = @(Get-McpScopes ([string]$_.scope)); Consent = [string]$_.consentType }
+        [pscustomobject]@{ Id = [string]$_.id; ClientId = ([string]$_.clientId).ToLowerInvariant(); ResourceId = ([string]$_.resourceId).ToLowerInvariant()
+                           ResourceAppId = [string]$res.AppId; ResourceName = [string]$res.Name; PrincipalId = [string]$_.principalId
+                           Scopes = @(Get-McpScopes ([string]$_.scope)); Scope = [string]$_.scope; Consent = [string]$_.consentType }
     })
     [pscustomobject]@{ Grants = $grants; Clients = $clients }
+}
+
+# The application object id of each blueprint, keyed by its app id (lowercased).
+function Get-BlueprintObjectIds {
+    param([string[]]$AppIds)
+    $map = @{}
+    $apps = @($AppIds | Where-Object { $_ -match $script:GuidPattern } | ForEach-Object { $_.ToLowerInvariant() } | Get-Distinct)
+    if ($apps.Count -eq 0) { return $map }
+    $objs = Invoke-GraphBatch -Requests @($apps | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/applications(appId='{0}')?`$select=id" -f $_) } }) -Activity 'Reading agent blueprints'
+    foreach ($a in $apps) { if ($objs[$a] -and $objs[$a].Status -eq 200) { $map[$a] = [string]$objs[$a].Body.id } }
+    $map
 }
 
 # Blueprint app id (lowercased) -> its inheritablePermissions entries, for the blueprints among the grant holders.
 function Get-McpInheritance {
     param([string[]]$BlueprintAppIds)
     $map = @{}
-    $apps = @($BlueprintAppIds | Where-Object { $_ } | ForEach-Object { $_.ToLowerInvariant() } | Get-Distinct)
-    if ($apps.Count -eq 0) { return $map }
-    $objs = Invoke-GraphBatch -Requests @($apps | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/applications(appId='{0}')?`$select=id" -f $_) } }) -Activity 'Reading agent blueprints'
-    $objectIds = @{}
-    foreach ($a in $apps) { if ($objs[$a] -and $objs[$a].Status -eq 200) { $objectIds[$a] = [string]$objs[$a].Body.id } }
+    $objectIds = Get-BlueprintObjectIds $BlueprintAppIds
     if ($objectIds.Count -eq 0) { return $map }
     $res = Invoke-GraphBatch -Version beta -Requests @($objectIds.Keys | ForEach-Object { @{ id = $_; method = 'GET'; url = ('/applications/{0}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions' -f $objectIds[$_]) } }) -Activity 'Reading inheritable permissions'
     foreach ($a in $objectIds.Keys) { $map[$a] = if ($res[$a] -and $res[$a].Status -eq 200) { @(Get-ItemList $res[$a].Body.value) } else { @() } }
@@ -2986,14 +3114,31 @@ function Get-McpBlueprintPackages {
     if ($cands.Count -eq 0) { return $map }
     $apps = @($cands | ForEach-Object { ([string]$_.manifestId).ToLowerInvariant() } | Get-Distinct)
     $principals = Get-ServicePrincipalsByAppId -AppIds $apps -Version beta -Activity 'Reading agent blueprints'
-    $reqs = @($apps | Where-Object { $principals.ContainsKey($_) } | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/servicePrincipals/microsoft.graph.agentIdentity?`$filter=agentIdentityBlueprintId eq '{0}'&`$select=id" -f $_) } })
-    $res = Invoke-GraphBatch -Version beta -Requests $reqs -Activity 'Reading agent blueprints'
+    $made = Get-BlueprintIdentities @($apps | Where-Object { $principals.ContainsKey($_) })
     foreach ($p in $cands) {
         $a = ([string]$p.manifestId).ToLowerInvariant()
         $pr = $principals[$a]
         if (-not $pr) { continue }
-        $map[[string]$p.id] = [pscustomobject]@{ AppId = $a; Principal = [string]$pr.id
-                                                Identities = @(if ($res[$a] -and $res[$a].Status -eq 200) { Get-ItemList $res[$a].Body.value | ForEach-Object { [string]$_.id } }) }
+        $map[[string]$p.id] = [pscustomobject]@{ AppId = $a; Principal = [string]$pr.id; Identities = @($made[$a] | Where-Object { $_ } | ForEach-Object { $_.Id }) }
+    }
+    $map
+}
+
+# The agent identities made from each blueprint, keyed by the blueprint's app id (lowercased): a { Id (lowercased); Name } for each,
+# or $null when Entra could not be read for that blueprint.
+function Get-BlueprintIdentities {
+    param([string[]]$AppIds)
+    $map = @{}
+    $apps = @($AppIds | Where-Object { $_ -match $script:GuidPattern } | ForEach-Object { $_.ToLowerInvariant() } | Get-Distinct)
+    if ($apps.Count -eq 0) { return $map }
+    $reqs = @($apps | ForEach-Object { @{ id = $_; method = 'GET'; url = ("/servicePrincipals/microsoft.graph.agentIdentity?`$filter=agentIdentityBlueprintId eq '{0}'&`$select=id,displayName&`$top=999" -f $_) } })
+    $res = Invoke-GraphBatch -Version beta -Requests $reqs -Activity 'Reading agent blueprints'
+    foreach ($a in $apps) {
+        $r = $res[$a]
+        if (-not $r -or $r.Status -ne 200) { $map[$a] = $null; continue }
+        $items = @(Get-ItemList $r.Body.value)
+        if ($r.Body.'@odata.nextLink') { $items += @(Get-GraphAll -Uri ([string]$r.Body.'@odata.nextLink')) }
+        $map[$a] = @($items | ForEach-Object { [pscustomobject]@{ Id = ([string]$_.id).ToLowerInvariant(); Name = [string]$_.displayName } })
     }
     $map
 }
@@ -3284,7 +3429,8 @@ function Get-McpAccessReport {
     $built = New-McpAccessRows -Packages $scope -IdentityIds $ids -AgentUsers $users -Grants $g.Grants -Clients $g.Clients -Inherit $inherit `
         -Declared $declared -Usage $usage -KeyMap $keyMap -ServerApps $serverApps -Blueprints $blueprints -IncludeOthers:($only.Count -eq 0)
     foreach ($r in $built.Rows) { Set-McpBlockState -Row $r -Policies $policies }
-    [pscustomobject]@{ Rows = $built.Rows; Agents = $built.Agents; ServerApps = $serverApps; Policies = $policies }
+    [pscustomobject]@{ Rows = $built.Rows; Agents = $built.Agents; ServerApps = $serverApps; Policies = $policies
+                       Grants = $g.Grants; Clients = $g.Clients; Inherit = $inherit; IdentityIds = $ids; AgentUsers = $users }
 }
 
 # Why a row matters, in a few words, for the chosen period.
@@ -3387,13 +3533,19 @@ function ConvertTo-McpBlockItem {
                        Server = $Row.Server; ResourceAppId = $Row.ResourceAppId; ResourceName = $Row.ResourceName; Target = $Target }
 }
 
+# The server key for a name given on the command line or in the console. "Agent Tools" or "shared" is the shared permission.
+function ConvertTo-McpRequestKey {
+    param([string]$Name)
+    if ($Name -match '^(?i)(agent\s*tools|shared)') { 'agenttools' } else { ConvertTo-McpServerKey $Name }
+}
+
 # The rows for chosen agents and server names, so a block can be set up before an agent ever uses the server. A pair the report
 # has no row for gets one from what is known about the agent and the server.
 function Resolve-McpBlockRows {
     param([object]$Report, [object[]]$Packages, [string[]]$Servers)
     foreach ($p in @($Packages)) {
         foreach ($name in @($Servers | Where-Object { $_ })) {
-            $key = if ($name -match '^(?i)(agent\s*tools|shared)') { 'agenttools' } else { ConvertTo-McpServerKey $name }
+            $key = ConvertTo-McpRequestKey $name
             $row = @($Report.Rows | Where-Object { $_.AgentId -eq $p.id -and $_.ServerKey -eq $key })[0]
             if (-not $row) {
                 $info = $Report.Agents[([string]$p.id).ToLowerInvariant()]
@@ -3561,6 +3713,616 @@ function ConvertTo-McpUndoItems {
 }
 
 # ---------------------------------------------------------------------------------------------
+# MCP permissions: take an MCP server away from an agent, give it one, or allow only a chosen set, in Entra's delegated permission
+# grants. An agent holds a server's scope through its own agent identity's grant, or through its blueprint's grant when the
+# blueprint passes it on (its inheritable permissions). Each removal uses the narrowest lever that reaches the agent:
+#   - the agent identity's own grant: only this agent changes;
+#   - the blueprint's inheritance, when every agent identity of the blueprint belongs to this agent: the blueprint stops passing
+#     the scope on and keeps its own grant. Agent ID Administrator may change it; a grant needs an application administrator.
+#     FromBlueprintGrant takes the scope out of the blueprint's grant instead;
+#   - otherwise a Conditional Access block of this agent alone or, when asked to, the shared blueprint's inheritance (or grant),
+#     which every agent of that blueprint then loses.
+# Granting passes a scope the blueprint holds on again, or adds Tools.ListInvoke.All of a server's own application to the grant of
+# each of the agent's identities. The shared Agent Tools scopes are never granted. Only MCP scopes are added or removed; every other
+# scope stays as it is.
+# ---------------------------------------------------------------------------------------------
+$script:GrantBase = 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants'
+$script:ApplicationBase = 'https://graph.microsoft.com/v1.0/applications'
+# Entra's grant ids are base64url strings, not GUIDs.
+$script:GrantIdPattern = '^[A-Za-z0-9_-]{1,128}$'
+$script:GrantWriteHint = ' (this needs the DelegatedPermissionGrant.ReadWrite.All permission and the Cloud Application Administrator, Application Administrator or Privileged Role Administrator role)'
+$script:InheritWriteHint = ' (this needs the AgentIdentityBlueprint.ReadWrite.All permission and the Agent ID Administrator role)'
+
+# A grant's scope list with MCP scopes taken out and added, in its own order and without repeats. Only MCP scopes are taken out
+# or added, so every other scope stays; names compare without case.
+function Edit-McpScope {
+    param([string]$Scope, [string[]]$Remove, [string[]]$Add)
+    $drop = @(Get-McpScopes ($Remove -join ' '))
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in ([string]$Scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) { if ($drop -notcontains $s -and $seen.Add($s)) { $out.Add($s) } }
+    foreach ($s in (Get-McpScopes ($Add -join ' '))) { if ($seen.Add($s)) { $out.Add($s) } }
+    $out -join ' '
+}
+
+# Is the text exactly one MCP scope, and nothing else?
+function Test-OneMcpScope {
+    param([string]$Scope)
+    $s = @(Get-McpScopes $Scope)
+    $s.Count -eq 1 -and $s[0] -eq $Scope
+}
+
+# What planning needs beyond the access report, for the agents being changed: the grant holders of each agent (its own agent
+# identities and its blueprint's principal), the other agents of that blueprint, and the servers' service principals. A blueprint's
+# agent identity belongs to the catalog agent that names it, or else to the blueprint's own catalog entry.
+function Get-McpPermissionContext {
+    param([object]$Report, [object[]]$Catalog, [string[]]$AgentIds)
+    $byId = @{}; $byIdentity = @{}; $byBlueprint = @{}
+    foreach ($p in @($Catalog)) {
+        $id = [string]$p.id
+        if (-not $byId.ContainsKey($id)) { $byId[$id] = $p }
+        if ($p.agentIdentityId) { $byIdentity[([string]$p.agentIdentityId).ToLowerInvariant()] = $id }
+        elseif ([string]$p.manifestId -match $script:GuidPattern -and @($p.elementTypes) -contains 'AgenticUserTemplates') {
+            $k = ([string]$p.manifestId).ToLowerInvariant()
+            if (-not $byBlueprint.ContainsKey($k)) { $byBlueprint[$k] = $id }
+        }
+    }
+    $infos = @{}
+    foreach ($a in @($AgentIds | Where-Object { $_ } | Get-Distinct)) {
+        $info = $Report.Agents[$a.ToLowerInvariant()]
+        if ($info -and $info.Kind -eq 'Agent') { $infos[$a] = $info }
+    }
+    $made = Get-BlueprintIdentities @($infos.Values | ForEach-Object { $_.BlueprintAppId })
+    $objects = Get-BlueprintObjectIds @($infos.Values | ForEach-Object { $_.BlueprintAppId })
+    $names = @{}
+    foreach ($c in @($Report.Clients.Values)) { $names[([string]$c.Id).ToLowerInvariant()] = [string]$c.Name }
+    $holders = @{}
+    foreach ($a in $infos.Keys) {
+        $info = $infos[$a]; $app = [string]$info.BlueprintAppId
+        $mine = @(); $others = @()
+        if ($app -and $made.ContainsKey($app) -and $null -eq $made[$app]) { $others = @('other agents (the blueprint''s agent identities could not be read)') }
+        foreach ($i in @($(if ($app -and $made.ContainsKey($app)) { $made[$app] }) | Where-Object { $_ })) {
+            $names[$i.Id] = $i.Name
+            $owner = if ($byIdentity.ContainsKey($i.Id)) { $byIdentity[$i.Id] } elseif ($byBlueprint.ContainsKey($app)) { $byBlueprint[$app] } else { '' }
+            if ($owner -eq $a) { $mine += $i.Id }
+            elseif ($owner) { $others += [string]$byId[$owner].displayName }
+            else { $others += ('{0} (an agent identity not in the catalog)' -f $i.Name) }
+        }
+        $principal = ''
+        if ($info.IdentityKind -eq 'Blueprint') { $principal = ([string]$info.IdentityId).ToLowerInvariant() }
+        else {
+            $mine = @(([string]$info.IdentityId).ToLowerInvariant())
+            $ids = if ($Report.IdentityIds) { $Report.IdentityIds[[string]$info.IdentityId] } else { $null }
+            if ($ids -and $ids.Principal) { $principal = ([string]$ids.Principal).ToLowerInvariant() }
+        }
+        $holders[$a] = [pscustomobject]@{ Identities = @($mine | Where-Object { $_ }); Principal = $principal; BlueprintAppId = $app; Others = @($others | Get-Distinct); IdentityKind = $info.IdentityKind
+                                          BlueprintObjectId = $(if ($app -and $objects.ContainsKey($app)) { $objects[$app] } else { '' })
+                                          BlueprintName = $(if ($principal -and $names.ContainsKey($principal)) { $names[$principal] } else { $app }) }
+    }
+    $sps = @{}
+    $apps = @($Report.ServerApps.Values | ForEach-Object { [string]$_.AppId } | Where-Object { $_ -ne $script:AgentToolsAppId })
+    $found = Get-ServicePrincipalsByAppId -AppIds $apps -Select 'id,appId,displayName,oauth2PermissionScopes' -Activity 'Reading MCP servers'
+    foreach ($k in $found.Keys) { $sps[$k.ToLowerInvariant()] = $found[$k] }
+    [pscustomobject]@{ Report = $Report; Holders = $holders; ResourceSps = $sps; Names = $names }
+}
+
+# One planned change for one agent, server and scope. Change is Remove, Grant, Block (Conditional Access in place of a shared
+# blueprint) or None, with the reason in Why. Via says what is written: a grant (Grant is the grant it works on, an existing one or
+# what a new one would be) or a blueprint's inheritance (Inherit names the blueprint, the resource and what it passes on now).
+function New-McpChange {
+    param([object]$Row, [ValidateSet('Remove', 'Grant', 'Block', 'None')][string]$Change, [string]$Lever = '', [string]$Why = '', [object]$Grant, [object]$Inherit, [string]$Scope = '',
+          [string]$ClientKind = '', [string]$ClientName = '', [string[]]$Others = @(), [object[]]$BlockItems = @(), [switch]$Shared)
+    $on = if ($Inherit) { $Inherit } else { $Grant }
+    [pscustomobject]@{
+        Agent = $Row.Agent; AgentId = $Row.AgentId; Server = $Row.Server; ServerKey = $Row.ServerKey; Change = $Change; Lever = $Lever; Scope = $Scope; Effect = ''; Why = $Why
+        Via = $(if ($Inherit) { 'inheritance' } else { 'grant' })
+        ClientId = $(if ($Inherit) { [string]$Inherit.PrincipalId } elseif ($Grant) { [string]$Grant.ClientId } else { '' }); ClientKind = $ClientKind; ClientName = $ClientName
+        GrantId = $(if ($Grant -and -not $Inherit) { [string]$Grant.Id } else { '' })
+        ResourceId = $(if ($on) { [string]$on.ResourceId } else { '' }); ResourceAppId = $(if ($on) { [string]$on.ResourceAppId } else { '' }); ResourceName = $(if ($on) { [string]$on.ResourceName } else { '' })
+        ConsentType = $(if ($Grant -and -not $Inherit) { [string]$Grant.Consent } else { '' }); PrincipalId = $(if ($Grant -and -not $Inherit) { [string]$Grant.PrincipalId } else { '' })
+        ScopeBefore = $(if ($Grant -and -not $Inherit) { [string]$Grant.Scope } else { '' }); ScopeAfter = ''; CreateScope = ''
+        BlueprintAppId = $(if ($Inherit) { [string]$Inherit.AppId } else { '' }); BlueprintObjectId = $(if ($Inherit) { [string]$Inherit.ObjectId } else { '' })
+        PatternBefore = $(if ($Inherit) { ConvertTo-InheritPatternJson $Inherit.Pattern } else { '' }); PatternAfter = ''; Held = $(if ($Inherit) { [string]$Inherit.Held } else { '' })
+        SetPattern = ''; ExpectPattern = ''
+        Others = @($Others | Where-Object { $_ }); Shared = [bool]$Shared; BlockItems = @($BlockItems | Where-Object { $_ })
+    }
+}
+
+# What a change of a blueprint's inheritance works on, for one resource: the blueprint, what it passes on now and the scopes its
+# principal holds for the resource (what allAllowed stands for).
+function New-McpInheritTarget {
+    param([object]$Context, [object]$Holder, [string]$ResourceId, [string]$ResourceAppId, [string]$ResourceName)
+    $held = Edit-McpScope -Scope ((@($Context.Report.Grants | Where-Object { $_.ClientId -eq $Holder.Principal -and $_.ResourceId -eq $ResourceId } | ForEach-Object { $_.Scope })) -join ' ')
+    [pscustomobject]@{ AppId = $Holder.BlueprintAppId; ObjectId = $Holder.BlueprintObjectId; PrincipalId = $Holder.Principal; ResourceId = $ResourceId; ResourceAppId = $ResourceAppId; ResourceName = $ResourceName
+                       Pattern = (Get-InheritPattern -Inherit $Context.Report.Inherit[$Holder.BlueprintAppId] -ResourceAppId $ResourceAppId); Held = $held }
+}
+
+# The changes that take one server (one row) away from one agent, each through the narrowest lever that reaches it. KeepShared
+# leaves the shared Agent Tools scopes alone (allow only, with Agent Tools allowed). FromBlueprintGrant changes a blueprint's grant
+# instead of its inheritance. BlockMode is the mode of a Conditional Access fallback.
+function Get-McpRemovalChanges {
+    param([object]$Context, [object]$Row, [switch]$IncludeSharedBlueprint, [switch]$KeepShared, [switch]$FromBlueprintGrant, [ValidateSet('On', 'Report-only')][string]$BlockMode = 'On')
+    $h = if ($Row.AgentId) { $Context.Holders[[string]$Row.AgentId] } else { $null }
+    if (-not $h) { return New-McpChange -Row $Row -Change None -Why 'Not a catalog agent. Review its permissions in Entra (Enterprise applications > Permissions).' }
+    $toolsRow = $Row.ServerKey -eq 'agenttools'
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    $blocked = @{}; $sharedOnly = $false
+    $others = ($h.Others -join ', ')
+    foreach ($g in @($Context.Report.Grants)) {
+        $own = $h.Identities -contains $g.ClientId
+        if (-not ($own -or ($h.Principal -and $g.ClientId -eq $h.Principal))) { continue }
+        $onTools = $g.ResourceAppId -eq $script:AgentToolsAppId
+        foreach ($s in $g.Scopes) {
+            $hit = if ($onTools) { $s -ne 'Tools.ListInvoke.All' -and ($toolsRow -or (-not $KeepShared -and (ConvertTo-McpServerKey $s) -eq $Row.ServerKey)) }
+                   else { -not $toolsRow -and $s -eq 'Tools.ListInvoke.All' -and (ConvertTo-McpServerKey $g.ResourceName) -eq $Row.ServerKey }
+            if (-not $hit) { continue }
+            $holder = [string]$Context.Names[$g.ClientId]
+            if ($own) {
+                $out.Add((New-McpChange -Row $Row -Change Remove -Lever 'Agent identity grant' -Grant $g -Scope $s -ClientKind identity -ClientName $holder -Why 'The agent identity''s own grant: only this agent changes.'))
+                continue
+            }
+            # A blueprint scope the blueprint does not pass on never reached the agent.
+            if (-not (Test-McpInherited -Inherit $Context.Report.Inherit[$h.BlueprintAppId] -ResourceAppId $g.ResourceAppId -Scope $s)) { continue }
+            $alone = $h.Others.Count -eq 0
+            if ($alone -or $IncludeSharedBlueprint) {
+                $whom = if ($alone) { 'only this agent uses it' } else { "it is removed for $others too" }
+                if ($FromBlueprintGrant) {
+                    $out.Add((New-McpChange -Row $Row -Change Remove -Lever $(if ($alone) { 'Blueprint grant' } else { 'Shared blueprint grant' }) -Grant $g -Scope $s -ClientKind blueprint -ClientName $holder `
+                        -Others $h.Others -Shared:(-not $alone) -Why "Taken out of the blueprint's own grant; $whom."))
+                } elseif (-not $h.BlueprintObjectId) {
+                    $out.Add((New-McpChange -Row $Row -Change None -Grant $g -ClientKind blueprint -ClientName $holder -Why 'The blueprint''s application could not be read, so its inheritance cannot be changed. -FromBlueprintGrant changes its grant instead.'))
+                } else {
+                    $target = New-McpInheritTarget -Context $Context -Holder $h -ResourceId $g.ResourceId -ResourceAppId $g.ResourceAppId -ResourceName $g.ResourceName
+                    $out.Add((New-McpChange -Row $Row -Change Remove -Lever $(if ($alone) { 'Blueprint inheritance' } else { 'Shared blueprint inheritance' }) -Inherit $target -Scope $s -ClientKind blueprint `
+                        -ClientName $h.BlueprintName -Others $h.Others -Shared:(-not $alone) -Why "The blueprint stops passing it to its agent identities and keeps its own grant; $whom."))
+                }
+            } elseif ($onTools -and -not $toolsRow) {
+                $sharedOnly = $true
+            } elseif (-not $blocked.ContainsKey($g.ResourceAppId)) {
+                $blocked[$g.ResourceAppId] = $true
+                $items = @(foreach ($i in $(if ($h.IdentityKind -eq 'Blueprint') { $h.Identities } else { @([string]$Row.IdentityId) })) {
+                    [pscustomobject]@{ Agent = $Row.Agent; AgentId = $Row.AgentId; IdentityId = $i; AgentUserIds = @($Context.Report.AgentUsers[$i.ToLowerInvariant()] | Where-Object { $_ })
+                                       Server = $Row.Server; ResourceAppId = $g.ResourceAppId; ResourceName = $g.ResourceName; Target = $BlockMode }
+                })
+                $out.Add($(if ($items.Count) {
+                    New-McpChange -Row $Row -Change Block -Lever 'Conditional Access' -Grant $g -ClientKind blueprint -ClientName $holder -Others $h.Others -BlockItems $items -Shared `
+                        -Why "The blueprint's grant is shared with $others, so it stays; this agent alone is blocked from the server with Conditional Access."
+                } else {
+                    New-McpChange -Row $Row -Change None -Grant $g -ClientKind blueprint -ClientName $holder -Others $h.Others -Shared `
+                        -Why "Every agent identity of this blueprint belongs to another catalog agent ($others). Change it on those agents."
+                }))
+            }
+        }
+    }
+    if ($sharedOnly) {
+        $out.Add((New-McpChange -Row $Row -Change None -Others $h.Others -Shared -Why ("It reaches this server only through the shared permission, inherited from a blueprint that {0} also use. Remove it from the blueprint for all of them, or remove the Agent Tools (shared permission) row, which blocks every shared server for this agent alone." -f $others)))
+    }
+    if ($out.Count -eq 0) {
+        $why = if ($KeepShared -and $Row.Shared) { 'It reaches this server only through the shared permission, which stays allowed.' }
+               elseif ($Row.NotInherited -and -not $Row.Granted) { 'Its blueprint holds this permission but does not pass it to the agent, so there is nothing to remove.' }
+               elseif ($Row.Via -like '*Power Platform connector*') { 'It reaches this server through a Power Platform connector, which has no Entra permission. Use a Power Platform data policy, or remove the tool from the agent.' }
+               else { 'The agent holds no Entra permission for this server.' }
+        $out.Add((New-McpChange -Row $Row -Change None -Why $why))
+    }
+    $out.ToArray()
+}
+
+# The changes that give one agent one server: Tools.ListInvoke.All of the server's own application. When the blueprint already holds
+# it, only this agent uses the blueprint and its inheritance leaves it out, the blueprint passes it on again. Otherwise it is added
+# to the grant of each of the agent's identities that does not hold it yet (a new grant for everyone when the identity has none);
+# for a blueprint catalog entry that means each of its agent identities, never the blueprint's grant.
+function Get-McpGrantChanges {
+    param([object]$Context, [object]$Row)
+    $h = if ($Row.AgentId) { $Context.Holders[[string]$Row.AgentId] } else { $null }
+    if (-not $h) { return New-McpChange -Row $Row -Change None -Why 'Not a catalog agent.' }
+    if ($Row.ServerKey -eq 'agenttools' -or ($Row.ResourceAppId -and $Row.ResourceAppId -eq $script:AgentToolsAppId)) {
+        return New-McpChange -Row $Row -Change None -Why 'The shared permission (Agent Tools) is not granted. Grant the server''s own application instead.'
+    }
+    if (-not $Row.ResourceAppId) { return New-McpChange -Row $Row -Change None -Why "No MCP server called '$($Row.Server)' with an application of its own is known in this tenant." }
+    $sp = $Context.ResourceSps[([string]$Row.ResourceAppId).ToLowerInvariant()]
+    if (-not $sp) { return New-McpChange -Row $Row -Change None -Why 'The server''s application has no service principal in this tenant.' }
+    if (@($sp.oauth2PermissionScopes | ForEach-Object { [string]$_.value }) -notcontains 'Tools.ListInvoke.All') { return New-McpChange -Row $Row -Change None -Why 'The application does not publish Tools.ListInvoke.All, so it is not an MCP server.' }
+    if ($h.Identities.Count -eq 0) { return New-McpChange -Row $Row -Change None -Why 'The agent has no agent identity to grant to.' }
+    $resource = ([string]$sp.id).ToLowerInvariant()
+    $grants = @($Context.Report.Grants | Where-Object { $_.ResourceId -eq $resource })
+    $bpHolds = $h.Principal -and @($grants | Where-Object { $_.ClientId -eq $h.Principal -and $_.Scopes -contains 'Tools.ListInvoke.All' }).Count
+    $inherited = $bpHolds -and (Test-McpInherited -Inherit $Context.Report.Inherit[$h.BlueprintAppId] -ResourceAppId $Row.ResourceAppId -Scope 'Tools.ListInvoke.All')
+    if ($bpHolds -and -not $inherited -and $h.Others.Count -eq 0 -and $h.BlueprintObjectId) {
+        $target = New-McpInheritTarget -Context $Context -Holder $h -ResourceId $resource -ResourceAppId ([string]$sp.appId) -ResourceName ([string]$sp.displayName)
+        if ($target.Pattern.Present) {
+            return New-McpChange -Row $Row -Change Grant -Lever 'Blueprint inheritance' -Inherit $target -Scope 'Tools.ListInvoke.All' -ClientKind blueprint -ClientName $h.BlueprintName `
+                -Why 'The blueprint already holds it, so it passes it to its agent identities again; only this agent uses the blueprint.'
+        }
+    }
+    $out = @(foreach ($i in $h.Identities) {
+        $mine = @($grants | Where-Object { $_.ClientId -eq $i })
+        if ($inherited -or @($mine | Where-Object { $_.Scopes -contains 'Tools.ListInvoke.All' }).Count) { continue }
+        $existing = @($mine | Where-Object { $_.Consent -eq 'AllPrincipals' })[0]
+        $target = if ($existing) { $existing } else {
+            [pscustomobject]@{ Id = ''; ClientId = $i; ResourceId = $resource; ResourceAppId = [string]$sp.appId; ResourceName = [string]$sp.displayName; Consent = 'AllPrincipals'; PrincipalId = ''; Scope = '' }
+        }
+        $name = if ($Context.Names.ContainsKey($i)) { $Context.Names[$i] } else { $Row.Agent }
+        New-McpChange -Row $Row -Change Grant -Lever 'Agent identity grant' -Grant $target -Scope 'Tools.ListInvoke.All' -ClientKind identity -ClientName $name `
+            -Why ('Granted to the agent identity for every user it acts for.{0}' -f $(if ($Row.Block) { ' A Conditional Access block of this server still applies; -UnblockMcp without -Via Permission removes it.' } else { '' }))
+    })
+    if ($out.Count -eq 0) { return New-McpChange -Row $Row -Change None -Why $(if ($inherited) { 'The agent already holds it through its blueprint.' } else { 'The agent already holds it.' }) }
+    $out
+}
+
+# Fill in what each planned change does: the scopes a grant keeps, a grant deleted because nothing is left or a new grant, and what
+# a blueprint passes on afterwards.
+function Set-McpPlanOutcome {
+    param([object[]]$Plan)
+    $short = { param([string[]]$List, [string]$Many) if ($List.Count -le 3) { $List -join ', ' } else { "$($List.Count) $Many" } }
+    foreach ($grp in @($Plan | Where-Object { $_.Change -eq 'Remove' -and $_.Via -eq 'grant' } | Group-Object GrantId)) {
+        $after = Edit-McpScope -Scope $grp.Group[0].ScopeBefore -Remove @($grp.Group | ForEach-Object { $_.Scope })
+        $left = @($after.Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+        $effect = if ($left.Count -eq 0) { 'Removed; the grant is deleted, nothing else is in it' } else { "Removed; the grant keeps $(& $short $left 'other scopes')" }
+        foreach ($c in $grp.Group) { $c.ScopeAfter = $after; $c.Effect = $effect }
+    }
+    foreach ($c in @($Plan | Where-Object { $_.Change -eq 'Grant' -and $_.Via -eq 'grant' })) { $c.ScopeAfter = Edit-McpScope -Scope $c.ScopeBefore -Add $c.Scope; $c.Effect = if ($c.GrantId) { 'Granted; added to its grant' } else { 'Granted in a new grant' } }
+    foreach ($grp in @($Plan | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'inheritance' } | Group-Object { '{0}|{1}|{2}' -f $_.Change, $_.BlueprintAppId, $_.ResourceAppId })) {
+        $first = $grp.Group[0]
+        $scopes = @($grp.Group | ForEach-Object { $_.Scope })
+        $before = ConvertFrom-InheritPatternJson $first.PatternBefore
+        $after = if ($first.Change -eq 'Grant') { Edit-InheritPattern -Pattern $before -Add $scopes } else { Edit-InheritPattern -Pattern $before -Remove $scopes -Held @(([string]$first.Held).Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) }
+        $effect = if ($first.Change -eq 'Grant') { 'Passed on by the blueprint again' }
+                  elseif ($after.Kind -eq 'noScopes') { 'No longer passed on; the blueprint passes nothing for this server' }
+                  else { "No longer passed on; the blueprint still passes $(& $short @($after.Scopes) 'scopes')" }
+        foreach ($c in $grp.Group) { $c.PatternAfter = ConvertTo-InheritPatternJson $after; $c.Effect = $effect }
+    }
+    foreach ($c in @($Plan | Where-Object { $_.Change -eq 'Block' })) { $c.Effect = if ($c.BlockItems[0].Target -eq 'Report-only') { 'Blocked in report-only mode' } else { 'Blocked' } }
+    foreach ($c in @($Plan | Where-Object { $_.Change -eq 'None' })) { $c.Effect = 'No change' }
+}
+
+# The plan for removing some rows and granting others. A row of an agent that is not in the context gets a None change.
+function New-McpPermissionPlan {
+    param([object]$Context, [object[]]$RemoveRows, [object[]]$GrantRows, [switch]$IncludeSharedBlueprint, [switch]$KeepShared, [switch]$FromBlueprintGrant,
+          [ValidateSet('On', 'Report-only')][string]$BlockMode = 'On')
+    $plan = @(foreach ($r in @($RemoveRows | Where-Object { $_ })) {
+                  Get-McpRemovalChanges -Context $Context -Row $r -IncludeSharedBlueprint:$IncludeSharedBlueprint -KeepShared:$KeepShared -FromBlueprintGrant:$FromBlueprintGrant -BlockMode $BlockMode }
+              foreach ($r in @($GrantRows | Where-Object { $_ })) { Get-McpGrantChanges -Context $Context -Row $r })
+    Set-McpPlanOutcome $plan
+    $plan
+}
+
+# The write permissions a plan needs, asked for only once it is confirmed.
+function Get-McpPlanScopes {
+    param([object[]]$Plan)
+    if (@($Plan | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'grant' }).Count) { 'DelegatedPermissionGrant.ReadWrite.All' }
+    if (@($Plan | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'inheritance' }).Count) { 'AgentIdentityBlueprint.ReadWrite.All' }
+    if (@($Plan | Where-Object { $_.Change -eq 'Block' }).Count) { 'Policy.ReadWrite.ConditionalAccess' }
+}
+
+# Allow only: the rows of one agent to remove (every server it holds that is not allowed) and, with GrantMissing, to grant (every
+# allowed server it does not hold). AllowKeys are server keys; 'agenttools' among them keeps the shared permission.
+function Select-McpAllowOnlyRows {
+    param([object]$Report, [object]$Package, [string[]]$AllowKeys, [switch]$GrantMissing)
+    $allow = @($AllowKeys | Where-Object { $_ })
+    $remove = @($Report.Rows | Where-Object { $_.AgentId -eq $Package.id -and $_.ServerKey -ne 'agenttools' -and $_.Granted -and $allow -notcontains $_.ServerKey })
+    $grant = @(if ($GrantMissing) { Resolve-McpBlockRows -Report $Report -Packages @($Package) -Servers @($allow | Where-Object { $_ -ne 'agenttools' }) | Where-Object { -not $_.Granted } })
+    [pscustomobject]@{ Remove = $remove; Grant = $grant }
+}
+
+# Lines that explain a plan: what a grant needs besides the permission, when a change takes effect, and who else a shared
+# blueprint reaches.
+function Get-McpPlanNotes {
+    param([object[]]$Plan)
+    if (@($Plan | Where-Object { $_.Change -eq 'Grant' }).Count) { 'A grant gives the permission only. The agent''s code or manifest (its ToolingManifest.json or MCP configuration) must also declare the server before the agent can call it.' }
+    if (@($Plan | Where-Object { $_.Change -in 'Remove', 'Block', 'Grant' }).Count) { 'A change applies when the agent next asks for a token; a token already issued keeps its permissions for up to an hour.' }
+    if (@($Plan | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'inheritance' }).Count) { 'Changing what a blueprint passes on needs the Agent ID Administrator role (AgentIdentityBlueprint.ReadWrite.All).' }
+    if (@($Plan | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'grant' }).Count) { 'Changing a grant needs the Cloud Application Administrator or Application Administrator role (DelegatedPermissionGrant.ReadWrite.All).' }
+    foreach ($c in @($Plan | Where-Object { $_.Lever -in 'Shared blueprint grant', 'Shared blueprint inheritance' } | Group-Object Agent | ForEach-Object { $_.Group[0] })) {
+        '{0}: the blueprint is shared with {1}, so the permission is removed for them too.' -f $c.Agent, ($c.Others -join ', ')
+    }
+}
+
+# Change the grants and inheritances the plan names, then block where it falls back to Conditional Access. Each grant or inheritance
+# is read again first and written once, however many scopes change in it: for a grant a PATCH with the scopes that stay, a DELETE
+# when none would, or a POST for a new grant; for an inheritance a PATCH of what the blueprint passes on. One log record per scope.
+function Invoke-McpPermissionChange {
+    param([object[]]$Changes, [switch]$PassThru)
+    $who = (Get-MgContext).Account
+    $log = New-Object 'System.Collections.Generic.List[object]'
+    $live = @{}
+    $grantsOf = {
+        param([string]$Client)
+        if (-not $live.ContainsKey($Client)) { $live[$Client] = @(Get-GraphAll -Uri ("{0}?`$filter=clientId eq '{1}'" -f $script:GrantBase, $Client)) }
+        $live[$Client]
+    }
+    $passes = @{}
+    $inheritOf = {
+        param([string]$Blueprint)
+        if (-not $passes.ContainsKey($Blueprint)) { $passes[$Blueprint] = @(Get-GraphAll -Uri ('{0}/{1}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions' -f $script:ApplicationBase, $Blueprint)) }
+        $passes[$Blueprint]
+    }
+    $writes = @($Changes | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'grant' -and $_.ClientId -match $script:GuidPattern -and $_.ResourceId -match $script:GuidPattern -and (Test-OneMcpScope $_.Scope) })
+    $inherits = @($Changes | Where-Object { $_.Change -in 'Remove', 'Grant' -and $_.Via -eq 'inheritance' -and $_.BlueprintObjectId -match $script:GuidPattern -and $_.ResourceAppId -match $script:GuidPattern -and (Test-OneMcpScope $_.Scope) })
+    $all = @($writes) + @($inherits)
+    if ($all.Count) { Write-Host ("`nMCP permission changes for {0} agent and server pair(s):" -f @($all | ForEach-Object { "$($_.AgentId)|$($_.Server)" } | Get-Distinct).Count) -ForegroundColor Cyan }
+    foreach ($grp in @($writes | Group-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.Change, $_.ClientId.ToLowerInvariant(), $_.ResourceId.ToLowerInvariant(), $_.ConsentType, $_.PrincipalId })) {
+        $first = $grp.Group[0]
+        $adding = $first.Change -eq 'Grant'
+        $principal = if ($first.ConsentType -eq 'Principal') { [string]$first.PrincipalId } else { '' }
+        $wanted = @($grp.Group | ForEach-Object { [string]$_.Scope } | Get-Distinct)
+        $readError = ''; $current = $null
+        try {
+            $current = @(& $grantsOf $first.ClientId | Where-Object {
+                ([string]$_.resourceId) -eq $first.ResourceId -and [string]$_.consentType -eq $first.ConsentType -and [string]$_.principalId -eq $principal })[0]
+        } catch { $readError = $_.Exception.Message }
+        $before = if ($current) { Edit-McpScope -Scope ([string]$current.scope) } else { '' }
+        $held = @($before.Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+        $todo = @($wanted | Where-Object { ($held -contains $_) -ne $adding })
+        $created = $adding -and -not $current -and -not $readError
+        # A grant made again holds only MCP scopes: those asked for and, on an undo, those it held when it was deleted.
+        $after = if ($created) { Edit-McpScope -Add (@($grp.Group | ForEach-Object { $_.CreateScope }) + $todo) }
+                 elseif ($adding) { Edit-McpScope -Scope $before -Add $todo }
+                 else { Edit-McpScope -Scope $before -Remove $todo }
+        $logged = if ($created) { @($after.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)) } else { $wanted }
+        $recs = foreach ($s in $logged) {
+            $c = @($grp.Group | Where-Object { $_.Scope -eq $s })[0]
+            if (-not $c) { $c = $first }
+            [pscustomobject][ordered]@{
+                Timestamp = (Get-LogTimestamp); Operator = $who; Action = $(if ($adding) { 'grantmcpscope' } else { 'revokemcpscope' }); Agent = $c.Agent; AgentId = $c.AgentId; Server = $c.Server; Lever = $c.Lever
+                GrantId = $(if ($current) { [string]$current.id } else { '' }); ClientId = $first.ClientId; ClientKind = $first.ClientKind; ClientName = $first.ClientName
+                ResourceId = $first.ResourceId; ResourceAppId = $first.ResourceAppId; ResourceName = $first.ResourceName; ConsentType = $first.ConsentType; PrincipalId = $principal
+                Scope = $s; ScopeBefore = $before; ScopeAfter = $before; Created = $false; Deleted = $false; Result = ''; Error = ''
+            }
+        }
+        $label = "{0}: {1}'s grant on {2}" -f ((@($grp.Group | ForEach-Object { $_.Agent }) | Get-Distinct) -join ', '), $first.ClientName, $first.ResourceName
+        $verb = if ($adding) { 'Grant MCP permission {0}{1}' -f ($todo -join ', '), $(if ($created) { ' in a new grant' } else { '' }) }
+                else { 'Remove MCP permission {0}{1}' -f ($todo -join ', '), $(if ($after) { '' } else { ' and delete the grant, which holds nothing else' }) }
+        $result = 'Skipped'; $writeError = ''
+        if ($readError) { $result = 'Failed' }
+        elseif ($todo.Count -and -not (Test-Proceed $label $verb)) { $result = 'WhatIf' }
+        elseif ($todo.Count) {
+            try {
+                if ($created) {
+                    $body = @{ clientId = $first.ClientId; consentType = $first.ConsentType; principalId = $(if ($principal) { $principal } else { $null }); resourceId = $first.ResourceId; scope = $after }
+                    $new = Invoke-Graph -Method POST -Uri $script:GrantBase -Body ($body | ConvertTo-Json) -ContentType 'application/json'
+                    foreach ($r in $recs) { $r.GrantId = [string]$new.id; $r.Created = $true }
+                } elseif (-not $after) {
+                    Invoke-Graph -Method DELETE -Uri ('{0}/{1}' -f $script:GrantBase, [uri]::EscapeDataString([string]$current.id)) | Out-Null
+                    foreach ($r in $recs) { $r.Deleted = $true }
+                } else {
+                    Invoke-Graph -Method PATCH -Uri ('{0}/{1}' -f $script:GrantBase, [uri]::EscapeDataString([string]$current.id)) -Body (@{ scope = $after } | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+                }
+                $result = 'Done'
+            } catch {
+                $writeError = $_.Exception.Message
+                if ($writeError -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $writeError += $script:GrantWriteHint }
+                $result = 'Failed'
+            }
+        }
+        foreach ($r in @($recs)) {
+            $s = $r.Scope
+            $changed = $created -or $todo -contains $s
+            $r.Result = if ($readError) { 'Failed' } elseif (-not $changed) { 'Skipped' } else { $result }
+            if ($r.Result -eq 'Done') { $r.ScopeAfter = $after }
+            $r.Error = switch ($r.Result) { 'Failed' { "$readError$writeError" } 'Skipped' { if ($adding) { 'Already granted.' } else { 'Already removed.' } } default { '' } }
+            $text = switch ($r.Result) {
+                'Done' { if ($adding) { "$s granted to $($r.ClientName)$(if ($r.Created) { ' (new grant)' })" } else { "$s removed from $($r.ClientName)$(if ($r.Deleted) { ' (grant deleted, it held nothing else)' })" } }
+                'WhatIf' { '' }
+                default { $r.Error }
+            }
+            if ($text) {
+                $tag = switch ($r.Result) { 'Done' { 'OK  ' } 'Failed' { 'FAIL' } default { 'SKIP' } }
+                Write-Host ("  {0} {1} -> {2}: {3}" -f $tag, $r.Agent, $r.Server, $text) -ForegroundColor $(switch ($r.Result) { 'Done' { 'Green' } 'Failed' { 'Red' } default { 'DarkGray' } })
+            }
+            $log.Add($r)
+        }
+    }
+    # Group-Object sorts its groups; an undo must run in the order given, latest change first.
+    $byEntry = [ordered]@{}
+    foreach ($c in $inherits) {
+        $k = '{0}|{1}|{2}|{3}|{4}' -f $c.Change, $c.BlueprintObjectId.ToLowerInvariant(), $c.ResourceAppId.ToLowerInvariant(), $c.SetPattern, $c.ExpectPattern
+        if (-not $byEntry.Contains($k)) { $byEntry[$k] = New-Object 'System.Collections.Generic.List[object]' }
+        $byEntry[$k].Add($c)
+    }
+    foreach ($k in @($byEntry.Keys)) {
+        $group = $byEntry[$k].ToArray()
+        $first = $group[0]
+        $adding = $first.Change -eq 'Grant'
+        $wanted = @($group | ForEach-Object { [string]$_.Scope } | Get-Distinct)
+        $readError = ''; $writeError = ''; $skip = ''; $now = $null; $after = $null; $todo = @()
+        try {
+            $now = Get-InheritPattern -Inherit @(& $inheritOf $first.BlueprintObjectId) -ResourceAppId $first.ResourceAppId
+            if ($first.SetPattern) {
+                # An undo puts back exactly what the run found, and only while the inheritance is still what the run left.
+                $after = ConvertFrom-InheritPatternJson $first.SetPattern
+                $todo = $wanted
+                $skip = if (-not $after) { 'What to put back is not an inheritance the tool writes.' }
+                        elseif (Test-InheritPatternSame $now $after) { 'Already as before the run.' }
+                        elseif (-not $now.Present -or -not (Test-InheritPatternSame $now (ConvertFrom-InheritPatternJson $first.ExpectPattern))) { 'The inheritance changed after the run, so it is left as it is.' }
+            } else {
+                $todo = @($wanted | Where-Object { (Test-InheritPasses -Pattern $now -Scope $_) -ne $adding })
+                $held = if (-not $adding -and $now.Kind -eq 'allAllowed' -and $first.ClientId -match $script:GuidPattern) {
+                    @(& $grantsOf $first.ClientId | Where-Object { ([string]$_.resourceId) -eq $first.ResourceId } | ForEach-Object { ([string]$_.scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries) })
+                } else { @() }
+                $after = if ($adding) { Edit-InheritPattern -Pattern $now -Add $todo } else { Edit-InheritPattern -Pattern $now -Remove $todo -Held $held }
+                $skip = if (-not $now.Present) { $(if ($adding) { 'The blueprint passes nothing on for this server; grant it to the agent identity instead.' } else { 'Not passed on.' }) }
+                        elseif ($todo.Count -eq 0) { $(if ($adding) { 'Already passed on.' } else { 'Not passed on.' }) }
+            }
+        } catch { $readError = $_.Exception.Message }
+        $before = if ($now) { ConvertTo-InheritPatternJson $now } else { '' }
+        $recs = foreach ($s in $wanted) {
+            $c = @($group | Where-Object { $_.Scope -eq $s })[0]
+            [pscustomobject][ordered]@{
+                Timestamp = (Get-LogTimestamp); Operator = $who; Action = $(if ($adding) { 'grantmcpinherit' } else { 'revokemcpinherit' }); Agent = $c.Agent; AgentId = $c.AgentId; Server = $c.Server; Lever = $c.Lever
+                BlueprintAppId = $first.BlueprintAppId; BlueprintObjectId = $first.BlueprintObjectId; BlueprintName = $first.ClientName; ResourceAppId = $first.ResourceAppId; ResourceName = $first.ResourceName
+                Scope = $s; PatternBefore = $before; PatternAfter = $before; Result = ''; Error = ''
+            }
+        }
+        $label = "{0}: {1}'s inheritance for {2}" -f ((@($group | ForEach-Object { $_.Agent }) | Get-Distinct) -join ', '), $first.ClientName, $first.ResourceName
+        $verb = if ($first.SetPattern) { 'Restore what the blueprint passed on before' } elseif ($adding) { 'Pass on MCP permission {0} again' -f ($todo -join ', ') } else { 'Stop passing on MCP permission {0}' -f ($todo -join ', ') }
+        $result = if ($readError) { 'Failed' } elseif ($skip) { 'Skipped' } elseif (-not (Test-Proceed $label $verb)) { 'WhatIf' } else { '' }
+        if (-not $result) {
+            try {
+                Invoke-Graph -Method PATCH -Uri ('{0}/{1}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions/{2}' -f $script:ApplicationBase, $first.BlueprintObjectId, $first.ResourceAppId) `
+                    -Body (New-InheritPatternBody $after) -ContentType 'application/json' | Out-Null
+                [void]$passes.Remove($first.BlueprintObjectId)
+                $result = 'Done'
+            } catch {
+                $writeError = $_.Exception.Message
+                if ($writeError -match 'Forbidden|Authorization|Unauthorized|403|Insufficient') { $writeError += $script:InheritWriteHint }
+                $result = 'Failed'
+            }
+        }
+        foreach ($r in @($recs)) {
+            $s = $r.Scope
+            $r.Result = if ($result -in 'Done', 'WhatIf' -and $todo -notcontains $s) { 'Skipped' } else { $result }
+            if ($r.Result -eq 'Done') { $r.PatternAfter = ConvertTo-InheritPatternJson $after }
+            $r.Error = switch ($r.Result) { 'Failed' { "$readError$writeError" } 'Skipped' { if ($skip) { $skip } elseif ($adding) { 'Already passed on.' } else { 'Not passed on.' } } default { '' } }
+            $text = switch ($r.Result) {
+                'Done' { if ($first.SetPattern) { "$s restored: $($first.ClientName) passes on what it did before" } elseif ($adding) { "$s passed on by $($first.ClientName) again" } else { "$s no longer passed on by $($first.ClientName)" } }
+                'WhatIf' { '' }
+                default { $r.Error }
+            }
+            if ($text) {
+                $tag = switch ($r.Result) { 'Done' { 'OK  ' } 'Failed' { 'FAIL' } default { 'SKIP' } }
+                Write-Host ("  {0} {1} -> {2}: {3}" -f $tag, $r.Agent, $r.Server, $text) -ForegroundColor $(switch ($r.Result) { 'Done' { 'Green' } 'Failed' { 'Red' } default { 'DarkGray' } })
+            }
+            $log.Add($r)
+        }
+    }
+    if ($all.Count) {
+        Write-Host ("Done: {0} scope(s) changed, {1} skipped, {2} failed." -f @($log | Where-Object Result -eq 'Done').Count, @($log | Where-Object Result -eq 'Skipped').Count, @($log | Where-Object Result -eq 'Failed').Count) -ForegroundColor Cyan
+        if (@($log | Where-Object Result -eq 'Done').Count) { Write-Host 'Entra applies a changed permission at the agent''s next token request; a token already issued keeps its permissions for up to an hour.' -ForegroundColor Yellow }
+    }
+    Export-ActionLog -Records $log.ToArray()
+    $blocks = @($Changes | Where-Object { $_.Change -eq 'Block' } | ForEach-Object { $_.BlockItems })
+    $blockLog = if ($blocks.Count) { @(Invoke-McpBlockChange -Items $blocks -PassThru) } else { @() }
+    if ($PassThru) { @($log.ToArray()) + $blockLog }
+}
+
+# Undo changes from a log of MCP permission changes: a removed scope is added back to its grant (a deleted grant is created again
+# with the scopes it held), and an added scope is removed again (with its grant when nothing else is left in it). A changed
+# inheritance is set back to exactly what it was, latest change first.
+function ConvertTo-McpPermissionUndoChanges {
+    param([object[]]$Records)
+    $done = @($Records | Where-Object { $_.Result -eq 'Done' })
+    [array]::Reverse($done)
+    foreach ($r in @($done | Where-Object { $_.Action -in 'revokemcpinherit', 'grantmcpinherit' })) {
+        $target = [pscustomobject]@{ AppId = [string]$r.BlueprintAppId; ObjectId = ([string]$r.BlueprintObjectId).ToLowerInvariant(); PrincipalId = ''; ResourceId = ''; ResourceAppId = ([string]$r.ResourceAppId).ToLowerInvariant()
+                                     ResourceName = [string]$r.ResourceName; Pattern = (ConvertFrom-InheritPatternJson ([string]$r.PatternAfter)); Held = '' }
+        if (-not $target.Pattern) { continue }
+        $c = New-McpChange -Row ([pscustomobject]@{ Agent = $r.Agent; AgentId = $r.AgentId; Server = $r.Server; ServerKey = '' }) -Change $(if ($r.Action -eq 'revokemcpinherit') { 'Grant' } else { 'Remove' }) -Lever 'Undo' `
+                 -Inherit $target -Scope ([string]$r.Scope) -ClientKind blueprint -ClientName ([string]$r.BlueprintName)
+        $c.SetPattern = [string]$r.PatternBefore; $c.ExpectPattern = [string]$r.PatternAfter; $c.PatternAfter = [string]$r.PatternBefore
+        $c
+    }
+    @($done | Where-Object { $_.Action -in 'revokemcpscope', 'grantmcpscope' } | ForEach-Object {
+        $restore = $_.Action -eq 'revokemcpscope'
+        $grant = [pscustomobject]@{ Id = [string]$_.GrantId; ClientId = ([string]$_.ClientId).ToLowerInvariant(); ResourceId = ([string]$_.ResourceId).ToLowerInvariant(); ResourceAppId = [string]$_.ResourceAppId
+                                    ResourceName = [string]$_.ResourceName; Consent = [string]$_.ConsentType; PrincipalId = [string]$_.PrincipalId; Scope = [string]$_.ScopeAfter }
+        $c = New-McpChange -Row ([pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; Server = $_.Server; ServerKey = '' }) -Change $(if ($restore) { 'Grant' } else { 'Remove' }) -Lever 'Undo' `
+                 -Grant $grant -Scope ([string]$_.Scope) -ClientKind ([string]$_.ClientKind) -ClientName ([string]$_.ClientName)
+        $c.ScopeAfter = [string]$_.ScopeBefore
+        if ($restore -and [string]$_.Deleted -eq 'True') { $c.CreateScope = [string]$_.ScopeBefore }
+        $c
+    })
+}
+
+# The undo changes Entra confirms: the client is an agent identity or blueprint principal of the kind logged, the resource is the
+# MCP server logged and publishes the scope, a one-user grant names an agent user, and the scopes logged before and after hold
+# nothing but MCP scopes and what the grant holds now. A log edited to reach another permission or another principal is refused.
+function Select-McpPermissionUndoChanges {
+    param([object[]]$Changes)
+    Select-McpInheritUndoChanges @($Changes | Where-Object { $_ -and $_.Via -eq 'inheritance' })
+    $items = @($Changes | Where-Object { $_ -and $_.Via -eq 'grant' -and $_.ClientId -match $script:GuidPattern -and $_.ResourceId -match $script:GuidPattern })
+    if ($items.Count -eq 0) { return }
+    $clients = Invoke-GraphBatch -Version beta -Requests @($items | ForEach-Object { $_.ClientId } | Get-Distinct | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_`?`$select=id" } }) -Activity 'Checking the agents in the log'
+    $resources = Invoke-GraphBatch -Requests @($items | ForEach-Object { $_.ResourceId } | Get-Distinct | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_`?`$select=id,appId,oauth2PermissionScopes" } }) -Activity 'Checking the MCP servers in the log'
+    $agentUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if (@($items | Where-Object { $_.ConsentType -eq 'Principal' }).Count) { foreach ($list in @((Get-AgentUserIdsByIdentity).Values)) { foreach ($u in @($list)) { [void]$agentUsers.Add([string]$u) } } }
+    $live = @{}
+    foreach ($it in $items) {
+        $c = $clients[$it.ClientId]; $r = $resources[$it.ResourceId]
+        $type = if ($c -and $c.Status -eq 200) { [string]$c.Body.'@odata.type' } else { '' }
+        $sp = if ($r -and $r.Status -eq 200) { $r.Body } else { $null }
+        $published = @($sp.oauth2PermissionScopes | ForEach-Object { [string]$_.value })
+        $tools = [string]$sp.appId -eq $script:AgentToolsAppId
+        $why = if ($type -notmatch $(if ($it.ClientKind -eq 'blueprint') { 'agentIdentityBlueprintPrincipal$' } else { '\.agentIdentity$' })) { 'the client is not the agent identity or blueprint logged' }
+               elseif (-not $sp -or [string]$sp.appId -ne $it.ResourceAppId) { 'the resource is not the application logged' }
+               elseif (-not ($tools -or $published -contains 'Tools.ListInvoke.All')) { 'the resource is not an MCP server' }
+               elseif (-not (Test-OneMcpScope $it.Scope) -or $published -notcontains $it.Scope) { 'the server does not publish that scope' }
+               elseif ($it.ConsentType -eq 'Principal' -and -not $agentUsers.Contains([string]$it.PrincipalId)) { 'the user of the grant is not an agent user' }
+        if (-not $why) {
+            if (-not $live.ContainsKey($it.ClientId)) { $live[$it.ClientId] = @(Get-GraphAll -Uri ("{0}?`$filter=clientId eq '{1}'" -f $script:GrantBase, $it.ClientId)) }
+            $now = @($live[$it.ClientId] | Where-Object { ([string]$_.resourceId) -eq $it.ResourceId -and [string]$_.consentType -eq $it.ConsentType -and [string]$_.principalId -eq [string]$it.PrincipalId })[0]
+            $held = @(([string]$now.scope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+            $extra = @(@($it.ScopeBefore, $it.ScopeAfter, $it.CreateScope) -join ' ' -split ' ' | Where-Object { $_ -and @(Get-McpScopes $_).Count -eq 0 -and $held -notcontains $_ })
+            if ($extra.Count) { $why = "the scopes logged hold $($extra -join ', '), which is neither an MCP scope nor in the grant now" }
+            elseif (@(([string]$it.CreateScope).Split(' ', [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { $published -notcontains $_ }).Count) { $why = 'the grant to create holds a scope the server does not publish' }
+        }
+        if ($why) { Write-Warning ("Undo leaves out {0} / {1} ({2}): {3}." -f $it.Agent, $it.Server, $it.Scope, $why); continue }
+        $it
+    }
+}
+
+# The inheritance undo changes Entra confirms: the application is the agent identity blueprint logged, and the resource is an MCP
+# server that publishes the scope and every scope both logged inheritances name.
+function Select-McpInheritUndoChanges {
+    param([object[]]$Changes)
+    $items = @($Changes | Where-Object { $_ -and $_.BlueprintObjectId -match $script:GuidPattern -and $_.ResourceAppId -match $script:GuidPattern })
+    if ($items.Count -eq 0) { return }
+    $apps = Invoke-GraphBatch -Requests @($items | ForEach-Object { $_.BlueprintObjectId } | Get-Distinct | ForEach-Object { @{ id = $_; method = 'GET'; url = "/applications/$_`?`$select=id,appId" } }) -Activity 'Checking the blueprints in the log'
+    $sps = Get-ServicePrincipalsByAppId -AppIds @($items | ForEach-Object { $_.ResourceAppId } | Get-Distinct) -Select 'appId,oauth2PermissionScopes' -Activity 'Checking the MCP servers in the log'
+    foreach ($it in $items) {
+        $a = $apps[$it.BlueprintObjectId]
+        $app = if ($a -and $a.Status -eq 200) { $a.Body } else { $null }
+        $sp = $sps[$it.ResourceAppId]
+        $published = @($sp.oauth2PermissionScopes | ForEach-Object { [string]$_.value })
+        $named = @(@((ConvertFrom-InheritPatternJson $it.SetPattern).Scopes) + @((ConvertFrom-InheritPatternJson $it.ExpectPattern).Scopes) | Where-Object { $_ })
+        $why = if (-not $app -or [string]$app.'@odata.type' -notmatch 'agentIdentityBlueprint$' -or [string]$app.appId -ne $it.BlueprintAppId) { 'the application is not the agent identity blueprint logged' }
+               elseif (-not $sp -or -not ([string]$sp.appId -eq $script:AgentToolsAppId -or $published -contains 'Tools.ListInvoke.All')) { 'the resource is not an MCP server' }
+               elseif (-not (Test-OneMcpScope $it.Scope) -or $published -notcontains $it.Scope) { 'the server does not publish that scope' }
+               elseif (@($named | Where-Object { $published -notcontains $_ }).Count) { 'an inheritance logged names a scope the server does not publish' }
+        if ($why) { Write-Warning ("Undo leaves out {0} / {1} ({2}): {3}." -f $it.Agent, $it.Server, $it.Scope, $why); continue }
+        $it
+    }
+}
+
+# Print a plan by agent: one line per server and scope with the lever and what happens to the grant, then each reason once, then
+# the notes. Fixed widths keep every column on a 120-column terminal.
+function Show-McpPermissionPlan {
+    param([object[]]$Plan)
+    foreach ($grp in @($Plan | Group-Object Agent)) {
+        Write-Host ("`n{0}" -f $grp.Name) -ForegroundColor Cyan
+        $grp.Group | Format-Table -Wrap @{ n = 'server'; e = { $_.Server }; Width = 26 }, @{ n = 'scope'; e = { $_.Scope }; Width = 30 },
+            @{ n = 'how'; e = { if ($_.ClientName) { '{0} ({1})' -f $_.Lever, $_.ClientName } else { $_.Lever } }; Width = 30 }, @{ n = 'result'; e = { $_.Effect }; Width = 30 } | Out-Host
+        foreach ($w in @($grp.Group | ForEach-Object { $_.Why } | Get-Distinct)) { Write-Host "  $w" -ForegroundColor DarkGray }
+    }
+    foreach ($n in @(Get-McpPlanNotes $Plan)) { Write-Host $n -ForegroundColor Yellow }
+}
+
+# -BlockMcp and -UnblockMcp with -Via Permission: plan, show the plan, ask once, then change the grants, and block with Conditional
+# Access where the plan falls back to it. AllowOnly is -BlockMcp All: every server the agent holds goes, except those in Except.
+function Invoke-McpPermissionRun {
+    param([object]$Report, [object[]]$Catalog, [object[]]$Targets, [string[]]$Servers, [string[]]$Except, [switch]$Grant, [switch]$AllowOnly,
+          [switch]$GrantMissing, [switch]$IncludeSharedBlueprint, [switch]$FromBlueprintGrant, [ValidateSet('On', 'Report-only')][string]$BlockMode = 'On')
+    $context = Get-McpPermissionContext -Report $Report -Catalog $Catalog -AgentIds @($Targets | ForEach-Object { [string]$_.id })
+    $remove = @(); $add = @()
+    $allow = @($Except | Where-Object { $_ } | ForEach-Object { ConvertTo-McpRequestKey $_ })
+    if ($AllowOnly) {
+        foreach ($t in @($Targets)) { $sel = Select-McpAllowOnlyRows -Report $Report -Package $t -AllowKeys $allow -GrantMissing:$GrantMissing; $remove += $sel.Remove; $add += $sel.Grant }
+    } else {
+        $rows = @(Resolve-McpBlockRows -Report $Report -Packages $Targets -Servers $Servers)
+        if ($Grant) { $add = $rows } else { $remove = $rows }
+    }
+    $plan = @(New-McpPermissionPlan -Context $context -RemoveRows $remove -GrantRows $add -IncludeSharedBlueprint:$IncludeSharedBlueprint -KeepShared:($allow -contains 'agenttools') `
+                  -FromBlueprintGrant:$FromBlueprintGrant -BlockMode $BlockMode)
+    if ($plan.Count -eq 0) { Write-Host $(if ($AllowOnly) { 'Nothing to change: those agents hold no MCP permission outside the allowed servers.' } else { 'Nothing matches those agents and servers.' }) -ForegroundColor Yellow; return }
+    Show-McpPermissionPlan -Plan $plan
+    $ready = @($plan | Where-Object { $_.Change -ne 'None' })
+    if ($ready.Count -eq 0) { Write-Host 'Nothing can be changed; the reasons are above.' -ForegroundColor Yellow; return }
+    if (@($plan | Where-Object { $_.Shared -and $_.Change -in 'Block', 'None' }).Count) { Write-Host 'Add -IncludeSharedBlueprint to remove the permission from a shared blueprint''s grant instead, which takes it away from every agent named.' -ForegroundColor DarkGray }
+    if (-not (Confirm-Batch -Count $ready.Count -Action $(if ($Grant) { 'grant MCP access for' } else { 'make the MCP permission changes for' }))) { Write-Host 'Cancelled.'; return }
+    if (-not $WhatIfPreference) { foreach ($s in @(Get-McpPlanScopes $ready)) { if (-not (Test-GraphScope $s)) { Write-Host "Asking for $s..." -ForegroundColor DarkGray; Request-GraphScope $s } } }
+    Invoke-McpPermissionChange -Changes $ready -PassThru
+}
+
+# ---------------------------------------------------------------------------------------------
 # Revoke sessions: end the sessions of agents' user accounts. Entra invalidates their refresh tokens and tells the resources that
 # support continuous access evaluation (Exchange, SharePoint, Teams, Microsoft Graph) to refuse the access tokens already issued,
 # so a block or a Conditional Access change applies at once instead of when those tokens expire. Other resources accept an access
@@ -3628,11 +4390,14 @@ function Invoke-AgentSessionRevoke {
 }
 
 # Revoke straight after a containment action. The revocation gets a log of its own beside -OutFile (name-revoke.csv), because
-# -Undo needs the log of the action intact. Records are the action's log: block, confirm compromised (by package id) or MCP block.
+# -Undo needs the log of the action intact. Records are the action's log: block, confirm compromised (by package id), MCP block or
+# a removed MCP permission (by agent id).
 function Invoke-SessionRevokeAfter {
     param([object[]]$Records, [object[]]$Packages)
     $mcp = @(ConvertTo-McpRevokeTargets $Records)
-    $ids = @($Records | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'confirmcompromised' } | ForEach-Object { [string]$_.Id } | Get-Distinct)
+    $blocked = @($mcp | ForEach-Object { [string]$_.AgentId })
+    $ids = @($Records | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'block', 'confirmcompromised', 'revokemcpscope' } |
+             ForEach-Object { if ($_.Action -eq 'revokemcpscope') { [string]$_.AgentId } else { [string]$_.Id } } | Get-Distinct | Where-Object { $blocked -notcontains $_ })
     $targets = @($mcp) + @(if ($ids.Count) { Get-AgentSessionTargets -Packages @($Packages | Where-Object { $ids -contains [string]$_.id }) })
     if ($targets.Count -eq 0) { Write-Host 'Nothing was changed, so no session was revoked.' -ForegroundColor DarkGray; return }
     $keep = $script:OutFile
@@ -5009,6 +5774,8 @@ function Get-UndoRowProblem {
         { $_ -in 'addsponsor', 'addowner' } { 'IdentityId', 'UserId' }
         'confirmcompromised' { 'IdentityId' }
         { $_ -in 'blockmcp', 'unblockmcp' } { 'IdentityId', 'ResourceAppId' }
+        { $_ -in 'revokemcpscope', 'grantmcpscope' } { 'ClientId', 'ResourceId', 'ResourceAppId' }
+        { $_ -in 'revokemcpinherit', 'grantmcpinherit' } { 'BlueprintAppId', 'BlueprintObjectId', 'ResourceAppId' }
     }
     foreach ($f in @($ids)) { if ([string]$Row.$f -notmatch $script:GuidPattern) { return "$f is not an Entra id" } }
     if ($action -in 'confirmcompromised', 'addsponsor', 'addowner' -and [string]$Row.IdentityId -ne [string]$pkg.agentIdentityId) { return "the identity is not this agent's" }
@@ -5022,13 +5789,31 @@ function Get-UndoRowProblem {
         if (@(([string]$Row.AgentUserIds).Split(';', [StringSplitOptions]::RemoveEmptyEntries) | Where-Object { $_ -notmatch $script:GuidPattern }).Count) { return 'AgentUserIds holds something other than Entra ids' }
         if ([string]$Row.WasMode -notin '', 'On', 'Report-only') { return 'WasMode is not a block mode' }
     }
+    if ($action -in 'revokemcpscope', 'grantmcpscope') {
+        if (-not (Test-OneMcpScope ([string]$Row.Scope))) { return 'Scope is not exactly one MCP scope' }
+        if ([string]$Row.ConsentType -notin 'AllPrincipals', 'Principal') { return 'ConsentType is not one Entra uses' }
+        if ([string]$Row.ConsentType -eq 'Principal' -and [string]$Row.PrincipalId -notmatch $script:GuidPattern) { return 'PrincipalId is not an Entra id' }
+        if ([string]$Row.ConsentType -eq 'AllPrincipals' -and [string]$Row.PrincipalId) { return 'a grant for every user names a principal' }
+        if ([string]$Row.GrantId -and [string]$Row.GrantId -notmatch $script:GrantIdPattern) { return 'GrantId is not a grant id' }
+        if ([string]$Row.ClientKind -notin 'identity', 'blueprint') { return 'ClientKind is not an agent identity or blueprint' }
+        if ([string]$Row.Created -notin 'True', 'False' -or [string]$Row.Deleted -notin 'True', 'False') { return 'Created or Deleted is not true or false' }
+        # A deleted grant is created again from ScopeBefore, so it may hold MCP scopes only.
+        $before = @(([string]$Row.ScopeBefore).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
+        if ($action -eq 'revokemcpscope' -and [string]$Row.Deleted -eq 'True' -and @(Get-McpScopes ([string]$Row.ScopeBefore)).Count -ne $before.Count) { return 'ScopeBefore holds a permission that is not an MCP scope' }
+    }
+    if ($action -in 'revokemcpinherit', 'grantmcpinherit') {
+        if (-not (Test-OneMcpScope ([string]$Row.Scope))) { return 'Scope is not exactly one MCP scope' }
+        $before = ConvertFrom-InheritPatternJson ([string]$Row.PatternBefore); $after = ConvertFrom-InheritPatternJson ([string]$Row.PatternAfter)
+        if (-not $before -or -not $after) { return 'PatternBefore or PatternAfter is not an inheritance the tool writes' }
+        if (-not (Test-InheritChangeShape -Before $before -After $after -Scope ([string]$Row.Scope) -Removed:($action -eq 'revokemcpinherit'))) { return 'PatternBefore and PatternAfter differ by more than that MCP scope' }
+    }
     if ($action -eq 'blocklocalagent' -and [string]$Row.RuleId -notlike "$script:BlockRulePrefix*") { return 'the rule was not made by this tool' }
 }
 
 # The undoable rows of a log that pass Get-UndoRowProblem, named from the catalog rather than from the file.
 function Select-UndoRows {
     param([object[]]$Rows, [hashtable]$PackageById)
-    $undoable = 'block', 'unblock', 'reassign', 'restrict', 'addsponsor', 'addowner', 'confirmcompromised', 'blocklocalagent', 'blockmcp', 'unblockmcp'
+    $undoable = 'block', 'unblock', 'reassign', 'restrict', 'addsponsor', 'addowner', 'confirmcompromised', 'blocklocalagent', 'blockmcp', 'unblockmcp', 'revokemcpscope', 'grantmcpscope', 'revokemcpinherit', 'grantmcpinherit'
     foreach ($r in @($Rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in $undoable })) {
         $problem = Get-UndoRowProblem -Row $r -PackageById $PackageById
         if ($problem) {
@@ -5044,7 +5829,8 @@ function Select-UndoRows {
 # an MCP server. A log edited to name people or other applications is refused.
 function Select-McpUndoItems {
     param([object[]]$Items)
-    $items = @($Items)
+    # A log with no MCP rows passes $null, which @() would turn into one empty item.
+    $items = @($Items | Where-Object { $_ })
     if ($items.Count -eq 0) { return }
     $subjects = @($items | ForEach-Object { [string]$_.IdentityId } | Get-Distinct)
     $res = Invoke-GraphBatch -Version beta -Requests @($subjects | ForEach-Object { @{ id = $_; method = 'GET'; url = "/servicePrincipals/$_`?`$select=id" } }) -Activity 'Checking the agents in the log'
@@ -6339,7 +7125,10 @@ function Request-GraphScope {
     $connect = @{ Scopes = @(@($context.Scopes) + $Scope | Select-Object -Unique); NoWelcome = $true }
     if ($context.TenantId) { $connect['TenantId'] = $context.TenantId }
     if ($script:ClientId) { $connect['ClientId'] = $script:ClientId }
-    Connect-GraphSession -Connect $connect
+    try { Connect-GraphSession -Connect $connect }
+    catch {
+        throw ('{0} If no consent page appeared, {1} needs an administrator''s consent: a Global Administrator or Privileged Role Administrator can grant it to the Microsoft Graph Command Line Tools app, or to your own app registration used with -ClientId.' -f $_.Exception.Message, $Scope)
+    }
 }
 
 # The callback a long read reports through: it shows the message, if any, in the note and lets the window repaint. A closure
@@ -7195,7 +7984,9 @@ $McpAccessXaml = @'
         <Button x:Name="BtnMcBlock" Content="Block..." DockPanel.Dock="Right" Style="{DynamicResource BtnDanger}" MinWidth="110" Margin="10,0,0,0" IsEnabled="False" ToolTip="Block the selected agents from the selected MCP servers with a Conditional Access policy for each server."/>
         <Button x:Name="BtnMcReport" Content="Block in report-only..." DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Set the same block in report-only mode: nothing is blocked, and Entra's sign-in logs record what would have been."/>
         <Button x:Name="BtnMcUnblock" Content="Remove block" DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Take the selected agents out of the block policies this tool made for those servers."/>
-        <TextBlock TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#6B7280" Text="The Agent 365 Tools registry and its Block for every agent have no public API, so registry status is not shown. A block here is a Conditional Access policy for the chosen agents and that server only. It applies when an agent asks for a token, and does not cover an agent acting on behalf of a signed-in person, or Copilot Studio agents, which reach MCP servers through Power Platform connectors."/>
+        <Button x:Name="BtnMcRemovePerm" Content="Remove permission..." DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Remove the selected agents' Entra permission for the selected servers, through the narrowest grant that reaches each agent."/>
+        <Button x:Name="BtnMcSetServers" Content="Set servers..." DockPanel.Dock="Right" Style="{DynamicResource Btn}" Margin="10,0,0,0" IsEnabled="False" ToolTip="Choose which MCP servers the agent of the highlighted row may use: grant the ones it lacks and remove the others."/>
+        <TextBlock TextWrapping="Wrap" VerticalAlignment="Center" Foreground="#6B7280" Text="Registry status has no public API. A block is a Conditional Access policy for the chosen agents and server; it does not cover an agent acting for a signed-in person, or Copilot Studio agents (Power Platform connectors). Remove permission and Set servers change the agents' Entra grants."/>
       </DockPanel>
     </Border>
   </Grid>
@@ -7234,7 +8025,7 @@ function Update-McpAccessWindow {
         $days, $scope, $s.Servers, $s.Agents, $s.Granted, $s.GrantedUsed, $s.Unused, $s.Calls, $s.Blocked, $s.ReportOnly,
         $(if ($s.Others) { " $($s.Others) blueprint(s) or application(s) that are not catalog agents also hold MCP permissions." } else { '' }),
         $(if ($s.Connectors) { " $($s.Connectors) agent(s) reach MCP servers through Power Platform connectors." } else { '' }))
-    $note.Text = if ($shown.Count) { "{0} row(s). Select one or more to block or unblock; the pane below explains the highlighted one." -f $shown.Count } else { 'Nothing to show for this period and filter.' }
+    $note.Text = if ($shown.Count) { "{0} row(s). Select one or more to block, unblock or remove a permission; Set servers works on the highlighted agent, and the pane below explains it." -f $shown.Count } else { 'Nothing to show for this period and filter.' }
     if ($shown.Count) { $grid.SelectedIndex = 0 }
     $detail.ItemsSource = @(if ($grid.SelectedItem) { Get-McpAccessDetailRows $grid.SelectedItem })
     Update-McpButtons -Window $Window
@@ -7251,6 +8042,9 @@ function Update-McpButtons {
     $unblock.IsEnabled = @($ok | Where-Object { $_.Block }).Count -gt 0
     $why = @($sel | Where-Object { $_.CanBlock })
     $block.ToolTip = if ($sel.Count -and -not $ok.Count -and $why.Count) { "Cannot be blocked: $($why[0].CanBlock)" } else { 'Block the selected agents from the selected MCP servers with a Conditional Access policy for each server.' }
+    $Window.FindName('BtnMcRemovePerm').IsEnabled = @($sel | Where-Object { $_.Kind -eq 'Agent' -and $_.Granted }).Count -gt 0
+    $cur = $Window.FindName('McGrid').SelectedItem
+    $Window.FindName('BtnMcSetServers').IsEnabled = [bool]($cur -and $cur.Kind -eq 'Agent' -and $cur.AgentId)
 }
 
 # Block the selected rows, in either mode, or remove their block. Asks first, naming every agent and server.
@@ -7323,6 +8117,209 @@ function Invoke-McpWindowRevoke {
     if ($failed.Count) { [void][Windows.MessageBox]::Show("$($failed.Count) account(s) could not be revoked:`n`n$(Get-FailureSummary $failed)", 'Revoke sessions', 'OK', 'Warning') }
 }
 
+$McpServersXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Set MCP servers" Width="660" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <StackPanel Margin="28,24,28,22">
+    <TextBlock x:Name="Heading" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937" TextWrapping="Wrap"/>
+    <TextBlock Foreground="#4B5563" Margin="0,4,0,12" TextWrapping="Wrap" Text="Tick the MCP servers this agent may use. A ticked server it lacks is granted, and a server it holds that you untick is removed. The next step shows how each change is made, before anything changes."/>
+    <Grid Margin="10,0,10,4">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="60"/><ColumnDefinition Width="100"/></Grid.ColumnDefinitions>
+      <TextBlock Text="MCP server" Foreground="#6B7280" FontSize="12"/>
+      <TextBlock Grid.Column="1" Text="Permission now" Foreground="#6B7280" FontSize="12"/>
+      <TextBlock Grid.Column="2" Text="Set up" Foreground="#6B7280" FontSize="12"/>
+      <TextBlock Grid.Column="3" Text="Calls (30 days)" Foreground="#6B7280" FontSize="12"/>
+    </Grid>
+    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8" Background="#F9FAFB">
+      <ScrollViewer MaxHeight="340" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="Servers" Margin="10,6"/></ScrollViewer>
+    </Border>
+    <TextBlock x:Name="Note" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" MinWidth="100" Margin="0,0,10,0"/>
+      <Button x:Name="BtnOk" Content="Review changes..." Style="{DynamicResource BtnAccent}" MinWidth="150"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+
+# Build the server list for one agent: a check box per server, ticked where the agent holds a permission, with what it holds, whether
+# it sets the server up and its calls. A server with no application of its own can be removed but not granted.
+function New-McpServerDialog {
+    param([string]$Agent, [object[]]$Entries, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($McpServersXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $d.FindName('Heading').Text = "MCP servers for $Agent"
+    $list = $d.FindName('Servers')
+    $widths = @([Windows.GridLength]::new(1, [Windows.GridUnitType]::Star), [Windows.GridLength]::new(130), [Windows.GridLength]::new(60), [Windows.GridLength]::new(100))
+    foreach ($e in @($Entries)) {
+        $g = New-Object Windows.Controls.Grid
+        $g.Margin = '0,3'
+        foreach ($w in $widths) { $c = New-Object Windows.Controls.ColumnDefinition; $c.Width = $w; $g.ColumnDefinitions.Add($c) }
+        $box = New-Object Windows.Controls.CheckBox
+        $box.Content = $e.Server; $box.Tag = $e.Key; $box.IsChecked = $e.Held; $box.IsEnabled = $e.Held -or $e.Grantable
+        [void]$g.Children.Add($box)
+        $cells = @($e.Permission, $(if ($e.Declared) { 'Yes' } else { '' }), [string]$e.Calls)
+        for ($i = 0; $i -lt $cells.Count; $i++) {
+            $t = New-Object Windows.Controls.TextBlock
+            $t.Text = $cells[$i]; $t.Foreground = '#4B5563'
+            [Windows.Controls.Grid]::SetColumn($t, $i + 1)
+            [void]$g.Children.Add($t)
+        }
+        [void]$list.Children.Add($g)
+    }
+    if (@($Entries | Where-Object { -not $_.Held -and -not $_.Grantable }).Count) { $d.FindName('Note').Text = 'A greyed-out server has no application of its own in this tenant, so it cannot be granted.' }
+    $script:mcpServerDialog = @{ Window = $d; List = $list }
+    $d.FindName('BtnOk').Add_Click({ $script:mcpServerDialog.Window.DialogResult = $true })
+    $d
+}
+
+# Ask which servers the agent may use. Returns { Servers = the ticked server keys }, or $null when cancelled.
+function Read-McpServerChoice {
+    param([string]$Agent, [object[]]$Entries, [System.Windows.Window]$Owner)
+    $d = New-McpServerDialog -Agent $Agent -Entries $Entries -Owner $Owner
+    if (-not $d.ShowDialog()) { return $null }
+    [pscustomobject]@{ Servers = @($script:mcpServerDialog.List.Children | ForEach-Object { $_.Children } | Where-Object { $_ -is [Windows.Controls.CheckBox] -and $_.IsChecked } | ForEach-Object { [string]$_.Tag }) }
+}
+
+$McpPlanXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Confirm the action" Width="1160" SizeToContent="Height" ResizeMode="NoResize" ShowInTaskbar="False"
+        WindowStartupLocation="CenterOwner" Background="White" FontFamily="Segoe UI" FontSize="13" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="Wrap" TargetType="TextBlock"><Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Padding" Value="0,5"/></Style>
+  </Window.Resources>
+  <StackPanel Margin="28,24,28,22">
+    <TextBlock Text="Confirm the MCP permission changes" FontSize="18" FontWeight="SemiBold" Foreground="#1F2937"/>
+    <TextBlock x:Name="Message" Foreground="#4B5563" Margin="0,4,0,12" TextWrapping="Wrap"/>
+    <Border BorderBrush="#E5E7EB" BorderThickness="1" CornerRadius="8">
+      <DataGrid x:Name="Plan" MaxHeight="330" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column" GridLinesVisibility="Horizontal"
+                HorizontalGridLinesBrush="#F0F1F3" BorderThickness="0" Background="White" RowHeaderWidth="0" CanUserAddRows="False">
+        <DataGrid.Columns>
+          <DataGridTextColumn Header="Agent" Binding="{Binding Agent}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="MCP server" Binding="{Binding Server}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Change" Binding="{Binding Change}" Width="70" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="How" Binding="{Binding Lever}" Width="1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Holder" Binding="{Binding ClientName}" Width="1.1*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Scope" Binding="{Binding Scope}" Width="1.2*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Result" Binding="{Binding Effect}" Width="1.3*" ElementStyle="{StaticResource Wrap}"/>
+          <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2.4*" ElementStyle="{StaticResource Wrap}"/>
+        </DataGrid.Columns>
+      </DataGrid>
+    </Border>
+    <CheckBox x:Name="Shared" Margin="0,12,0,0" Visibility="Collapsed"><TextBlock x:Name="SharedText" TextWrapping="Wrap"/></CheckBox>
+    <CheckBox x:Name="FromGrant" Margin="0,8,0,0" Visibility="Collapsed">
+      <TextBlock TextWrapping="Wrap" Text="Take it out of the blueprint's own grant instead of what the blueprint passes on. A grant needs the Cloud Application Administrator or Application Administrator role; what a blueprint passes on needs Agent ID Administrator."/>
+    </CheckBox>
+    <TextBlock x:Name="Notes" Foreground="#6B7280" FontSize="12" Margin="0,10,0,0" TextWrapping="Wrap"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+      <Button x:Name="BtnCancel" Content="Cancel" Style="{DynamicResource Btn}" IsCancel="True" IsDefault="True" MinWidth="100" Margin="0,0,10,0"/>
+      <Button x:Name="BtnOk" Style="{DynamicResource BtnDanger}" MinWidth="150"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+
+# Build the one confirmation before an MCP permission change: per agent and server, the lever that will be used and what happens to
+# the grant or the blueprint's inheritance. When a blueprint is shared, a check box names the other agents and plans again with
+# their blueprint; another plans with the blueprint's grant in place of its inheritance.
+function New-McpPlanDialog {
+    param([object]$Context, [object[]]$RemoveRows, [object[]]$GrantRows, [System.Windows.Window]$Owner)
+    $d = [Windows.Markup.XamlReader]::Parse($McpPlanXaml)
+    if ($Owner) { $d.Owner = $Owner; $d.Resources.MergedDictionaries.Add($Owner.Resources) }
+    $script:mcpPlanDialog = @{ Window = $d; Context = $Context; Remove = @($RemoveRows); Grant = @($GrantRows); Plan = @() }
+    $script:mcpPlanDialog.Refresh = {
+        $s = $script:mcpPlanDialog; $win = $s.Window
+        $s.Plan = @(New-McpPermissionPlan -Context $s.Context -RemoveRows $s.Remove -GrantRows $s.Grant -IncludeSharedBlueprint:([bool]$win.FindName('Shared').IsChecked) `
+                        -FromBlueprintGrant:([bool]$win.FindName('FromGrant').IsChecked))
+        $win.FindName('Plan').ItemsSource = $s.Plan
+        $n = @($s.Plan | Where-Object { $_.Change -ne 'None' }).Count
+        $win.FindName('Message').Text = "$n change(s) for $(@($s.Plan | ForEach-Object { $_.AgentId } | Get-Distinct).Count) agent(s). Each uses the narrowest lever that reaches the agent; rows marked None change nothing, and say why."
+        $win.FindName('Notes').Text = (@(Get-McpPlanNotes $s.Plan) + 'Undo last run puts every change back.') -join "`n"
+        $ok = $win.FindName('BtnOk'); $ok.Content = "Apply $n change(s)"; $ok.IsEnabled = $n -gt 0
+    }
+    & $script:mcpPlanDialog.Refresh
+    $with = @($script:mcpPlanDialog.Plan | Where-Object { $_.Shared } | ForEach-Object { $_.Others } | Get-Distinct)
+    if ($with.Count) {
+        $d.FindName('Shared').Visibility = 'Visible'
+        $d.FindName('SharedText').Text = "Remove it from the shared blueprint's grant instead of blocking with Conditional Access. This also takes it away from: $($with -join ', ')."
+        $d.FindName('Shared').Add_Click({ & $script:mcpPlanDialog.Refresh })
+    }
+    if (@($script:mcpPlanDialog.Plan | Where-Object { $_.Change -eq 'Remove' -and $_.Via -eq 'inheritance' }).Count -or $with.Count) {
+        $d.FindName('FromGrant').Visibility = 'Visible'
+        $d.FindName('FromGrant').Add_Click({ & $script:mcpPlanDialog.Refresh })
+    }
+    $d.FindName('BtnOk').Add_Click({ $script:mcpPlanDialog.Window.DialogResult = $true })
+    $d
+}
+
+# Ask to confirm a plan. Returns { Plan = the changes to make }, or $null when cancelled.
+function Read-McpPlanChoice {
+    param([object]$Context, [object[]]$RemoveRows, [object[]]$GrantRows, [System.Windows.Window]$Owner)
+    $d = New-McpPlanDialog -Context $Context -RemoveRows $RemoveRows -GrantRows $GrantRows -Owner $Owner
+    if (-not $d.ShowDialog()) { return $null }
+    [pscustomobject]@{ Plan = @($script:mcpPlanDialog.Plan | Where-Object { $_.Change -ne 'None' }) }
+}
+
+# Remove permission (the selected rows) or Set servers (the agent of the highlighted row). Plans each change with the narrowest
+# lever, confirms once, asks for the write permission only then, applies and logs the changes, and reads the page again.
+function Invoke-McpWindowPermission {
+    param([System.Windows.Window]$Window, [ValidateSet('Remove', 'Set')][string]$Mode)
+    $grid = $Window.FindName('McGrid'); $note = $Window.FindName('McNote')
+    $report = $Window.Tag
+    if (-not $report) { return }
+    $pump = { $Window.Dispatcher.Invoke([Action]{}, [Windows.Threading.DispatcherPriority]::Background) }
+    $remove = @(); $add = @()
+    if ($Mode -eq 'Remove') {
+        $remove = @($grid.SelectedItems | Where-Object { $_.Kind -eq 'Agent' -and $_.Granted })
+        if ($remove.Count -eq 0) { [void][Windows.MessageBox]::Show('None of the selected rows is a catalog agent that holds an Entra permission for the server.', 'MCP access', 'OK', 'Information'); return }
+    } else {
+        $row = $grid.SelectedItem
+        if (-not $row -or $row.Kind -ne 'Agent' -or -not $row.AgentId) { return }
+        $mine = @($report.Rows | Where-Object { $_.AgentId -eq $row.AgentId -and $_.ServerKey -ne 'agenttools' })
+        $keys = @(@($report.ServerApps.Keys | Where-Object { $_ -ne 'agenttools' }) + @($mine | Where-Object { $_.Granted } | ForEach-Object { $_.ServerKey }) | Get-Distinct)
+        $entries = @(foreach ($k in $keys) {
+            $r = @($mine | Where-Object { $_.ServerKey -eq $k })[0]
+            $app = $report.ServerApps[$k]
+            [pscustomobject]@{ Key = $k; Server = $(if ($r) { $r.Server } else { $app.Name }); Held = [bool]($r -and $r.Granted); Grantable = [bool]$app
+                               Permission = $(if ($r) { $r.Permission } else { 'None found' }); Declared = [bool]($r -and $r.Declared); Calls = $(if ($r) { $r.Calls30 } else { 0 }) }
+        })
+        $pick = Read-McpServerChoice -Agent $row.Agent -Entries @($entries | Sort-Object Server) -Owner $script:w
+        if (-not $pick) { return }
+        $remove = @($mine | Where-Object { $_.Granted -and $pick.Servers -notcontains $_.ServerKey })
+        $want = @($entries | Where-Object { -not $_.Held -and $pick.Servers -contains $_.Key } | ForEach-Object { $_.Key })
+        if ($want.Count) { $add = @(Resolve-McpBlockRows -Report $report -Packages @($script:mcpState.Packages | Where-Object { $_.id -eq $row.AgentId }) -Servers $want) }
+        if ($remove.Count + $add.Count -eq 0) { $note.Text = "No change for $($row.Agent)."; return }
+    }
+    try {
+        $Window.Cursor = [Windows.Input.Cursors]::Wait; $note.Text = 'Working out how to make each change...'; & $pump
+        $context = Get-McpPermissionContext -Report $report -Catalog $script:mcpState.Packages -AgentIds @(@($remove) + @($add) | ForEach-Object { $_.AgentId } | Get-Distinct)
+    } catch { $note.Text = 'Could not read what the change needs: ' + $_.Exception.Message; return }
+    finally { $Window.Cursor = $null }
+    $choice = Read-McpPlanChoice -Context $context -RemoveRows $remove -GrantRows $add -Owner $script:w
+    if (-not $choice) { $note.Text = 'Cancelled.'; return }
+    $plan = @($choice.Plan)
+    try {
+        foreach ($s in @(Get-McpPlanScopes $plan)) {
+            if (-not (Test-GraphScope $s)) { $note.Text = "Granting $s`: finish the sign-in window..."; & $pump; Request-GraphScope $s }
+        }
+    } catch { $note.Text = 'Sign-in failed: ' + $_.Exception.Message; return }
+    if ($script:ctx) { & $script:ctx.NewLogPath 'mcp-permission' }
+    $note.Text = 'Changing MCP permissions...'; & $pump
+    $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+    $done = @($recs | Where-Object { $_.Result -eq 'Done' })
+    if ($done.Count -and $script:ctx) { $script:ctx.LastRun = $done; & $script:ctx.Summary }
+    $failed = @($recs | Where-Object { $_.Result -eq 'Failed' })
+    Update-McpAccessWindow -Window $Window -Load
+    $note.Text = ("{0} changed, {1} skipped, {2} failed.{3}" -f $done.Count, @($recs | Where-Object { $_.Result -eq 'Skipped' }).Count, $failed.Count, $(if ($script:OutFile) { " Log: $script:OutFile" } else { '' }))
+    if ($failed.Count) {
+        $why = (@($failed | Select-Object -First 5 | ForEach-Object { "$($_.Agent) -> $($_.Server): $($_.Error)" }) -join "`n")
+        [void][Windows.MessageBox]::Show("$($failed.Count) change(s) failed:`n`n$why", 'Some changes failed', 'OK', 'Warning')
+    }
+}
+
 function New-McpAccessWindow {
     param([System.Windows.Window]$Owner, [object[]]$Packages, [string[]]$OnlyIds, [int]$Days = 30)
     $d = [Windows.Markup.XamlReader]::Parse($McpAccessXaml)
@@ -7343,6 +8340,8 @@ function New-McpAccessWindow {
     $d.FindName('BtnMcBlock').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode On })
     $d.FindName('BtnMcReport').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode Report-only })
     $d.FindName('BtnMcUnblock').Add_Click({ Invoke-McpWindowBlock -Window $script:mcWindow -Mode Remove })
+    $d.FindName('BtnMcRemovePerm').Add_Click({ Invoke-McpWindowPermission -Window $script:mcWindow -Mode Remove })
+    $d.FindName('BtnMcSetServers').Add_Click({ Invoke-McpWindowPermission -Window $script:mcWindow -Mode Set })
     $d.FindName('BtnMcExport').Add_Click({
         $shown = @($script:mcWindow.FindName('McGrid').ItemsSource)
         if ($shown.Count -eq 0) { return }
@@ -9880,6 +10879,27 @@ function New-ConsoleWindow {
             & $script:ctx.Idle ("Restored access for {0} agent(s)." -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count)
             return
         }
+        $perm = @($done | Where-Object { $_.Action -in 'revokemcpscope', 'grantmcpscope', 'revokemcpinherit', 'grantmcpinherit' })
+        if ($perm.Count -gt 0) {
+            $blocks = @($done | Where-Object { $_.Action -in 'blockmcp', 'unblockmcp' })
+            $ask = "Put back the MCP permissions the last run changed: $($perm.Count) scope change(s)$(if ($blocks.Count) { " and $($blocks.Count) Conditional Access block change(s)" })?"
+            if ([Windows.MessageBox]::Show($ask, 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
+            $back = @(ConvertTo-McpPermissionUndoChanges $perm)
+            try {
+                foreach ($s in @(Get-McpPlanScopes $back) + @(if ($blocks.Count) { 'Policy.ReadWrite.ConditionalAccess' })) {
+                    if (-not (Test-GraphScope $s)) { & $script:ctx.Busy "Granting $s`: finish the sign-in window..."; Request-GraphScope $s }
+                }
+            } catch { & $script:ctx.Idle 'Sign-in failed.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Undo last run', 'OK', 'Error'); return }
+            & $script:ctx.NewLogPath 'mcp-permission-undo'
+            & $script:ctx.Busy 'Restoring the MCP permissions...'
+            $recs = @(Invoke-McpPermissionChange -Changes $back -PassThru)
+            if ($blocks.Count) { $recs += @(Invoke-McpBlockChange -Items @(ConvertTo-McpUndoItems $blocks) -PassThru) }
+            $script:ctx.LastRun = @()
+            if ($script:shell -and $script:shell.Pages['tools']) { $script:shell.Pages['tools'].Loaded = $false }
+            & $script:ctx.Refilter
+            & $script:ctx.Idle ("MCP permissions restored: {0} change(s), {1} failed. Log: {2}" -f @($recs | Where-Object { $_.Result -eq 'Done' }).Count, @($recs | Where-Object { $_.Result -eq 'Failed' }).Count, $script:OutFile)
+            return
+        }
         if ($done.Count -gt 0 -and $done[0].Action -in 'blockmcp', 'unblockmcp') {
             if ([Windows.MessageBox]::Show("Put $($done.Count) agent and MCP server pair(s) back the way they were before (blocked, report-only or not blocked)?", 'Confirm the action', 'YesNo', 'Question', 'No') -ne 'Yes') { return }
             try { if (-not (Test-GraphScope 'Policy.ReadWrite.ConditionalAccess')) { & $script:ctx.Busy 'Granting write access to Conditional Access: finish the sign-in window...'; Request-GraphScope 'Policy.ReadWrite.ConditionalAccess' } }
@@ -10110,7 +11130,7 @@ switch ($PSCmdlet.ParameterSetName) {
                 @{ n = 'calls'; e = { $_.Calls } }, @{ n = 'last call'; e = { if ($_.LastCall) { ([datetime]$_.LastCall).ToString('yyyy-MM-dd') } } }, @{ n = 'block'; e = { $_.Block } }, @{ n = 'note'; e = { $_.Note } } | Format-Table -AutoSize -Wrap | Out-Host
         } elseif ($Unused) { Write-Host 'Every MCP permission was used in this period.' -ForegroundColor Green }
         if ($s.Connectors) { Write-Host ("{0} agent(s) reach MCP servers through Power Platform connectors (Copilot Studio). Conditional Access for agents does not cover those; use a Power Platform data policy." -f $s.Connectors) -ForegroundColor DarkGray }
-        Write-Host 'The Agent 365 Tools registry and its Block for every agent have no public API, so registry status is not shown. -BlockMcp <server> -ForAgent <agent> blocks one server for chosen agents with Conditional Access.' -ForegroundColor DarkGray
+        Write-Host 'The Agent 365 Tools registry and its Block for every agent have no public API, so registry status is not shown. -BlockMcp <server> -ForAgent <agent> blocks one server for chosen agents with Conditional Access; add -Via Permission to remove the permission itself.' -ForegroundColor DarkGray
         Export-ActionLog -Records @($rows | ForEach-Object {
             [pscustomobject]@{ Agent = $_.Agent; AgentId = $_.AgentId; Kind = $_.Kind; Platform = $_.Platform; Server = $_.Server; EntraApplication = $_.ResourceAppId; Permission = $_.Permission
                                PermissionDetail = ($_.PermParts -join ' | '); SetUp = $_.Declared; SetUpAs = $_.DeclaredAs; Calls = $_.Calls; Last7Days = $_.Calls7; Last14Days = $_.Calls14; Last30Days = $_.Calls30
@@ -10121,9 +11141,26 @@ switch ($PSCmdlet.ParameterSetName) {
         $blocking = $_ -eq 'BlockMcp'
         $ForAgent = ConvertTo-NameList $ForAgent
         $servers = ConvertTo-NameList $(if ($blocking) { $BlockMcp } else { $UnblockMcp })
+        $except = ConvertTo-NameList $ExceptMcp
+        $allServers = $blocking -and $servers -contains 'All'
         $pk = @(Get-Packages)
         $targets = @(Resolve-Packages $ForAgent -Catalog $pk)
         $report = Get-McpAccessReport -Packages $pk -OnlyIds @($targets | ForEach-Object { $_.id }) -OnStatus { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
+        if ($Via -eq 'Permission') {
+            $recs = @(Invoke-McpPermissionRun -Report $report -Catalog $pk -Targets $targets -Servers $servers -Except $except -Grant:(-not $blocking) -AllowOnly:$allServers `
+                -GrantMissing:$GrantMissing -IncludeSharedBlueprint:$IncludeSharedBlueprint -FromBlueprintGrant:$FromBlueprintGrant -BlockMode $(if ($ReportOnly) { 'Report-only' } else { 'On' }))
+            if ($RevokeSessions -and @($recs | Where-Object { $_.Result -eq 'Done' }).Count) { Invoke-SessionRevokeAfter -Records $recs -Packages $targets }
+            break
+        }
+        if ($allServers) {
+            $skip = @($except | ForEach-Object { ConvertTo-McpRequestKey $_ })
+            $servers = @($report.ServerApps.Keys | Where-Object { $skip -notcontains $_ } | Sort-Object)
+            if ($servers -contains 'agenttools') {
+                foreach ($r in @($report.Rows | Where-Object { $skip -contains $_.ServerKey -and $_.Shared -and -not $_.OwnApp })) {
+                    Write-Warning ("{0} reaches {1} only through the shared permission, and blocking Agent Tools covers it, so it loses {1} too. -Via Permission removes the other shared scopes and keeps this one." -f $r.Agent, $r.Server)
+                }
+            }
+        }
         $rows = @(Resolve-McpBlockRows -Report $report -Packages $targets -Servers $servers)
         if ($rows.Count -eq 0) { Write-Host 'Nothing matches those agents and servers.' -ForegroundColor Yellow; break }
         $rows | Select-Object @{ n = 'agent'; e = { $_.Agent } }, @{ n = 'server'; e = { $_.Server } }, @{ n = 'permission'; e = { $_.Permission } }, @{ n = 'block now'; e = { $_.Block } },
@@ -10379,6 +11416,14 @@ switch ($PSCmdlet.ParameterSetName) {
         $riskChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'confirmcompromised' })
         $blockRules = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -eq 'blocklocalagent' })
         $mcpChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'blockmcp', 'unblockmcp' })
+        $permChanges = @($rows | Where-Object { $_.Result -eq 'Done' -and $_.Action -in 'revokemcpscope', 'grantmcpscope', 'revokemcpinherit', 'grantmcpinherit' })
+        $permItems = @(Select-McpPermissionUndoChanges (ConvertTo-McpPermissionUndoChanges $permChanges))
+        if ($permItems.Count -gt 0) {
+            $permItems | Select-Object Agent, Server, @{ n = 'undo'; e = { if ($_.Change -eq 'Grant') { 'Add back' } else { 'Remove' } } }, Scope, @{ n = 'holder'; e = { $_.ClientName } },
+                @{ n = 'change'; e = { if ($_.Via -eq 'inheritance') { $s = ConvertFrom-InheritPatternJson $_.SetPattern; 'Inheritance back to {0}{1}' -f $s.Kind, $(if ($s.Kind -eq 'enumerated') { " ($(@($s.Scopes).Count) scopes)" }) }
+                                       elseif ($_.CreateScope) { 'Create the grant again' } else { 'Grant' } } } | Format-Table -AutoSize -Wrap | Out-Host
+            if (Confirm-Batch -Count $permItems.Count -Action 'restore the MCP permissions of') { Invoke-McpPermissionChange -Changes $permItems }
+        }
         $mcpItems = @(Select-McpUndoItems (ConvertTo-McpUndoItems $mcpChanges))
         if ($mcpItems.Count -gt 0) {
             $mcpItems | Select-Object Agent, Server, IdentityId, @{ n = 'agentUsers'; e = { @($_.AgentUserIds).Count } }, @{ n = 'restoreTo'; e = { if ($_.Target) { $_.Target } else { 'Not blocked' } } } | Format-Table -AutoSize | Out-Host
@@ -10420,7 +11465,7 @@ switch ($PSCmdlet.ParameterSetName) {
             $back = @($back)
             if ($back.Count -gt 0 -and (Confirm-Batch -Count $back.Count -Action 'reassign')) { Invoke-OwnerReassign -Items $back }
         }
-        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0 -and $mcpChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
+        if ($changed.Count -eq 0) { if ($ownerChanges.Count -eq 0 -and $accessChanges.Count -eq 0 -and $accountChanges.Count -eq 0 -and $riskChanges.Count -eq 0 -and $blockRules.Count -eq 0 -and $mcpChanges.Count -eq 0 -and $permChanges.Count -eq 0) { Write-Host 'The log has no changes to undo.' }; break }
         $restore = @{ block = [System.Collections.Generic.List[object]]::new(); unblock = [System.Collections.Generic.List[object]]::new() }
         foreach ($r in $changed) {
             $pkg = $byId[[string]$r.Id]
