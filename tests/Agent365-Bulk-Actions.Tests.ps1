@@ -3305,6 +3305,7 @@ Describe 'MCP permissions' {
             mailApp = '16b1878d-62c7-4009-aa25-68989d63bbad'; teamsApp = 'ce5029ee-c1d3-45c0-bdcc-efb5a4245687'; calApp = '910333d2-47e9-43ca-981f-6df2f4531ef4'
             mailSp = '00000111-0000-0000-0000-000000000005'; teamsSp = '00000222-0000-0000-0000-000000000005'; toolsSp = '00000333-0000-0000-0000-000000000005'; calSp = '00000444-0000-0000-0000-000000000005'
             uD2 = '0000000d-0000-0000-0000-0000000000c2'
+            objA = '0000000a-0000-0000-0000-0000000000a0'; objS = '00000005-0000-0000-0000-0000000000a0'; objD = '0000000d-0000-0000-0000-0000000000a0'
         }
         # Alpha: own identity (own grant on Mail) and a blueprint only it uses (shared scopes). Bravo and Charlie: two identities of
         # one blueprint, whose catalog entry Echo owns a third identity. Delta: a blueprint entry with two identities, its own.
@@ -3362,8 +3363,10 @@ Describe 'MCP permissions' {
         $o = { param($id, $name) [pscustomobject]@{ Id = $id; Name = $name } }
         $script:made = @{ $p.bpA = @(& $o $p.idA 'Alpha Identity'); $p.bpS = @((& $o $p.idB 'Bravo Identity'), (& $o $p.idC 'Charlie Identity'), (& $o $p.idE1 'Echo One')); $p.bpD = @((& $o $p.idD1 'Delta One'), (& $o $p.idD2 'Delta Two')) }
         $script:sps = @{ $p.mailApp = (New-Sp $p.mailSp $p.mailApp 'Work IQ Mail MCP'); $p.teamsApp = (New-Sp $p.teamsSp $p.teamsApp 'Work IQ Teams MCP'); $p.calApp = (New-Sp $p.calSp $p.calApp 'Work IQ Calendar MCP') }
+        $script:objs = @{ $p.bpA = $p.objA; $p.bpS = $p.objS; $p.bpD = $p.objD }
         Mock Get-BlueprintIdentities { $script:made }
         Mock Get-ServicePrincipalsByAppId { $script:sps }
+        Mock Get-BlueprintObjectIds { $script:objs }
     }
 
     It 'takes out and adds MCP scopes only, keeping every other scope and its order' {
@@ -3375,6 +3378,53 @@ Describe 'MCP permissions' {
         foreach ($s in 'Tools.ListInvoke.All Directory.ReadWrite.All', 'Directory.ReadWrite.All', 'McpServersMetadata.Read.All', '', ' Tools.ListInvoke.All') { Test-OneMcpScope $s | Should -BeFalse -Because "'$s'" }
         ConvertTo-McpRequestKey 'Agent Tools' | Should -Be 'agenttools'
         ConvertTo-McpRequestKey 'Work IQ Mail MCP' | Should -Be 'mail'
+    }
+
+    It 'reads what a blueprint passes on, by type or by kind, and treats a missing entry as nothing' {
+        $inh = @(@{ resourceAppId = 'APP-1'; inheritableScopes = @{ '@odata.type' = '#microsoft.graph.allAllowedScopes'; kind = 'allAllowed' } },
+                 @{ resourceAppId = 'app-2'; inheritableScopes = @{ kind = 'enumerated'; scopes = @('A.All', 'B.All') } },
+                 @{ resourceAppId = 'app-3'; inheritableScopes = @{ '@odata.type' = '#microsoft.graph.noScopes' } })
+        (Get-InheritPattern -Inherit $inh -ResourceAppId 'app-1').Kind | Should -Be 'allAllowed'
+        $e = Get-InheritPattern -Inherit $inh -ResourceAppId 'app-2'
+        $e.Kind | Should -Be 'enumerated'; $e.Scopes | Should -Be @('A.All', 'B.All'); $e.Present | Should -BeTrue
+        (Get-InheritPattern -Inherit $inh -ResourceAppId 'app-3').Kind | Should -Be 'noScopes'
+        $none = Get-InheritPattern -Inherit $inh -ResourceAppId 'app-4'
+        $none.Kind | Should -Be 'noScopes'; $none.Present | Should -BeFalse
+    }
+
+    It 'takes scopes out of an inheritance and puts them back, MCP scopes only' {
+        $all = [pscustomobject]@{ Kind = 'allAllowed'; Scopes = @() }
+        $r = Edit-InheritPattern -Pattern $all -Remove 'McpServers.Mail.All', 'User.Read' -Held 'McpServers.Mail.All', 'McpServersMetadata.Read.All', 'User.Read'
+        $r.Kind | Should -Be 'enumerated'; $r.Scopes | Should -Be @('McpServersMetadata.Read.All', 'User.Read')
+        (Edit-InheritPattern -Pattern ([pscustomobject]@{ Kind = 'enumerated'; Scopes = @('Tools.ListInvoke.All') }) -Remove 'Tools.ListInvoke.All').Kind | Should -Be 'noScopes'
+        $back = Edit-InheritPattern -Pattern ([pscustomobject]@{ Kind = 'noScopes'; Scopes = @() }) -Add 'Tools.ListInvoke.All', 'Directory.ReadWrite.All'
+        $back.Kind | Should -Be 'enumerated'; $back.Scopes | Should -Be @('Tools.ListInvoke.All')
+        (Edit-InheritPattern -Pattern $all -Add 'Tools.ListInvoke.All').Kind | Should -Be 'allAllowed'
+    }
+
+    It 'writes an inheritance to the log and reads back only what the tool writes' {
+        ConvertTo-InheritPatternJson ([pscustomobject]@{ Kind = 'enumerated'; Scopes = @('McpServers.Mail.All') }) | Should -Be '{"kind":"enumerated","scopes":["McpServers.Mail.All"]}'
+        ConvertTo-InheritPatternJson ([pscustomobject]@{ Kind = 'allAllowed'; Scopes = @() }) | Should -Be '{"kind":"allAllowed"}'
+        (ConvertFrom-InheritPatternJson '{"kind":"enumerated","scopes":["McpServers.Mail.All"]}').Scopes | Should -Be @('McpServers.Mail.All')
+        foreach ($bad in 'not json', '{"kind":"everything"}', '{"kind":"enumerated","scopes":[]}', '{"kind":"noScopes","scopes":["A"]}', '{"kind":"enumerated","scopes":["a b"]}', '') {
+            ConvertFrom-InheritPatternJson $bad | Should -BeNullOrEmpty -Because $bad
+        }
+        (New-InheritPatternBody ([pscustomobject]@{ Kind = 'enumerated'; Scopes = @('A.All') })) | Should -Be '{"inheritableScopes":{"@odata.type":"microsoft.graph.enumeratedScopes","scopes":["A.All"]}}'
+        (New-InheritPatternBody ([pscustomobject]@{ Kind = 'noScopes'; Scopes = @() })) | Should -Be '{"inheritableScopes":{"@odata.type":"microsoft.graph.noScopes"}}'
+        (New-InheritPatternBody ([pscustomobject]@{ Kind = 'allAllowed'; Scopes = @() })) | Should -Be '{"inheritableScopes":{"@odata.type":"microsoft.graph.allAllowedScopes"}}'
+    }
+
+    It 'grants by passing a scope on again when the blueprint holds it and only this agent uses the blueprint' {
+        $r = New-PermReport
+        $r.Inherit[$p.bpD] = @(@{ resourceAppId = $p.mailApp; inheritableScopes = @{ '@odata.type' = '#microsoft.graph.enumeratedScopes'; kind = 'enumerated'; scopes = @('User.Read') } })
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Delta' 'mail'))
+        $c.Count | Should -Be 1
+        $c[0].Change | Should -Be 'Grant'; $c[0].Via | Should -Be 'inheritance'; $c[0].Lever | Should -Be 'Blueprint inheritance'; $c[0].ClientName | Should -Be 'Delta Blueprint'
+        $c[0].PatternAfter | Should -Be '{"kind":"enumerated","scopes":["User.Read","Tools.ListInvoke.All"]}'; $c[0].Effect | Should -Be 'Passed on by the blueprint again'
+        (Get-McpPlanScopes $c) | Should -Be @('AgentIdentityBlueprint.ReadWrite.All')
+        $r.Inherit[$p.bpS] = @(@{ resourceAppId = $p.teamsApp; inheritableScopes = @{ '@odata.type' = '#microsoft.graph.noScopes' } })
+        $b = @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Bravo' 'teams'))
+        $b[0].Via | Should -Be 'grant'; $b[0].ClientId | Should -Be $p.idB
     }
 
     It 'knows who holds each agent''s permissions and who else uses its blueprint' {
@@ -3394,23 +3444,46 @@ Describe 'MCP permissions' {
         (Get-McpPermissionContext -Report $r -Catalog $r.Packages -AgentIds 'P_B').Holders['P_B'].Others | Should -Be @('Charlie', 'Echo One (an agent identity not in the catalog)')
     }
 
-    It 'removes the agent identity''s own grant and the scope of a blueprint only this agent uses, keeping other scopes' {
+    It 'removes the agent identity''s own grant, and stops a blueprint only this agent uses from passing the scope on' {
         $r = New-PermReport
         $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail'))
         $plan.Count | Should -Be 2
         $own = $plan | Where-Object { $_.GrantId -eq 'grantA1' }
-        $own.Change | Should -Be 'Remove'; $own.Lever | Should -Be 'Agent identity grant'; $own.ClientKind | Should -Be 'identity'; $own.Scope | Should -Be 'Tools.ListInvoke.All'
+        $own.Change | Should -Be 'Remove'; $own.Via | Should -Be 'grant'; $own.Lever | Should -Be 'Agent identity grant'; $own.ClientKind | Should -Be 'identity'; $own.Scope | Should -Be 'Tools.ListInvoke.All'
         $own.ScopeAfter | Should -Be ''; $own.Effect | Should -BeLike '*deleted*'
-        $bp = $plan | Where-Object { $_.GrantId -eq 'grantA2' }
-        $bp.Lever | Should -Be 'Blueprint grant'; $bp.ClientKind | Should -Be 'blueprint'; $bp.Scope | Should -Be 'McpServers.Mail.All'; $bp.ClientName | Should -Be 'Alpha Blueprint'
-        $bp.ScopeAfter | Should -Be 'openid McpServers.Calendar.All McpServersMetadata.Read.All'
+        $bp = $plan | Where-Object { $_.Via -eq 'inheritance' }
+        $bp.Lever | Should -Be 'Blueprint inheritance'; $bp.Scope | Should -Be 'McpServers.Mail.All'; $bp.ClientName | Should -Be 'Alpha Blueprint'
+        $bp.BlueprintAppId | Should -Be $p.bpA; $bp.BlueprintObjectId | Should -Be $p.objA; $bp.ResourceAppId | Should -Be $script:AgentToolsAppId; $bp.ClientId | Should -Be $p.spA
+        $bp.PatternBefore | Should -Be '{"kind":"allAllowed"}'
+        $bp.PatternAfter | Should -Be '{"kind":"enumerated","scopes":["openid","McpServers.Calendar.All","McpServersMetadata.Read.All"]}'
+        $bp.Why | Should -BeLike '*keeps its own grant*only this agent*'
     }
 
-    It 'removes every shared scope for the Agent Tools row, and only those' {
+    It 'takes the scope out of the blueprint''s own grant only when asked' {
+        $r = New-PermReport
+        $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail') -FromBlueprintGrant)
+        $bp = $plan | Where-Object { $_.GrantId -eq 'grantA2' }
+        $bp.Via | Should -Be 'grant'; $bp.Lever | Should -Be 'Blueprint grant'; $bp.ClientKind | Should -Be 'blueprint'; $bp.Scope | Should -Be 'McpServers.Mail.All'
+        $bp.ScopeAfter | Should -Be 'openid McpServers.Calendar.All McpServersMetadata.Read.All'
+        (Get-McpPlanScopes $plan) | Should -Be @('DelegatedPermissionGrant.ReadWrite.All')
+        (Get-McpPlanNotes $plan) -join ' ' | Should -BeLike '*Cloud Application Administrator or Application Administrator*'
+    }
+
+    It 'stops passing on every shared scope for the Agent Tools row in one change of the inheritance' {
         $r = New-PermReport
         $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'agenttools'))
         @($plan | ForEach-Object { $_.Scope }) | Should -Be @('McpServers.Calendar.All', 'McpServers.Mail.All')
-        @($plan.ScopeAfter | Get-Distinct) | Should -Be @('openid McpServersMetadata.Read.All')
+        @($plan.PatternAfter | Get-Distinct) | Should -Be @('{"kind":"enumerated","scopes":["openid","McpServersMetadata.Read.All"]}')
+        (Get-McpPlanScopes $plan) | Should -Be @('AgentIdentityBlueprint.ReadWrite.All')
+        (Get-McpPlanNotes $plan) -join ' ' | Should -BeLike '*Agent ID Administrator*'
+        $plan[0].Effect | Should -Be 'No longer passed on; the blueprint still passes openid, McpServersMetadata.Read.All'
+    }
+
+    It 'says when the blueprint''s application cannot be read for its inheritance' {
+        $script:objs = @{}
+        $r = New-PermReport
+        $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'calendar'))
+        $c[0].Change | Should -Be 'None'; $c[0].Why | Should -BeLike '*could not be read*-FromBlueprintGrant*'
     }
 
     It 'blocks with Conditional Access instead of changing a blueprint other agents use, and says who they are' {
@@ -3428,8 +3501,11 @@ Describe 'MCP permissions' {
         $r = New-PermReport
         $c = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams') -IncludeSharedBlueprint)
         $c.Count | Should -Be 1
-        $c[0].Change | Should -Be 'Remove'; $c[0].Lever | Should -Be 'Shared blueprint grant'; $c[0].GrantId | Should -Be 'grantS1'; $c[0].Others | Should -Be @('Charlie', 'Echo')
+        $c[0].Change | Should -Be 'Remove'; $c[0].Lever | Should -Be 'Shared blueprint inheritance'; $c[0].Others | Should -Be @('Charlie', 'Echo')
+        $c[0].PatternAfter | Should -Be '{"kind":"noScopes"}'; $c[0].Effect | Should -BeLike '*passes nothing for this server*'
         (Get-McpPlanNotes $c) -join ' ' | Should -BeLike '*Bravo*shared with Charlie, Echo*removed for them too*'
+        $g = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'teams') -IncludeSharedBlueprint -FromBlueprintGrant)
+        $g[0].Lever | Should -Be 'Shared blueprint grant'; $g[0].GrantId | Should -Be 'grantS1'
     }
 
     It 'blocks a blueprint entry that shares its blueprint through its own identities only' {
@@ -3447,7 +3523,8 @@ Describe 'MCP permissions' {
         $c[0].Change | Should -Be 'None'; $c[0].Shared | Should -BeTrue; $c[0].Why | Should -BeLike '*only through the shared permission*Agent Tools*'
         $t = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'agenttools'))
         $t[0].Change | Should -Be 'Block'; $t[0].BlockItems[0].ResourceAppId | Should -Be $script:AgentToolsAppId
-        (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'excel') -IncludeSharedBlueprint))[0].GrantId | Should -Be 'grantS2'
+        $x = (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Bravo' 'excel') -IncludeSharedBlueprint))[0]
+        $x.PatternBefore | Should -Be '{"kind":"enumerated","scopes":["McpServers.Excel.All"]}'; $x.PatternAfter | Should -Be '{"kind":"noScopes"}'
     }
 
     It 'leaves a scope the blueprint does not pass on, and a server the agent does not hold' {
@@ -3461,8 +3538,10 @@ Describe 'MCP permissions' {
         $r = New-PermReport
         $m = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'mail'))
         $m.Count | Should -Be 2
-        $bp = $m | Where-Object { $_.GrantId -eq 'grantD1' }
-        $bp.Lever | Should -Be 'Blueprint grant'; $bp.ScopeAfter | Should -Be 'User.Read'; $bp.Effect | Should -Be 'Removed; the grant keeps User.Read'
+        $bp = $m | Where-Object { $_.Via -eq 'inheritance' }
+        $bp.Lever | Should -Be 'Blueprint inheritance'; $bp.BlueprintObjectId | Should -Be $p.objD; $bp.PatternAfter | Should -Be '{"kind":"enumerated","scopes":["User.Read"]}'
+        $g = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'mail') -FromBlueprintGrant) | Where-Object { $_.GrantId -eq 'grantD1' }
+        $g.Lever | Should -Be 'Blueprint grant'; $g.ScopeAfter | Should -Be 'User.Read'; $g.Effect | Should -Be 'Removed; the grant keeps User.Read'
         $one = $m | Where-Object { $_.GrantId -eq 'grantD3' }
         $one.Lever | Should -Be 'Agent identity grant'; $one.ConsentType | Should -Be 'Principal'; $one.PrincipalId | Should -Be $p.uD2
         (@(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'teams')))[0].ClientId | Should -Be $p.idD1
@@ -3526,13 +3605,24 @@ Describe 'MCP permissions' {
             Mock Test-Proceed { $true }
             $script:writes = @()
             $script:live = @{}
-            Mock Get-GraphAll { $c = if ($Uri -match "clientId eq '([^']+)'") { $Matches[1] } else { '' }; @($script:live[$c]) | Where-Object { $_ } }
-            Mock Invoke-Graph { $script:writes += , [pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($Body) { $Body | ConvertFrom-Json }) }; if ($Method -eq 'POST') { @{ id = 'newGrant' } } }
+            $script:entries = @{}
+            Mock Get-GraphAll {
+                if ($Uri -match '/applications/([^/]+)/microsoft\.graph\.agentIdentityBlueprint/inheritablePermissions$') { return @($script:entries[$Matches[1]]) | Where-Object { $_ } }
+                $c = if ($Uri -match "clientId eq '([^']+)'") { $Matches[1] } else { '' }; @($script:live[$c]) | Where-Object { $_ }
+            }
+            # A PATCH of an inheritance is kept, so a later read sees it.
+            Mock Invoke-Graph {
+                $script:writes += , [pscustomobject]@{ Method = $Method; Uri = $Uri; Body = $(if ($Body) { $Body | ConvertFrom-Json }) }
+                if ($Method -eq 'PATCH' -and $Uri -match '/applications/([^/]+)/microsoft\.graph\.agentIdentityBlueprint/inheritablePermissions/([^/]+)$') {
+                    $script:entries[$Matches[1]] = @(@{ resourceAppId = $Matches[2]; inheritableScopes = ($Body | ConvertFrom-Json -AsHashtable).inheritableScopes })
+                }
+                if ($Method -eq 'POST') { @{ id = 'newGrant' } }
+            }
         }
         It 'writes each grant once: a PATCH with what stays, never a scope that is not MCP' {
             $r = New-PermReport
             $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp ' openid McpServers.Calendar.All McpServers.Mail.All McpServersMetadata.Read.All')
-            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'agenttools'))
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'agenttools') -FromBlueprintGrant)
             $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
             $script:writes.Count | Should -Be 1
             $script:writes[0].Method | Should -Be 'PATCH'; $script:writes[0].Uri | Should -Be "$($script:GrantBase)/grantA2"; $script:writes[0].Body.scope | Should -Be 'openid McpServersMetadata.Read.All'
@@ -3545,7 +3635,7 @@ Describe 'MCP permissions' {
             $r = New-PermReport
             $script:live[$p.idA] = @(New-LiveGrant 'grantA1' $p.idA $p.mailSp 'Tools.ListInvoke.All')
             $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'McpServers.Calendar.All')
-            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail')) -PassThru)
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail') -FromBlueprintGrant) -PassThru)
             @($script:writes | ForEach-Object { $_.Method }) | Should -Be @('DELETE')
             ($recs | Where-Object { $_.GrantId -eq 'grantA1' }).Deleted | Should -BeTrue
             $skip = $recs | Where-Object { $_.Scope -eq 'McpServers.Mail.All' }
@@ -3577,6 +3667,80 @@ Describe 'MCP permissions' {
             $f = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
             $f[0].Result | Should -Be 'Failed'; $f[0].Error | Should -BeLike '*DelegatedPermissionGrant.ReadWrite.All*Cloud Application Administrator*'
         }
+        It 'stops a blueprint passing a scope on: allAllowed becomes the list it holds now without it, in one PATCH' {
+            $r = New-PermReport
+            $script:entries[$p.objA] = @(@{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ '@odata.type' = '#microsoft.graph.allAllowedScopes'; kind = 'allAllowed' }; inheritableRoles = @{ kind = 'allAllowed' } })
+            $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'McpServers.Calendar.All McpServers.Mail.All McpServers.Me.All')
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail') | Where-Object { $_.Via -eq 'inheritance' })
+            $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $script:writes.Count | Should -Be 1
+            $w = $script:writes[0]
+            $w.Method | Should -Be 'PATCH'
+            $w.Uri | Should -Be "https://graph.microsoft.com/v1.0/applications/$($p.objA)/microsoft.graph.agentIdentityBlueprint/inheritablePermissions/$($script:AgentToolsAppId)"
+            $w.Body.PSObject.Properties.Name | Should -Be @('inheritableScopes')
+            $w.Body.inheritableScopes.'@odata.type' | Should -Be 'microsoft.graph.enumeratedScopes'; $w.Body.inheritableScopes.scopes | Should -Be @('McpServers.Calendar.All', 'McpServers.Me.All')
+            $recs[0].Action | Should -Be 'revokemcpinherit'; $recs[0].Result | Should -Be 'Done'; $recs[0].Scope | Should -Be 'McpServers.Mail.All'
+            $recs[0].Agent | Should -Be 'Alpha'; $recs[0].AgentId | Should -Be 'P_A'; $recs[0].Lever | Should -Be 'Blueprint inheritance'; $recs[0].BlueprintName | Should -Be 'Alpha Blueprint'
+            $recs[0].BlueprintAppId | Should -Be $p.bpA; $recs[0].BlueprintObjectId | Should -Be $p.objA; $recs[0].ResourceAppId | Should -Be $script:AgentToolsAppId
+            $recs[0].PatternBefore | Should -Be '{"kind":"allAllowed"}'; $recs[0].PatternAfter | Should -Be '{"kind":"enumerated","scopes":["McpServers.Calendar.All","McpServers.Me.All"]}'
+        }
+        It 'changes a grant and an inheritance of one agent in the same run, each logged with its agent and server' {
+            $r = New-PermReport
+            $script:live[$p.idA] = @(New-LiveGrant 'grantA1' $p.idA $p.mailSp 'Tools.ListInvoke.All')
+            $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'McpServers.Mail.All')
+            $script:entries[$p.objA] = @(@{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'allAllowed' } })
+            $recs = @(Invoke-McpPermissionChange -Changes @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Alpha' 'mail')) -PassThru)
+            @($recs | ForEach-Object { "$($_.Action):$($_.Agent):$($_.Server):$($_.Result)" }) | Should -Be @('revokemcpscope:Alpha:Work IQ Mail MCP:Done', 'revokemcpinherit:Alpha:Work IQ Mail MCP:Done')
+            @($script:writes | ForEach-Object { $_.Method }) | Should -Be @('DELETE', 'PATCH')
+            $script:writes[1].Body.inheritableScopes.'@odata.type' | Should -Be 'microsoft.graph.noScopes'
+        }
+        It 'passes nothing once the last scope goes, skips a scope not passed on, and changes nothing under -WhatIf' {
+            $r = New-PermReport
+            $script:entries[$p.objD] = @(@{ resourceAppId = $p.mailApp; inheritableScopes = @{ kind = 'enumerated'; scopes = @('Tools.ListInvoke.All') } })
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -RemoveRows @(Get-PermRow $r 'Delta' 'mail') | Where-Object { $_.Via -eq 'inheritance' })
+            Mock Test-Proceed { $false }
+            (@(Invoke-McpPermissionChange -Changes $plan -PassThru))[0].Result | Should -Be 'WhatIf'
+            $script:writes.Count | Should -Be 0
+            Mock Test-Proceed { $true }
+            $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $script:writes[0].Body.inheritableScopes.'@odata.type' | Should -Be 'microsoft.graph.noScopes'; $recs[0].PatternAfter | Should -Be '{"kind":"noScopes"}'
+            $script:writes = @()
+            $s = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $s[0].Result | Should -Be 'Skipped'; $s[0].Error | Should -Be 'Not passed on.'; $script:writes.Count | Should -Be 0
+        }
+        It 'passes a scope on again, and names the role when Entra refuses' {
+            $r = New-PermReport
+            $r.Inherit[$p.bpD] = @(@{ resourceAppId = $p.mailApp; inheritableScopes = @{ kind = 'enumerated'; scopes = @('User.Read') } })
+            $script:entries[$p.objD] = $r.Inherit[$p.bpD]
+            $plan = @(New-McpPermissionPlan -Context (New-PermContext $r) -GrantRows @(Get-PermRow $r 'Delta' 'mail'))
+            $recs = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $script:writes[0].Body.inheritableScopes.scopes | Should -Be @('User.Read', 'Tools.ListInvoke.All'); $recs[0].Action | Should -Be 'grantmcpinherit'
+            $script:entries[$p.objD] = $r.Inherit[$p.bpD]
+            Mock Invoke-Graph { throw 'Response status code does not indicate success: Forbidden (Authorization_RequestDenied)' }
+            $f = @(Invoke-McpPermissionChange -Changes $plan -PassThru)
+            $f[0].Result | Should -Be 'Failed'; $f[0].Error | Should -BeLike '*AgentIdentityBlueprint.ReadWrite.All*Agent ID Administrator*'
+        }
+        It 'undoes changes of an inheritance exactly, latest first, and only while it is still what the run left' {
+            $row = { param($before, $after, $scope) [pscustomobject]@{ Action = 'revokemcpinherit'; Result = 'Done'; Agent = 'Alpha'; AgentId = 'P_A'; Server = 'x'; BlueprintAppId = $p.bpA; BlueprintObjectId = $p.objA
+                                                                       BlueprintName = 'Alpha Blueprint'; ResourceAppId = $script:AgentToolsAppId; ResourceName = 'Agent Tools'; Scope = $scope; PatternBefore = $before; PatternAfter = $after } }
+            $log = @((& $row '{"kind":"allAllowed"}' '{"kind":"enumerated","scopes":["McpServers.Calendar.All","McpServers.Me.All"]}' 'McpServers.Mail.All'),
+                     (& $row '{"kind":"enumerated","scopes":["McpServers.Calendar.All","McpServers.Me.All"]}' '{"kind":"enumerated","scopes":["McpServers.Calendar.All"]}' 'McpServers.Me.All'))
+            $u = @(ConvertTo-McpPermissionUndoChanges $log)
+            @($u | ForEach-Object { $_.Scope }) | Should -Be @('McpServers.Me.All', 'McpServers.Mail.All')
+            $u[0].Change | Should -Be 'Grant'; $u[0].Via | Should -Be 'inheritance'; $u[1].SetPattern | Should -Be '{"kind":"allAllowed"}'
+            $script:entries[$p.objA] = @(@{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'enumerated'; scopes = @('McpServers.Calendar.All') } })
+            $recs = @(Invoke-McpPermissionChange -Changes $u -PassThru)
+            @($recs | ForEach-Object { $_.Result }) | Should -Be @('Done', 'Done')
+            $script:writes[1].Body.inheritableScopes.'@odata.type' | Should -Be 'microsoft.graph.allAllowedScopes'
+            $recs[1].Action | Should -Be 'grantmcpinherit'; $recs[1].PatternAfter | Should -Be '{"kind":"allAllowed"}'
+            $script:writes = @()
+            (@(Invoke-McpPermissionChange -Changes @($u[1]) -PassThru))[0].Error | Should -Be 'Already as before the run.'
+            $script:entries[$p.objA] = @(@{ resourceAppId = $script:AgentToolsAppId; inheritableScopes = @{ kind = 'enumerated'; scopes = @('McpServers.Teams.All') } })
+            (@(Invoke-McpPermissionChange -Changes @($u[1]) -PassThru))[0].Error | Should -BeLike '*changed after the run*'
+            $bad = $u[1].PSObject.Copy(); $bad.SetPattern = '{"kind":"everything"}'
+            (@(Invoke-McpPermissionChange -Changes @($bad) -PassThru))[0].Error | Should -BeLike '*not an inheritance the tool writes*'
+            $script:writes.Count | Should -Be 0
+        }
         It 'sends the Conditional Access fallback to the block writer' {
             Mock Invoke-McpBlockChange { $script:blocked = @($Items); @([pscustomobject]@{ Action = 'blockmcp'; Result = 'Done' }) }
             $r = New-PermReport
@@ -3595,8 +3759,9 @@ Describe 'MCP permissions' {
                 [pscustomobject]@{ Action = 'revokemcpscope'; Result = 'Failed'; Agent = 'Echo' })
             $u = @(ConvertTo-McpPermissionUndoChanges $log)
             $u.Count | Should -Be 2
-            $u[0].Change | Should -Be 'Grant'; $u[0].CreateScope | Should -Be ''; $u[0].ScopeAfter | Should -Be 'openid McpServers.Mail.All'
-            $u[1].CreateScope | Should -Be 'Tools.ListInvoke.All'
+            $a = $u | Where-Object Agent -eq 'Alpha'
+            $a.Change | Should -Be 'Grant'; $a.CreateScope | Should -Be ''; $a.ScopeAfter | Should -Be 'openid McpServers.Mail.All'
+            ($u | Where-Object Agent -eq 'Delta').CreateScope | Should -Be 'Tools.ListInvoke.All'
             $script:live[$p.spA] = @(New-LiveGrant 'grantA2' $p.spA $p.toolsSp 'openid')
             $recs = @(Invoke-McpPermissionChange -Changes $u -PassThru)
             $patch = $script:writes | Where-Object Method -eq 'PATCH'
@@ -3674,6 +3839,42 @@ Describe 'MCP permissions' {
             $kept[0].Scope | Should -Be 'McpServers.Mail.All'
             $script:warned.Count | Should -Be 5
             ($script:warned -join "`n") | Should -BeLike '*kind*client is not*not mcp*not an MCP server*unpublished*does not publish*extra*Directory.ReadWrite.All*person*not an agent user*'
+        }
+        It 'accepts and refuses inheritance rows: <Why>' -ForEach @(
+            @{ Why = 'allAllowed narrowed to a list'; Ok = $true; Change = @{} }
+            @{ Why = 'the last scope taken out of a list'; Ok = $true; Change = @{ Scope = 'Tools.ListInvoke.All'; PatternBefore = '{"kind":"enumerated","scopes":["Tools.ListInvoke.All"]}'; PatternAfter = '{"kind":"noScopes"}' } }
+            @{ Why = 'a scope passed on again'; Ok = $true; Change = @{ Action = 'grantmcpinherit'; Scope = 'Tools.ListInvoke.All'; PatternBefore = '{"kind":"noScopes"}'; PatternAfter = '{"kind":"enumerated","scopes":["Tools.ListInvoke.All"]}' } }
+            @{ Why = 'another permission as the scope'; Change = @{ Scope = 'Directory.ReadWrite.All' }; Expect = 'Scope' }
+            @{ Why = 'a pattern that is not one'; Change = @{ PatternBefore = '{"kind":"everything"}' }; Expect = 'PatternBefore or PatternAfter' }
+            @{ Why = 'lists that differ by another permission'; Change = @{ PatternBefore = '{"kind":"enumerated","scopes":["McpServers.Mail.All"]}'; PatternAfter = '{"kind":"enumerated","scopes":["Directory.ReadWrite.All"]}' }; Expect = 'differ by more' }
+            @{ Why = 'a removal that ends in allAllowed'; Change = @{ PatternAfter = '{"kind":"allAllowed"}' }; Expect = 'differ by more' }
+            @{ Why = 'a scope that was not passed on'; Change = @{ PatternBefore = '{"kind":"enumerated","scopes":["McpServers.Me.All"]}'; PatternAfter = '{"kind":"enumerated","scopes":["McpServers.Me.All"]}' }; Expect = 'differ by more' }
+            @{ Why = 'a grant that starts from allAllowed'; Change = @{ Action = 'grantmcpinherit'; PatternBefore = '{"kind":"allAllowed"}'; PatternAfter = '{"kind":"enumerated","scopes":["McpServers.Mail.All"]}' }; Expect = 'differ by more' }
+            @{ Why = 'a path as the blueprint'; Change = @{ BlueprintObjectId = '../servicePrincipals/x' }; Expect = 'BlueprintObjectId' }
+        ) {
+            $row = @{ Action = 'revokemcpinherit'; Result = 'Done'; BlueprintAppId = $script:p.bpA; BlueprintObjectId = $script:p.objA; ResourceAppId = $script:AgentToolsAppId; Scope = 'McpServers.Mail.All'
+                      PatternBefore = '{"kind":"allAllowed"}'; PatternAfter = '{"kind":"enumerated","scopes":["McpServersMetadata.Read.All"]}' }
+            foreach ($k in $Change.Keys) { $row[$k] = $Change[$k] }
+            $problem = Get-UndoRowProblem -Row ([pscustomobject]$row) -PackageById @{}
+            if ($Ok) { $problem | Should -BeNullOrEmpty } else { $problem | Should -Match ([regex]::Escape($Expect)) }
+        }
+        It 'keeps inheritance undo changes only when Entra confirms the blueprint and an MCP server that publishes every scope named' {
+            Mock Write-Warning { $script:warned += , $Message }
+            $script:warned = @()
+            Mock Invoke-GraphBatch { @{ $script:p.objA = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.agentIdentityBlueprint'; appId = $script:p.bpA } }
+                                         $script:p.objS = @{ Status = 200; Body = [pscustomobject]@{ '@odata.type' = '#microsoft.graph.application'; appId = $script:p.bpS } } } }
+            $script:sps = @{ $script:AgentToolsAppId = [pscustomobject]@{ appId = $script:AgentToolsAppId; oauth2PermissionScopes = @([pscustomobject]@{ value = 'McpServers.Mail.All' }, [pscustomobject]@{ value = 'McpServers.Calendar.All' }) }
+                             '00000003-0000-0000-c000-000000000000' = [pscustomobject]@{ appId = '00000003-0000-0000-c000-000000000000'; oauth2PermissionScopes = @([pscustomobject]@{ value = 'McpServers.Mail.All' }) } }
+            $mk = { param([hashtable]$c)
+                $row = @{ Action = 'revokemcpinherit'; Result = 'Done'; Agent = 'ok'; BlueprintAppId = $script:p.bpA; BlueprintObjectId = $script:p.objA; ResourceAppId = $script:AgentToolsAppId; Scope = 'McpServers.Mail.All'
+                          PatternBefore = '{"kind":"allAllowed"}'; PatternAfter = '{"kind":"enumerated","scopes":["McpServers.Calendar.All"]}' }
+                foreach ($k in $c.Keys) { $row[$k] = $c[$k] }
+                @(ConvertTo-McpPermissionUndoChanges @([pscustomobject]$row))[0] }
+            $items = @((& $mk @{}), (& $mk @{ Agent = 'app'; BlueprintObjectId = $script:p.objS; BlueprintAppId = $script:p.bpS }), (& $mk @{ Agent = 'other blueprint'; BlueprintAppId = $script:p.bpD }),
+                       (& $mk @{ Agent = 'not mcp'; ResourceAppId = '00000003-0000-0000-c000-000000000000' }), (& $mk @{ Agent = 'unpublished'; PatternAfter = '{"kind":"enumerated","scopes":["McpServers.Excel.All"]}' }))
+            $kept = @(Select-McpPermissionUndoChanges $items)
+            $kept.Count | Should -Be 1; $kept[0].Agent | Should -Be 'ok'
+            ($script:warned -join "`n") | Should -BeLike '*app*not the agent identity blueprint*other blueprint*not the agent identity blueprint*not mcp*not an MCP server*unpublished*does not publish*'
         }
         It 'takes the agents whose permission was removed for revoking straight after, once each' {
             Mock Get-AgentSessionTargets { @($Packages | ForEach-Object { [pscustomobject]@{ Agent = $_.displayName; AgentId = $_.id; Identities = @(); AgentUsers = @('u') } }) }

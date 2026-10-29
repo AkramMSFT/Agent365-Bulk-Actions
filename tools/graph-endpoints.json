@@ -12,6 +12,7 @@
   { "version": "v1.0", "path": "/oauth2PermissionGrants", "use": "Delegated permission grants, including MCP access; grant an MCP server" },
   { "version": "v1.0", "path": "/oauth2PermissionGrants/{id}", "use": "Remove or add an agent's MCP scope, or delete a grant left empty" },
   { "version": "v1.0", "path": "/applications(appId='{id}')", "use": "Find an agent blueprint's application" },
+  { "version": "v1.0", "path": "/applications/{id}/microsoft.graph.agentIdentityBlueprint/inheritablePermissions/{id}", "use": "Read a blueprint, and stop or resume passing an MCP scope to its agent identities" },
   { "version": "v1.0", "path": "/security/runHuntingQuery", "use": "Advanced Hunting: telemetry, detections, endpoint AI, MCP calls" },
   { "version": "v1.0", "path": "/security/alerts_v2", "use": "Defender XDR alerts about agents" },
   { "version": "v1.0", "path": "/security/auditLog/queries", "use": "Start a Purview audit search" },
