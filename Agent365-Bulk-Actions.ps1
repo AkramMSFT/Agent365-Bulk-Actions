@@ -549,6 +549,17 @@ function Set-SignInMethod {
     } catch { Write-Verbose $_.Exception.Message }
 }
 
+# Where a sign-in goes when no -TenantId was given. Entra refuses directory permissions at its common address (AADSTS70011), so it is the
+# tenant of the saved session, or any work account for a first or fresh sign-in.
+function Get-SignInTenant {
+    param([switch]$Fresh)
+    $tenant = ''
+    if (-not $Fresh -and (Test-Path -LiteralPath $script:SavedSignInPath)) {
+        try { $tenant = [string](Get-Content -Raw -LiteralPath $script:SavedSignInPath | ConvertFrom-Json).tenantId } catch { Write-Verbose $_.Exception.Message }
+    }
+    if ($tenant) { $tenant } else { 'organizations' }
+}
+
 # Sign in. The Microsoft sign-in window always comes first. Only when it cannot be shown (a remote shell, a server without a browser, a
 # window that fails to open) and a person is at the terminal, fall back to a device code: a code and a page address printed here, to be
 # entered on any device. A session made with a code can only be reused with a code, so an unattended or windowless run that finds one
@@ -557,6 +568,7 @@ function Set-SignInMethod {
 # instruction to sign in.
 function Connect-GraphSession {
     param([hashtable]$Connect, [switch]$DeviceCode, [switch]$Fresh)
+    if (-not $Connect.ContainsKey('TenantId')) { $Connect = $Connect + @{ TenantId = (Get-SignInTenant -Fresh:$Fresh) } }
     $person = Test-SignInPromptPossible
     $viaCode = {
         $c = $Connect.Clone(); $c['UseDeviceCode'] = $true

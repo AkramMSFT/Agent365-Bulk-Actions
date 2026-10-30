@@ -4803,6 +4803,35 @@ Describe 'Saved sign-in kept through a failed sign-in' {
         Invoke-KeepingSavedSignIn { Set-Content -LiteralPath $script:SavedSignInPath -Value '{"username":"new@contoso.com"}' -NoNewline }
         Get-Content -LiteralPath $script:SavedSignInPath -Raw | Should -Be '{"username":"new@contoso.com"}'
     }
+    Context 'where a sign-in goes' {
+        BeforeEach {
+            Mock Set-SignInMethod {}
+            Mock Connect-MgGraph { $script:signInTenant = $TenantId }
+            Set-Content -LiteralPath $script:SavedSignInPath -Value '{"tenantId":"66666666-6666-6666-6666-666666666666"}' -NoNewline
+        }
+        It 'goes to the tenant of the saved session, not to the common address Entra refuses directory permissions at' {
+            Connect-GraphSession -Connect @{ Scopes = @('Policy.Read.All') } -DeviceCode
+            $script:signInTenant | Should -Be '66666666-6666-6666-6666-666666666666'
+        }
+        It 'goes to any work account with no saved session, with an unreadable one, or when starting over' {
+            Connect-GraphSession -Connect @{ Scopes = @('Policy.Read.All') } -DeviceCode -Fresh
+            $script:signInTenant | Should -Be 'organizations'
+            Set-Content -LiteralPath $script:SavedSignInPath -Value 'not json'
+            Connect-GraphSession -Connect @{ Scopes = @('Policy.Read.All') } -DeviceCode
+            $script:signInTenant | Should -Be 'organizations'
+            Remove-Item -LiteralPath $script:SavedSignInPath
+            Connect-GraphSession -Connect @{ Scopes = @('Policy.Read.All') } -DeviceCode
+            $script:signInTenant | Should -Be 'organizations'
+        }
+        It 'keeps a tenant the caller chose, and leaves the settings it was given alone' {
+            $given = @{ Scopes = @('Policy.Read.All'); TenantId = '77777777-7777-7777-7777-777777777777' }
+            Connect-GraphSession -Connect $given -DeviceCode
+            $script:signInTenant | Should -Be '77777777-7777-7777-7777-777777777777'
+            $bare = @{ Scopes = @('Policy.Read.All') }
+            Connect-GraphSession -Connect $bare -DeviceCode
+            $bare.ContainsKey('TenantId') | Should -BeFalse
+        }
+    }
     It 'says an administrator must consent when a permission request fails' {
         Mock Get-MgContext { [pscustomobject]@{ Scopes = @('User.Read'); TenantId = '66666666-6666-6666-6666-666666666666' } }
         Mock Connect-GraphSession { throw 'Sign-in was cancelled before it finished.' }
