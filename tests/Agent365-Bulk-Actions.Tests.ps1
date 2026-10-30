@@ -2329,7 +2329,7 @@ Describe 'Conditional Access check for agents' {
         # Policies shaped like the ones the service returns.
         function New-RawCa {
             param([string]$Name = 'p', [string]$State = 'enabled', [string[]]$Include = @(), $Filter = $null, [string[]]$Exclude = @(), [string[]]$Risk = @(),
-                  [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Grant = @('block'), $Agents = $null, [switch]$NoClientApps)
+                  [string[]]$Resources = @('All'), [string[]]$Grant = @('block'), $Agents = $null, [switch]$NoClientApps)
             $ca = if ($NoClientApps) { $null } else { @{ includeServicePrincipals = @(); includeAgentIdServicePrincipals = $Include; excludeServicePrincipals = $Exclude } }
             if ($ca -and $Filter) { $ca['agentIdServicePrincipalFilter'] = $Filter }
             @{ id = "id-$Name"; displayName = $Name; state = $State
@@ -2342,8 +2342,8 @@ Describe 'Conditional Access check for agents' {
     It 'reads who a policy targets, what it protects and what it does' {
         $all = New-Ca (New-RawCa -Name 'Contoso' -Include @('All') -Risk @('high'))
         $all.TargetsAgentIdentities | Should -BeTrue; $all.AllAgents | Should -BeTrue
-        $all.RiskLevels | Should -Be @('high'); $all.ResourceScope | Should -Be 'Agent resources'; $all.Blocks | Should -BeTrue
-        (New-Ca (New-RawCa -Include @('a1', 'b2') -Resources @('All'))).ResourceScope | Should -Be 'All resources'
+        $all.RiskLevels | Should -Be @('high'); $all.ResourceScope | Should -Be 'All resources'; $all.Blocks | Should -BeTrue
+        (New-Ca (New-RawCa -Include @('a1', 'b2') -Resources @('AllAgentIdResources'))).ResourceScope | Should -Be 'Agents only'
         (New-Ca (New-RawCa -Include @('All') -Resources @('None'))).ResourceScope | Should -Be 'None'
         (New-Ca (New-RawCa -Include @('All') -Resources @('00000000-0000-0000-0000-0000000000a1'))).ResourceScope | Should -Be 'Specific resources'
         (New-Ca (New-RawCa -Include @('All') -Grant @('mfa'))).Blocks | Should -BeFalse
@@ -2363,14 +2363,14 @@ Describe 'Conditional Access check for agents' {
         (Test-AgentCaTarget (New-Ca (New-RawCa -Include @('All') -Filter @{ mode = 'exclude'; rule = 'r' })) $ids).Result | Should -Be 'Maybe'
         (Test-AgentCaTarget (New-Ca (New-RawCa -NoClientApps)) $ids).Result | Should -Be 'No'
     }
-    It 'says an agent is protected when an enforced policy blocks High agent risk, and whether it is blocked now' {
+    It 'says it would block when an enforced policy blocks High agent risk, and whether it is blocked now' {
         $pol = @(New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high')))
         $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
-        $c.Kind | Should -Be 'Protected'; $c.BlockedNow | Should -BeTrue; $c.Verdict | Should -BeLike '*Block high*Blocked now*'
+        $c.Kind | Should -Be 'Would block'; $c.BlockedNow | Should -BeTrue; $c.Verdict | Should -BeLike '*Block high*Blocked now*'
         $m = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'medium'
-        $m.Kind | Should -Be 'Protected'; $m.BlockedNow | Should -BeFalse; $m.Verdict | Should -BeLike '*risk is medium*no enforced policy covers*'
+        $m.Kind | Should -Be 'Would block'; $m.BlockedNow | Should -BeFalse; $m.Verdict | Should -BeLike '*risk is medium*no enforced policy covers*'
         $n = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
-        $n.Kind | Should -Be 'Protected'; $n.BlockedNow | Should -BeFalse; $n.Verdict | Should -BeLike '*Not blocked now: Entra has not flagged it*'
+        $n.Kind | Should -Be 'Would block'; $n.BlockedNow | Should -BeFalse; $n.Verdict | Should -BeLike '*Not blocked now: Entra has not flagged it*'
     }
     It 'blocks now at the current level when the policy covers medium and high' {
         $pol = @(New-Ca (New-RawCa -Name 'Medium and up' -Include @('All') -Risk @('medium', 'high')))
@@ -2391,14 +2391,23 @@ Describe 'Conditional Access check for agents' {
         $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
         $c.Kind | Should -Be 'Possible'; $c.Verdict | Should -BeLike '*attribute-based*By attribute*'
     }
-    It 'says unprotected when no enforced policy blocks the agent at High, whatever else exists' {
+    It 'does not count All agent resources as protection: it covers tokens requested for an agent, not what the agent calls' {
+        $pol = @(New-Ca (New-RawCa -Name 'Agents as targets' -Include @('All') -Risk @('high') -Resources @('AllAgentIdResources')))
+        $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
+        $c.Kind | Should -Be 'Wrong resources'; $c.BlockedNow | Should -BeFalse; $c.Verdict | Should -BeLike '*Agents as targets*only tokens requested for an agent*'
+        (Get-AgentCaCovering $c) | Should -Be 'Agents as targets'
+        (@(Get-AgentCaDetailRows ($c | Add-Member -NotePropertyName EntraRisk -NotePropertyValue 'x' -PassThru)) | Where-Object Item -eq 'Agents as targets').Info | Should -BeLike '*not counted as protection*'
+        $reporting = @(New-Ca (New-RawCa -Name 'Reporting' -State 'enabledForReportingButNotEnforced' -Include @('All') -Risk @('high') -Resources @('AllAgentIdResources')))
+        (Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $reporting -RiskLevel 'high').Kind | Should -Be 'Not covered'
+    }
+    It 'says not covered when no enforced policy blocks the agent at High, whatever else exists' {
         $pol = @(
             (New-Ca (New-RawCa -Name 'Other agents' -Include @('someone-else') -Risk @('high'))),
             (New-Ca (New-RawCa -Name 'Off' -State 'disabled' -Include @('All') -Risk @('high'))),
             (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))),
             (New-Ca (New-RawCa -Name 'Low only' -Include @('All') -Risk @('low'))))
         $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'high'
-        $c.Kind | Should -Be 'Unprotected'; $c.Verdict | Should -BeLike 'No enforced policy blocks it at High*'
+        $c.Kind | Should -Be 'Not covered'; $c.Verdict | Should -BeLike 'No enforced policy blocks it at High*'
         @($c.Policies | ForEach-Object { $_.Policy }) | Should -Be @('Off', 'Low only')
     }
     It 'lets an enforced policy win over a report-only one and over one with no effect' {
@@ -2407,7 +2416,7 @@ Describe 'Conditional Access check for agents' {
             (New-Ca (New-RawCa -Name 'Nothing' -Include @('All') -Risk @('high') -Resources @('None'))),
             (New-Ca (New-RawCa -Name 'Real' -Include @('All') -Risk @('high'))))
         $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies $pol -RiskLevel 'none'
-        $c.Kind | Should -Be 'Protected'; $c.Verdict | Should -BeLike '*Real*'; $c.Verdict | Should -Not -BeLike '*Nothing*'
+        $c.Kind | Should -Be 'Would block'; $c.Verdict | Should -BeLike '*Real*'; $c.Verdict | Should -Not -BeLike '*Nothing*'
     }
     It 'reads the policies page by page' {
         Mock Invoke-Graph {
@@ -2432,13 +2441,20 @@ Describe 'Conditional Access check for agents' {
         Get-EntraRiskyAgentIds | Should -Be @('a', 'c')
     }
     It 'builds a report for chosen agents and notes the ones with no Entra identity' {
-        Mock Get-AgentCaPolicies { @((New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))), (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))), (New-Ca (New-RawCa -Name 'Agent users' -Include @('All') -Agents @{ x = 1 } -NoClientApps))) }
+        Mock Get-AgentCaPolicies { @((New-Ca (New-RawCa -Name 'Block high' -Include @('All') -Risk @('high'))), (New-Ca (New-RawCa -Name 'Users only' -NoClientApps -Resources @('All'))), (New-Ca (New-RawCa -Name 'Agent users' -Agents @{ includeAgentUsers = @('All') } -NoClientApps))) }
+        Mock Invoke-Graph { @{ isEnabled = $false } }
+        Mock Get-AgentUserIdsByIdentity { @{} }
+        Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+        Mock Get-AgentTokensAfterRisk { @{} }
+        Mock Test-GraphScope { $false }
+        Mock Get-AgentCaWhatIf { @{ "i1|$($script:GraphAppId)|high" = [pscustomobject]@{ Enforced = @('Block high'); ReportOnly = @() } } }
         Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = 'i1'; Blueprint = ''; Principal = '' } } }
         Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = '' } } }
         $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Beta'; agentIdentityId = '' })
         $r = Get-AgentCaReport -Packages $pk
         $r.Rows.Count | Should -Be 1
-        $r.Rows[0].Agent | Should -Be 'Alpha'; $r.Rows[0].Kind | Should -Be 'Protected'; $r.Rows[0].EntraRisk | Should -Be 'high (confirmedCompromised)'; $r.Rows[0].BlockedNow | Should -BeTrue
+        $r.Rows[0].Agent | Should -Be 'Alpha'; $r.Rows[0].Kind | Should -Be 'Would block'; $r.Rows[0].Overall | Should -Be 'Would block'; $r.Rows[0].EntraRisk | Should -Be 'high (confirmedCompromised)'; $r.Rows[0].BlockedNow | Should -BeTrue
+        $r.Rows[0].AsItself | Should -Be 'Would block'; $r.Rows[0].OwnAccount | Should -Be 'none'; $r.Rows[0].ForUser | Should -Be 'Not covered'; $r.Rows[0].FlowsUsed | Should -Be 'None seen'
         $r.NoIdentity | Should -Be @('Beta')
         $r.PolicyCount | Should -Be 3; $r.AgentPolicies | Should -Be 1; $r.AgentUserPolicies | Should -Be 1
     }
@@ -2475,14 +2491,14 @@ Describe 'Conditional Access check for agents' {
             (Get-AgentCaCoverage -Agent 'D' -Ids @('d') -Policies @($open)))
         $g = @(Get-AgentCaGroups $rows)
         $g.Count | Should -Be 2
-        $g[0].Verdict | Should -Be 'Unprotected'; $g[0].Agents | Should -Be 1; $g[0].CoveredBy | Should -Be ''
-        $g[1].Verdict | Should -Be 'Protected'; $g[1].Agents | Should -Be 3; $g[1].BlockedNow | Should -Be 1; $g[1].CoveredBy | Should -Be 'Block high'
+        $g[0].Verdict | Should -Be 'Not covered'; $g[0].Agents | Should -Be 1; $g[0].CoveredBy | Should -Be ''
+        $g[1].Verdict | Should -Be 'Would block'; $g[1].Agents | Should -Be 3; $g[1].BlockedNow | Should -Be 1; $g[1].CoveredBy | Should -Be 'Block high'
     }
 }
 
 Describe 'Conditional Access check: tenant findings' {
     It 'lists enabled policies that protect no resources, and agents covered but not blocked now' {
-        function New-RawCa2 { param([string]$Name, [string]$State = 'enabled', [string[]]$Resources = @('AllAgentIdResources'), [string[]]$Risk = @('high'))
+        function New-RawCa2 { param([string]$Name, [string]$State = 'enabled', [string[]]$Resources = @('All'), [string[]]$Risk = @('high'))
             @{ id = "id-$Name"; displayName = $Name; state = $State
                conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('All'); excludeServicePrincipals = @() }; agents = $null; agentIdRiskLevels = $Risk
                                applications = @{ includeApplications = $Resources; applicationFilter = $null } }
@@ -2490,6 +2506,12 @@ Describe 'Conditional Access check: tenant findings' {
         Mock Get-AgentCaPolicies { @((ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Real')), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Nothing' -Resources @('None'))), (ConvertTo-AgentCaPolicy (New-RawCa2 -Name 'Off' -State 'disabled' -Resources @('None')))) }
         Mock Get-AgentIdentityIds { @{ 'i1' = [pscustomobject]@{ Identity = 'i1'; AppId = ''; Blueprint = ''; Principal = '' }; 'i2' = [pscustomobject]@{ Identity = 'i2'; AppId = ''; Blueprint = ''; Principal = '' } } }
         Mock Get-AgentRiskStates { @{ 'i1' = [pscustomobject]@{ Level = 'high'; State = 'atRisk'; Detail = '' }; 'i2' = $null } }
+        Mock Invoke-Graph { @{ isEnabled = $false } }
+        Mock Get-AgentUserIdsByIdentity { @{} }
+        Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+        Mock Get-AgentTokensAfterRisk { @{} }
+        Mock Test-GraphScope { $false }
+        Mock Get-AgentCaWhatIf { @{ "i1|$($script:GraphAppId)|high" = [pscustomobject]@{ Enforced = @('Real'); ReportOnly = @() }; "i2|$($script:GraphAppId)|high" = [pscustomobject]@{ Enforced = @('Real'); ReportOnly = @() } } }
         $pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Flagged'; agentIdentityId = 'i1' }, [pscustomobject]@{ id = 'T_2'; displayName = 'Quiet'; agentIdentityId = 'i2' })
         $r = Get-AgentCaReport -Packages $pk
         $r.NeverApply | Should -Be @('Nothing')
@@ -2498,6 +2520,366 @@ Describe 'Conditional Access check: tenant findings' {
         ($r.Rows | Where-Object Agent -eq 'Quiet').EntraRisk | Should -Be 'unknown'
     }
 }
+Describe 'Conditional Access evidence: what really stops an agent' {
+    BeforeAll {
+        function New-Pol {
+            param([string]$Name = 'p', [string]$State = 'enabled', [string[]]$Include = @(), [string[]]$Resources = @('All'), [string[]]$Risk = @('high'), [string[]]$Users = @('None'), $Agents = $null, $Context = $null, [string[]]$SessionRisk = @(), [string[]]$Grant = @('block'))
+            ConvertTo-AgentCaPolicy @{ id = "id-$Name"; displayName = $Name; state = $State; grantControls = @{ builtInControls = $Grant }
+                conditions = @{ clientApplications = $(if ($Include.Count) { @{ includeAgentIdServicePrincipals = $Include } } else { $null }); agents = $Agents; agentContext = $Context; agentSessionRiskLevels = $SessionRisk; agentIdRiskLevels = $Risk
+                                users = @{ includeUsers = $Users }; applications = @{ includeApplications = $Resources; excludeApplications = @() } } }
+        }
+        $script:G = '00000003-0000-0000-c000-000000000000'
+        $script:Cov = [pscustomobject]@{ Kind = 'Not covered'; Verdict = 'From settings.' }
+        function New-Seen { param([int]$Issued = 0, [int]$Denied = 0, [string[]]$Resources = @()) [pscustomobject]@{ Issued = $Issued; Denied = $Denied; Last = '2026-10-06T20:00:00Z'; LastDenied = $null; Resources = $Resources } }
+        function New-WhatIf { param([string[]]$Enforced = @(), [string[]]$ReportOnly = @()) [pscustomobject]@{ Enforced = $Enforced; ReportOnly = $ReportOnly } }
+    }
+    It 'reads the agent user, agent-assisted and named-user targets of a policy' {
+        $all = New-Pol -Agents @{ includeAgentUsers = @('All'); excludeAgentUsers = @('u9') }
+        $all.TargetsAgentUsers | Should -BeTrue; $all.AllAgentUsers | Should -BeTrue; $all.ExcludeAgentUsers | Should -Be @('u9'); $all.TargetsUsers | Should -BeFalse
+        (New-Pol -Users @('AllAgentIdUsers')).AllAgentUsers | Should -BeTrue
+        (New-Pol -Users @('AllAgentIdUsers')).TargetsUsers | Should -BeFalse
+        (New-Pol -Agents $null).TargetsAgentUsers | Should -BeFalse
+        $assisted = New-Pol -Users @('All') -Context @{ includeAgentContexts = @('allAgentAssistedFlows') } -SessionRisk @('High')
+        $assisted.AgentAssisted | Should -BeTrue; $assisted.TargetsUsers | Should -BeTrue; $assisted.SessionRiskLevels | Should -Be @('high')
+        (New-Pol -Users @('All', 'u1', 'GuestsOrExternalUsers')).NamedUsers | Should -Be @('u1')
+    }
+    It 'knows which agent user accounts a policy targets, and that naming one under Users does not count' {
+        (Test-AgentUserCaTarget (New-Pol -Agents @{ includeAgentUsers = @('All') }) 'u1') | Should -Be 'Yes'
+        (Test-AgentUserCaTarget (New-Pol -Agents @{ includeAgentUsers = @('U1') }) 'u1') | Should -Be 'Yes'
+        (Test-AgentUserCaTarget (New-Pol -Agents @{ includeAgentUsers = @('All'); excludeAgentUsers = @('u1') }) 'u1') | Should -Be 'No'
+        (Test-AgentUserCaTarget (New-Pol -Agents @{ agentFilter = @{ rule = 'r' } }) 'u1') | Should -Be 'Maybe'
+        (Test-AgentUserCaTarget (New-Pol -Users @('u1')) 'u1') | Should -Be 'No'
+        (Test-AgentUserCaTarget (New-Pol -Users @('All')) 'u1') | Should -Be 'No'
+    }
+    Context 'asking What If' {
+        It 'asks once per identity, resource and risk, and sends the agent as the subject' {
+            Mock Invoke-GraphBatch {
+                $script:sent = $Requests
+                @{ 'w0' = [pscustomobject]@{ Status = 200; Body = @{ value = @(
+                       @{ displayName = 'On'; state = 'enabled'; policyApplies = $true; grantControls = @{ builtInControls = @('block') } },
+                       @{ displayName = 'Watching'; state = 'enabledForReportingButNotEnforced'; policyApplies = $true; grantControls = @{ builtInControls = @('block') } },
+                       @{ displayName = 'Mfa'; state = 'enabled'; policyApplies = $true; grantControls = @{ builtInControls = @('mfa') } },
+                       @{ displayName = 'Elsewhere'; state = 'enabled'; policyApplies = $false; grantControls = @{ builtInControls = @('block') } }) } }
+                   'w1' = [pscustomobject]@{ Status = 400; Body = $null } }
+            }
+            $r = Get-AgentCaWhatIf -Asks @([pscustomobject]@{ Identity = 'i1'; Resource = 'r1'; Risk = 'high' }, [pscustomobject]@{ Identity = 'i1'; Resource = 'r1'; Risk = 'high' }, [pscustomobject]@{ Identity = 'i2'; Resource = 'r1'; Risk = 'none' })
+            $script:sent.Count | Should -Be 2
+            $script:sent[0].url | Should -Be '/identity/conditionalAccess/evaluate'; $script:sent[0].method | Should -Be 'POST'
+            $script:sent[0].body.signInIdentity.'@odata.type' | Should -Be '#microsoft.graph.agentSignIn'; $script:sent[0].body.signInIdentity.agentServicePrincipalId | Should -Be 'i1'
+            $script:sent[0].body.signInConditions.agentIdRiskLevel | Should -Be 'high'; $script:sent[1].body.signInConditions.ContainsKey('agentIdRiskLevel') | Should -BeFalse
+            $r['i1|r1|high'].Enforced | Should -Be @('On'); $r['i1|r1|high'].ReportOnly | Should -Be @('Watching')
+            $r.ContainsKey('i2|r1|none') | Should -BeTrue; $r['i2|r1|none'] | Should -BeNullOrEmpty
+        }
+        It 'asks nothing when there is nothing to ask' {
+            Mock Invoke-GraphBatch { throw 'not expected' }
+            (Get-AgentCaWhatIf -Asks @()).Count | Should -Be 0
+        }
+    }
+    It 'sets an agent apart for an enforced attribute rule, not for a report-only one' {
+        $rule = @{ agentIdServicePrincipalFilter = @{ mode = 'include'; rule = 'r' } }
+        $raw = { param($state) ConvertTo-AgentCaPolicy @{ id = 'x'; displayName = 'x'; state = $state; grantControls = @{ builtInControls = @('block') }; conditions = @{ clientApplications = $rule; users = @{ includeUsers = @('None') }; applications = @{ includeApplications = @('All') } } } }
+        (Get-CaPolicyPlace -Policy (& $raw 'enabled') -Ids @('a')) | Should -Be 'Maybe'
+        (Get-CaPolicyPlace -Policy (& $raw 'enabledForReportingButNotEnforced') -Ids @('a')) | Should -Be 'Rule'
+        (Get-CaPolicyPlace -Policy (New-Pol -Include @('a')) -Ids @('a')) | Should -Be 'Yes'
+    }
+    It 'plans fewer What If questions without sharing an answer that could differ' {
+        $agent = { param($i, $idle, $sig, $level = 'none') [pscustomobject]@{ Identity = $i; Idle = $idle; Signature = $sig; Resources = @('r1'); Level = $level } }
+        $p = New-CaWhatIfPlan -Agents @((& $agent 'a' $true 'Yes,No'), (& $agent 'b' $true 'Yes,No'), (& $agent 'c' $true 'Yes,Yes'), (& $agent 'd' $false 'Yes,No'), (& $agent 'e' $true 'Maybe,No'), (& $agent 'f' $true 'Maybe,No'), (& $agent 'g' $false 'Yes,No' 'medium'))
+        $p.SharedWith['b'] | Should -Be 'a'; $p.SharedWith.Count | Should -Be 1
+        @($p.Asks | ForEach-Object { $_.Identity }) | Should -Be @('a', 'c', 'd', 'e', 'f', 'g', 'g')
+        @($p.Asks | Where-Object Identity -eq 'g' | ForEach-Object { $_.Risk }) | Should -Be @('high', 'medium')
+    }
+    It 'tests the resources an agent really uses, always Microsoft Graph, never the exempt token exchange, and at most four' {
+        $none = @(Get-CaTestResources $null); $none.Count | Should -Be 1; $none[0].Id | Should -Be $script:G
+        $used = @(Get-CaTestResources (New-Seen -Resources @('8D2D3342-CF29-4959-9577-0E0EAFBD16BC|Bot Framework', 'fb60f99c-7a34-4190-8149-302f77469936|AAD Token Exchange Endpoint')))
+        @($used | ForEach-Object { $_.Name }) | Should -Be @('Microsoft Graph', 'Bot Framework'); $used[1].Id | Should -Be '8d2d3342-cf29-4959-9577-0e0eafbd16bc'
+        @(Get-CaTestResources (New-Seen -Resources @('a|A', 'b|B', 'c|C', 'd|D', 'e|E'))).Count | Should -Be 4
+    }
+    Context 'reading sign-ins' {
+        It 'groups what agents did per flow and never puts anything but a GUID into a query' {
+            Mock Invoke-HuntingQuery {
+                $script:kql += @($Query)
+                if ($Query -match 'EntraIdSpnSignInEvents') { return @(@{ App = 'a1'; Issued = 3; Denied = 2; Last = 'x'; LastDenied = 'y'; Resources = @('r|R') }) }
+                if ($Query -match 'mv-expand') { return @(@{ Flow = 'Obo'; Key = 'a1'; Policy = 'Mfa'; Result = 'success'; Events = 4 }) }
+                @(@{ Flow = 'Obo'; Key = 'a1'; Events = 4; Denied = 0; People = 2; Last = 'x'; LastDenied = $null; Resources = @() }, @{ Flow = 'AgentUser'; Key = 'u1'; Events = 7; Denied = 1; People = 1; Last = 'x'; LastDenied = 'y'; Resources = @() })
+            }
+            $script:kql = @()
+            $good = '11111111-1111-1111-1111-111111111111'
+            $s = Get-AgentCaSeen -AppIds @($good, 'evil") | take 1 //') -AgentUserIds @()
+            $s.AppOnly['a1'].Denied | Should -Be 2; $s.Obo['a1'].People | Should -Be 2; $s.AgentUser['u1'].Events | Should -Be 7; $s.Policies['Obo|a1'][0].Policy | Should -Be 'Mfa'
+            $script:kql.Count | Should -Be 3
+            ($script:kql -join ' ') | Should -Not -BeLike '*evil*'; $script:kql[0] | Should -BeLike "*$good*"; $script:kql[0] | Should -BeLike '*fb60f99c-7a34-4190-8149-302f77469936*'
+        }
+        It 'reads nothing when there is no id to read' {
+            Mock Invoke-HuntingQuery { throw 'not expected' }
+            (Get-AgentCaSeen -AppIds @() -AgentUserIds @()).AppOnly.Count | Should -Be 0
+        }
+        It 'counts tokens issued after the risk record last changed' {
+            Mock Invoke-HuntingQuery { $script:afterKql = $Query; @(@{ App = 'a1'; Issued = 5; Denied = 1; LastIssued = 'x' }) }
+            $good = '11111111-1111-1111-1111-111111111111'
+            $r = Get-AgentTokensAfterRisk -Flagged @([pscustomobject]@{ App = $good; Since = [datetime]::SpecifyKind([datetime]'2026-10-02 20:03:33', 'Utc') }, [pscustomobject]@{ App = 'nope'; Since = [datetime]'2026-10-02' })
+            $r['a1'].Issued | Should -Be 5
+            $script:afterKql | Should -BeLike "*`"$good`", datetime(2026-10-02T20:03:33Z)*"; $script:afterKql | Should -Not -BeLike '*nope*'
+            (Get-AgentTokensAfterRisk -Flagged @()).Count | Should -Be 0
+        }
+        It 'names the policy behind each denial from the sign-in log, for chosen agents or for all of them' {
+            Mock Get-GraphAll {
+                $script:logUri = $Uri; $script:logPrefer = $Headers.Prefer
+                @(@{ appId = 'A1'; appliedConditionalAccessPolicies = @(@{ displayName = 'Block'; result = 'failure' }, @{ displayName = 'Watch'; result = 'reportOnlyFailure' }, @{ displayName = 'Other'; result = 'notApplied' }) },
+                  @{ appId = 'a1'; appliedConditionalAccessPolicies = @(@{ displayName = 'Block'; result = 'failure' }) }, @{ appId = 'a2'; appliedConditionalAccessPolicies = @() })
+            }
+            $good = '11111111-1111-1111-1111-111111111111'
+            $l = Get-AgentSignInLog -AppIds @($good)
+            $l.Rows | Should -Be 3; $l.ByApp['a1'].DeniedBy['Block'] | Should -Be 2; $l.ByApp['a1'].WouldBlock['Watch'] | Should -Be 1; $l.ByApp.ContainsKey('a2') | Should -BeFalse
+            $script:logUri | Should -BeLike "*appId eq '$good'*"; $script:logPrefer | Should -Be 'include-unknown-enum-members'
+            $null = Get-AgentSignInLog -AppIds @(1..16 | ForEach-Object { '11111111-1111-1111-1111-1111111111{0:d2}' -f $_ })
+            $script:logUri | Should -BeLike "*agent/agentType eq 'agenticAppInstance'*"
+            (Get-AgentSignInLog -AppIds @($good) -Max 3).Capped | Should -BeTrue
+        }
+        It 'reads who changed a policy and its state before and after, and keeps only Conditional Access entries' {
+            $entry = @{ activityDateTime = '2026-10-05T13:57:46Z'; activityDisplayName = 'Update conditional access policy'; initiatedBy = @{ app = @{ displayName = 'Automation' }; user = $null }
+                        targetResources = @(@{ displayName = 'Block'; modifiedProperties = @(@{ oldValue = '{"state":"enabled"}'; newValue = '{"state":"disabled"}' }, @{ oldValue = 'not json'; newValue = $null }) }) }
+            $c = ConvertTo-CaPolicyChange $entry
+            $c.Policy | Should -Be 'Block'; $c.By | Should -Be 'Automation'; $c.ByApp | Should -BeTrue; $c.Old | Should -Be 'enabled'; $c.New | Should -Be 'disabled'
+            Mock Get-GraphAll { @(@{ activityDateTime = '2026-10-06T00:00:00Z'; activityDisplayName = 'Delete conditional access policy'; initiatedBy = @{ user = @{ userPrincipalName = 'a@b.c' } }; targetResources = @(@{ displayName = 'Later'; modifiedProperties = @() }) }, $entry, @{ activityDisplayName = 'Add named location' }) }
+            $all = @(Get-CaPolicyChanges)
+            @($all | ForEach-Object { $_.Policy }) | Should -Be @('Block', 'Later'); $all[1].By | Should -Be 'a@b.c'; $all[1].ByApp | Should -BeFalse
+        }
+    }
+    Context 'an agent acting as itself' {
+        BeforeAll {
+            function Get-Flow { param($Seen, [hashtable]$Answers, $Log) Get-AppOnlyCaFlow -Coverage $script:Cov -Identity 'i1' -Seen $Seen -Answers $Answers -Log $Log }
+        }
+        It 'would block only when What If finds an enforced block on every resource it uses' {
+            $seen = New-Seen -Issued 3 -Resources @('bot|Bot Framework')
+            $f = Get-Flow $seen @{ "i1|$script:G|high" = (New-WhatIf @('Block')); 'i1|bot|high' = (New-WhatIf @('Block')) }
+            $f.Grade | Should -Be 'Would block'; $f.Used | Should -BeTrue; $f.Text | Should -BeLike '*Microsoft Graph, Bot Framework*Block*3 token(s) issued*'
+            $partly = Get-Flow $seen @{ "i1|$script:G|high" = (New-WhatIf @('Block')); 'i1|bot|high' = (New-WhatIf) }
+            $partly.Grade | Should -Be 'Partly'; $partly.Text | Should -BeLike '*blocked for Microsoft Graph but not for Bot Framework*'
+        }
+        It 'says report-only or not covered when nothing enforced applies' {
+            (Get-Flow (New-Seen) @{ "i1|$script:G|high" = (New-WhatIf @() @('Watch')) }).Grade | Should -Be 'Report-only'
+            (Get-Flow (New-Seen) @{ "i1|$script:G|high" = (New-WhatIf) }).Grade | Should -Be 'Not covered'
+            (Get-Flow (New-Seen) @{ "i1|$script:G|high" = (New-WhatIf) }).Used | Should -BeFalse
+        }
+        It 'trusts What If over the settings, but keeps the explanation of a policy that cannot work' {
+            $settings = [pscustomobject]@{ Kind = 'Would block'; Verdict = 'x' }
+            (Get-AppOnlyCaFlow -Coverage $settings -Identity 'i1' -Seen (New-Seen) -Answers @{ "i1|$script:G|high" = (New-WhatIf) }).Grade | Should -Be 'Not covered'
+            $wrong = [pscustomobject]@{ Kind = 'Wrong resources'; Verdict = 'Only agents.' }
+            (Get-AppOnlyCaFlow -Coverage $wrong -Identity 'i1' -Seen (New-Seen) -Answers @{ "i1|$script:G|high" = (New-WhatIf) }).Grade | Should -Be 'Wrong resources'
+        }
+        It 'falls back on the settings, and says so, when What If gives no answer' {
+            $f = Get-Flow (New-Seen) @{}
+            $f.Grade | Should -Be 'Not covered'; $f.Text | Should -BeLike '*gave no answer*'
+        }
+        It 'is proven only by a denial from a policy that is still enforced' {
+            $what = @{ "i1|$script:G|high" = (New-WhatIf @('Block')) }
+            (Get-Flow (New-Seen -Denied 2) $what ([pscustomobject]@{ ByApp = @{ i1 = [pscustomobject]@{ DeniedBy = @{ Block = 2 }; WouldBlock = @{} } } })).Grade | Should -Be 'Proven'
+            (Get-Flow (New-Seen -Denied 2) $what ([pscustomobject]@{ ByApp = @{ i1 = [pscustomobject]@{ DeniedBy = @{ 'Since switched off' = 2 }; WouldBlock = @{} } } })).Grade | Should -Be 'Would block'
+            (Get-Flow (New-Seen -Denied 2) $what).Grade | Should -Be 'Would block'
+            (Get-Flow (New-Seen) @{ "i1|$script:G|high" = (New-WhatIf) } ([pscustomobject]@{ ByApp = @{ i1 = [pscustomobject]@{ DeniedBy = @{ Block = 2 }; WouldBlock = @{} } } })).Grade | Should -Be 'Not covered'
+        }
+        It 'reports what a report-only policy logged it would have blocked' {
+            $f = Get-Flow (New-Seen) @{ "i1|$script:G|high" = (New-WhatIf @() @('Watch')) } ([pscustomobject]@{ ByApp = @{ i1 = [pscustomobject]@{ DeniedBy = @{}; WouldBlock = @{ Watch = 9 } } } })
+            $f.Text | Should -BeLike '*logged they would have blocked it: Watch*'
+        }
+    }
+    Context 'an agent with its own user account' {
+        It 'has nothing to say without an account' {
+            $f = Get-AgentUserCaFlow -UserIds @() -Policies @() -Seen @{} -SeenPolicies @{}
+            $f.Used | Should -BeFalse; $f.Grade | Should -Be ''
+        }
+        It 'is not covered by policies on users or on its identity' {
+            $pol = @((New-Pol -Name 'All users' -Users @('All') -Risk @()), (New-Pol -Name 'Named' -Users @('u1') -Risk @()), (New-Pol -Name 'Identities' -Include @('All')))
+            $f = Get-AgentUserCaFlow -UserIds @('U1') -Policies $pol -Seen @{ u1 = [pscustomobject]@{ Events = 117; Denied = 0; Last = '2026-10-21T12:00:00Z' } } -SeenPolicies @{}
+            $f.Grade | Should -Be 'Not covered'; $f.Used | Should -BeTrue; $f.Text | Should -BeLike '*even All users*117 sign-in(s)*'
+        }
+        It 'would block, partly block, report or prove, by what targets agent users' {
+            $on = New-Pol -Name 'On' -Agents @{ includeAgentUsers = @('All') }
+            (Get-AgentUserCaFlow -UserIds @('u1') -Policies @($on) -Seen @{} -SeenPolicies @{}).Grade | Should -Be 'Would block'
+            (Get-AgentUserCaFlow -UserIds @('u1', 'u2') -Policies @((New-Pol -Name 'One' -Agents @{ includeAgentUsers = @('u1') })) -Seen @{} -SeenPolicies @{}).Grade | Should -Be 'Partly'
+            (Get-AgentUserCaFlow -UserIds @('u1') -Policies @((New-Pol -Name 'R' -State 'enabledForReportingButNotEnforced' -Agents @{ includeAgentUsers = @('All') })) -Seen @{} -SeenPolicies @{}).Grade | Should -Be 'Report-only'
+            (Get-AgentUserCaFlow -UserIds @('u1') -Policies @((New-Pol -Name 'Narrow' -Agents @{ includeAgentUsers = @('All') } -Resources @('AllAgentIdResources'))) -Seen @{} -SeenPolicies @{}).Grade | Should -Be 'Not covered'
+            (Get-AgentUserCaFlow -UserIds @('u1') -Policies @($on) -Seen @{} -SeenPolicies @{ 'AgentUser|u1' = @([pscustomobject]@{ Policy = 'On'; Result = 'failure'; Events = 1 }) }).Grade | Should -Be 'Proven'
+        }
+    }
+    Context 'an agent acting for a user' {
+        BeforeAll {
+            function Get-Obo { param([object[]]$Policies, [hashtable]$Obo = @{}, [hashtable]$Inbound = @{}, [hashtable]$Seen = @{}) Get-OboCaFlow -AgentApps @('A1', 'bp1') -Policies $Policies -Obo $Obo -Inbound $Inbound -SeenPolicies $Seen }
+        }
+        It 'never counts a policy on the agent identity, and says only user policies apply' {
+            $pol = @((New-Pol -Name 'Identities' -Include @('All') -Risk @()), (New-Pol -Name 'Mfa' -Users @('All') -Grant @('mfa') -Risk @()))
+            $f = Get-Obo $pol -Obo @{ a1 = [pscustomobject]@{ Events = 3; Denied = 0; People = 1; Last = '2026-10-16T13:00:00Z' } } -Seen @{ 'Obo|a1' = @([pscustomobject]@{ Policy = 'Mfa'; Result = 'success'; Events = 3 }) }
+            $f.Grade | Should -Be 'User policies only'; $f.Used | Should -BeTrue; $f.Text | Should -BeLike '*(Mfa)*does not stop it*3 sign-in(s)*'
+        }
+        It 'is not covered when no enforced policy applies to users' {
+            (Get-Obo @((New-Pol -Name 'Identities' -Include @('All')))).Grade | Should -Be 'Not covered'
+        }
+        It 'recognises a policy for agent-assisted flows, enforced or report-only' {
+            $ctx = @{ includeAgentContexts = @('allAgentAssistedFlows') }
+            $on = Get-Obo @((New-Pol -Name 'Assisted' -Users @('All') -Context $ctx -SessionRisk @('high') -Risk @()))
+            $on.Grade | Should -Be 'Would block'; $on.Text | Should -BeLike '*Assisted*session risk*'
+            (Get-Obo @((New-Pol -Name 'Assisted' -State 'enabledForReportingButNotEnforced' -Users @('All') -Context $ctx -Risk @()))).Grade | Should -Be 'Report-only'
+        }
+        It 'recognises a user policy that names the agent as the resource, and proves it by a real denial' {
+            $named = New-Pol -Name 'Cannot reach it' -Users @('All') -Resources @('a1') -Risk @()
+            (Get-Obo @($named)).Text | Should -BeLike '*blocked from reaching this agent by Cannot reach it*'
+            (Get-Obo @((New-Pol -Name 'Other agent' -Users @('All') -Resources @('zz') -Risk @()), (New-Pol -Name 'Mfa' -Users @('All') -Grant @('mfa') -Risk @()))).Grade | Should -Be 'User policies only'
+            (Get-Obo @($named) -Inbound @{ a1 = [pscustomobject]@{ Events = 2; Denied = 2; People = 1; Last = '2026-10-02T11:00:00Z' } } -Seen @{ 'Inbound|a1' = @([pscustomobject]@{ Policy = 'Cannot reach it'; Result = 'failure'; Events = 2 }) }).Grade | Should -Be 'Proven'
+            (Get-Obo @($named) -Seen @{ 'Inbound|a1' = @([pscustomobject]@{ Policy = 'Deleted since'; Result = 'failure'; Events = 2 }) }).Grade | Should -Be 'Would block'
+        }
+    }
+    It 'gives an agent the worst verdict of the flows it uses, or of acting as itself when it uses none' {
+        $self = [pscustomobject]@{ Flow = 'As itself'; Used = $false; Grade = 'Would block'; Text = 'a' }
+        $obo = [pscustomobject]@{ Flow = 'For a user'; Used = $true; Grade = 'User policies only'; Text = 'b' }
+        $own = [pscustomobject]@{ Flow = 'Own user account'; Used = $true; Grade = 'Not covered'; Text = 'c' }
+        (Get-AgentCaOverall @($self, $obo)).Grade | Should -Be 'User policies only'
+        (Get-AgentCaOverall @($self, $obo, $own)).Grade | Should -Be 'Not covered'
+        $idle = [pscustomobject]@{ Flow = 'For a user'; Used = $false; Grade = 'Not covered'; Text = 'd' }
+        (Get-AgentCaOverall @($self, $idle)).Grade | Should -Be 'Would block'
+    }
+    Context 'findings across the tenant' {
+        BeforeAll {
+            function Get-F { param([object[]]$Policies = @(), $Defaults = $false, [string[]]$Accounts = @(), [object[]]$Rows = @(), [object[]]$Changes = @(), [bool]$Audit = $true) @(Get-AgentCaFindings -Policies $Policies -SecurityDefaults $Defaults -AgentUserIds $Accounts -Rows $Rows -Changes $Changes -HasAuditLog $Audit) }
+            function Find-F { param([object[]]$F, [string]$Like) @($F | Where-Object { $_.Finding -like $Like }) }
+            $script:Good = New-Pol -Name 'Good' -Include @('All')
+        }
+        It 'says when security defaults switch Conditional Access off' {
+            (Find-F (Get-F @($script:Good) $true) '*Security defaults are on*')[0].Level | Should -Be 'Problem'
+            (Find-F (Get-F @($script:Good) $false) '*Security defaults*').Count | Should -Be 0
+        }
+        It 'says when nothing blocks agent identities on all resources, and which report-only policy is ready' {
+            $f = Get-F @((New-Pol -Name 'Ready' -State 'enabledForReportingButNotEnforced' -Include @('All')), (New-Pol -Name 'Excluded scope' -Include @('All') -Resources @('AllAgentIdResources')))
+            (Find-F $f '*No enforced policy blocks agent identities*ready to turn on: Ready*').Count | Should -Be 1
+            (Find-F (Get-F @($script:Good)) '*No enforced policy blocks agent identities*').Count | Should -Be 0
+        }
+        It 'counts an identity listed twice in the catalog once' {
+            $row = { param($a, $i) [pscustomobject]@{ Agent = $a; IdentityId = $i; Risk = 'high'; BlockedNow = $false; TokensAfterRisk = 3 } }
+            $f = Get-F @($script:Good) -Rows @((& $row 'One' 'i1'), (& $row 'One again' 'i1'), (& $row 'Two' 'i2'))
+            (Find-F $f '2 agent(s) at High risk are not blocked now*').Count | Should -Be 1
+            (Find-F $f '2 flagged agent(s) received tokens*').Count | Should -Be 1
+        }
+        It 'names policies that can never do what they look like, and ignores a user-action policy with no resources' {
+            $f = Get-F @($script:Good, (New-Pol -Name 'None set' -Include @('All') -Resources @('None')), (New-Pol -Name 'Agents only' -Include @('All') -Resources @('AllAgentIdResources')), (New-Pol -Name 'Register info' -Users @('All') -Resources @() -Risk @()))
+            (Find-F $f '*never applies: None set.*').Count | Should -Be 1
+            (Find-F $f '*All agent resources*Agents only*').Count | Should -Be 1
+        }
+        It 'finds a policy that names an agent user account under Users, and agent users nothing targets' {
+            $f = Get-F @($script:Good, (New-Pol -Name 'Misnamed' -Users @('U1') -Risk @())) -Accounts @('u1')
+            (Find-F $f '*under Users*Misnamed*').Count | Should -Be 1
+            (Find-F $f '1 agent user account(s) exist*').Count | Should -Be 1
+            (Find-F (Get-F @($script:Good, (New-Pol -Name 'Agent users' -Agents @{ includeAgentUsers = @('All') })) -Accounts @('u1')) '*agent user account(s) exist*').Count | Should -Be 0
+        }
+        It 'says when no policy covers agent-assisted flows' {
+            (Find-F (Get-F @($script:Good)) '*agent-assisted*').Count | Should -Be 1
+            (Find-F (Get-F @($script:Good, (New-Pol -Users @('All') -Context @{ includeAgentContexts = @('allAgentAssistedFlows') } -Risk @()))) '*agent-assisted*').Count | Should -Be 0
+        }
+        It 'warns when policies keep changing, and asks for the logs when it cannot tell' {
+            $ch = @([pscustomobject]@{ Old = 'enabled'; New = 'disabled'; ByApp = $true; By = 'Bot' }, [pscustomobject]@{ Old = 'disabled'; New = 'enabled'; ByApp = $false; By = 'a@b.c' })
+            (Find-F (Get-F @($script:Good) -Changes $ch) '*changed 2 time(s)*1 of them by applications (Bot), and 1 change(s) took a policy out of enforcement*').Count | Should -Be 1
+            (Find-F (Get-F @($script:Good) -Audit $false) '*Add the AuditLog.Read.All permission*').Count | Should -Be 1
+            (Find-F (Get-F @($script:Good)) '*Add the AuditLog.Read.All permission*').Count | Should -Be 0
+        }
+        It 'lists problems first' {
+            $f = Get-F @() $true
+            $f[0].Level | Should -Be 'Problem'; $f[-1].Level | Should -Be 'Note'
+        }
+    }
+    Context 'the whole report' {
+        BeforeAll {
+            $script:Pk = @([pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'I1' })
+            function Set-ReportMocks {
+                Mock Get-AgentCaPolicies { @((New-Pol -Name 'Block' -Include @('All') -Risk @('medium', 'high'))) }
+                Mock Get-AgentIdentityIds { @{ 'I1' = [pscustomobject]@{ Identity = 'I1'; AppId = 'A1'; Blueprint = 'BP1'; Principal = 'P1' } } }
+                Mock Get-AgentRiskStates { @{ 'I1' = [pscustomobject]@{ Level = 'medium'; State = 'atRisk'; Detail = ''; Modified = $null } } }
+                Mock Invoke-Graph { @{ isEnabled = $false } }
+                Mock Get-AgentUserIdsByIdentity { @{ 'i1' = @('u1') } }
+                Mock Get-AgentTokensAfterRisk { @{} }
+                Mock Test-GraphScope { $false }
+                Mock Get-AgentSignInLog { throw 'not expected' }
+                Mock Get-CaPolicyChanges { throw 'not expected' }
+            }
+        }
+        It 'decides blocked now from What If at the real risk level, on every resource' {
+            Set-ReportMocks
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{ a1 = (New-Seen -Issued 1 -Resources @('bot|Bot')) }; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf {
+                $script:asks = $Asks
+                @{ "i1|$script:G|high" = (New-WhatIf @('Block')); 'i1|bot|high' = (New-WhatIf @('Block')); "i1|$script:G|medium" = (New-WhatIf @('Block')); 'i1|bot|medium' = (New-WhatIf) }
+            }
+            $r = Get-AgentCaReport -Packages $script:Pk
+            @($script:asks).Count | Should -Be 4
+            $r.Rows[0].BlockedNow | Should -BeFalse; $r.Rows[0].BlockedNowText | Should -Be 'No'; $r.Rows[0].Overall | Should -Be 'Would block'; $r.Rows[0].FlowsUsed | Should -Be 'As itself'
+            $r.Rows[0].OwnAccount | Should -Be 'Not covered'
+            $r.HasAuditLog | Should -BeFalse
+            Should -Invoke Get-AgentCaSeen -ParameterFilter { $AppIds -contains 'a1' -and $AppIds -contains 'BP1' -and $AgentUserIds -contains 'u1' }
+        }
+        It 'keeps going and names what it could not read' {
+            Set-ReportMocks
+            Mock Get-AgentCaSeen { throw 'no hunting' }
+            Mock Get-AgentCaWhatIf { throw 'no what if' }
+            $r = Get-AgentCaReport -Packages $script:Pk
+            $r.Rows.Count | Should -Be 1; $r.Rows[0].Overall | Should -Be 'Would block'; $r.Rows[0].AsItself | Should -Be 'Would block'
+            $r.Rows[0].Flows[0].Text | Should -BeLike '*gave no answer*'
+            ($r.Gaps -join ' ') | Should -BeLike '*Agent sign-ins: no hunting*What If: no what if*'
+        }
+        It 'reads the sign-in and audit logs only when the permission is there' {
+            Set-ReportMocks
+            Mock Test-GraphScope { $Scope -eq 'AuditLog.Read.All' }
+            Mock Get-AgentSignInLog { [pscustomobject]@{ Rows = 1; Capped = $true; ByApp = @{ a1 = [pscustomobject]@{ DeniedBy = @{ Block = 1 }; WouldBlock = @{} } } } }
+            Mock Get-CaPolicyChanges { @([pscustomobject]@{ Old = 'enabled'; New = 'disabled'; ByApp = $false; By = 'x' }) }
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{ a1 = (New-Seen -Denied 1) }; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf { @{ "i1|$script:G|high" = (New-WhatIf @('Block')); "i1|$script:G|medium" = (New-WhatIf @('Block')) } }
+            $r = Get-AgentCaReport -Packages $script:Pk
+            $r.HasAuditLog | Should -BeTrue; $r.Rows[0].AsItself | Should -Be 'Proven'; $r.Rows[0].BlockedNow | Should -BeTrue
+            @($r.Changes).Count | Should -Be 1
+            ($r.Gaps -join ' ') | Should -BeLike '*only the most recent rows*'
+            Should -Invoke Get-AgentSignInLog -ParameterFilter { @($AppIds) -contains 'a1' }
+        }
+        It 'skips the slow sign-in log when no agent signed in as itself' {
+            Set-ReportMocks
+            Mock Test-GraphScope { $Scope -eq 'AuditLog.Read.All' }
+            Mock Get-CaPolicyChanges { @() }
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf { @{ "i1|$script:G|high" = (New-WhatIf @('Block')); "i1|$script:G|medium" = (New-WhatIf @('Block')) } }
+            $r = Get-AgentCaReport -Packages $script:Pk
+            Should -Invoke Get-AgentSignInLog -Times 0 -Exactly
+            $r.Rows[0].AsItself | Should -Be 'Would block'
+        }
+        It 'lets idle agents that every policy treats alike share a What If answer, and gives every other agent its own' {
+            Set-ReportMocks
+            Mock Get-AgentRiskStates { @{ 'I1' = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = ''; Modified = $null }; 'I2' = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = ''; Modified = $null }; 'I3' = [pscustomobject]@{ Level = 'none'; State = 'none'; Detail = ''; Modified = $null } } }
+            Mock Get-AgentIdentityIds { @{ 'I1' = [pscustomobject]@{ Identity = 'I1'; AppId = 'A1'; Blueprint = ''; Principal = '' }; 'I2' = [pscustomobject]@{ Identity = 'I2'; AppId = 'A2'; Blueprint = ''; Principal = '' }; 'I3' = [pscustomobject]@{ Identity = 'I3'; AppId = 'A3'; Blueprint = ''; Principal = '' } } }
+            Mock Get-AgentCaPolicies { @((New-Pol -Name 'Block' -Include @('All')), (New-Pol -Name 'Named' -Include @('i3') -State 'enabledForReportingButNotEnforced')) }
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf {
+                $script:asked = @($Asks | ForEach-Object { $_.Identity })
+                @{ "i1|$script:G|high" = (New-WhatIf @('Block')); "i3|$script:G|high" = (New-WhatIf @('Block') @('Named')) }
+            }
+            $pk = @('I1', 'I2', 'I3' | ForEach-Object { [pscustomobject]@{ id = "T_$_"; displayName = $_; agentIdentityId = $_ } })
+            $r = Get-AgentCaReport -Packages $pk
+            $script:asked | Should -Be @('i1', 'i3')
+            @($r.Rows | ForEach-Object { $_.AsItself }) | Should -Be @('Would block', 'Would block', 'Would block')
+            ($r.Rows | Where-Object Agent -eq 'I2').Flows[0].Text | Should -Not -BeLike '*gave no answer*'
+        }
+    }
+    It 'sorts the worst verdict first, then the highest risk, then agents seen signing in' {
+        $row = { param($a, $o, $r, $u = 'None seen') [pscustomobject]@{ Agent = $a; Overall = $o; Risk = $r; FlowsUsed = $u } }
+        @(Get-CaRowsWorstFirst @((& $row 'Quiet' 'Report-only' 'none'), (& $row 'Busy' 'Report-only' 'none' 'As itself'), (& $row 'Risky' 'Report-only' 'high'), (& $row 'Bad' 'Not covered' 'none'), (& $row 'Fine' 'Proven' 'high')) | ForEach-Object { $_.Agent }) | Should -Be @('Bad', 'Risky', 'Busy', 'Quiet', 'Fine')
+    }
+    It 'counts verdicts worst first' {
+        Format-CaVerdictCounts @([pscustomobject]@{ Overall = 'Proven' }, [pscustomobject]@{ Overall = 'Not covered' }, [pscustomobject]@{ Overall = 'Not covered' }) | Should -Be '2 not covered, 1 proven'
+    }
+    It 'follows pages up to a limit and passes headers on' {
+        Mock Invoke-Graph { @{ value = @(1, 2); '@odata.nextLink' = 'https://next' } }
+        @(Get-GraphAll -Uri 'https://first' -Max 3).Count | Should -Be 4
+        Should -Invoke Invoke-Graph -Times 2 -Exactly
+        Mock Invoke-Graph { $script:hdr = $Headers; @{ value = @(1) } }
+        @(Get-GraphAll -Uri 'https://first' -Headers @{ Prefer = 'x' }).Count | Should -Be 1
+        $script:hdr.Prefer | Should -Be 'x'
+    }
+}
+
 Describe 'Agent users' {
     BeforeAll {
         function New-LicenseDetail {
@@ -3101,9 +3483,9 @@ Describe 'MCP access' {
         }
         function Get-Row { param($Built, $Agent, $Key) @($Built.Rows | Where-Object { $_.Agent -eq $Agent -and $_.ServerKey -eq $Key })[0] }
         function New-RawMcpPolicy {
-            param([string]$Name, [string]$State = 'enabled', [string]$App = 'app-mail', [string[]]$Identities = @(), [string[]]$Users = @('None'), [string[]]$Risk = @())
+            param([string]$Name, [string]$State = 'enabled', [string]$App = 'app-mail', [string[]]$Identities = @(), [string[]]$Users = @('None'), [string[]]$AgentUsers = @(), [string[]]$Risk = @())
             @{ id = "id-$Name"; displayName = $Name; state = $State; grantControls = @{ builtInControls = @('block') }
-               conditions = @{ agentIdRiskLevels = $Risk; users = @{ includeUsers = $Users; excludeUsers = @() }; applications = @{ includeApplications = @($App); excludeApplications = @() }
+               conditions = @{ agentIdRiskLevels = $Risk; users = @{ includeUsers = $Users; excludeUsers = @() }; agents = $(if ($AgentUsers.Count) { @{ includeAgentUsers = $AgentUsers; excludeAgentUsers = @() } } else { $null }); applications = @{ includeApplications = @($App); excludeApplications = @() }
                                clientApplications = $(if ($Identities.Count) { @{ includeAgentIdServicePrincipals = $Identities } } else { $null }) } }
         }
         function New-McpItem { param([string]$Target = 'On', [string[]]$Users = @('u-a')) [pscustomobject]@{ Agent = 'Alpha'; AgentId = 'P_A'; IdentityId = 'id-a'; AgentUserIds = $Users; Server = 'Work IQ Mail MCP'; ResourceAppId = 'app-mail'; ResourceName = 'Work IQ Mail MCP'; Target = $Target } }
@@ -3180,8 +3562,8 @@ Describe 'MCP access' {
     }
     It 'reads whether Conditional Access blocks an agent from a server, for its identity and its agent user accounts' {
         $idOn = New-RawMcpPolicy -Name 'ids on' -Identities @('BPSP-A')
-        $usersReport = New-RawMcpPolicy -Name 'users report' -State 'enabledForReportingButNotEnforced' -Users @('u-a')
-        $usersOn = New-RawMcpPolicy -Name 'users on' -Users @('AllAgentIdUsers')
+        $usersReport = New-RawMcpPolicy -Name 'users report' -State 'enabledForReportingButNotEnforced' -AgentUsers @('u-a')
+        $usersOn = New-RawMcpPolicy -Name 'users on' -AgentUsers @('All')
         $state = { param($p, [string[]]$users = @('u-a')) Get-McpBlockState -Policies $p -AppId 'app-mail' -IdentityKeys @('id-a', 'bpsp-a') -AgentUserIds $users }
         $s = & $state @($idOn, $usersReport)
         $s.Kind | Should -Be 'Partly blocked'; $s.Identity | Should -Be 'On'; $s.Users | Should -Be 'Report-only'; $s.Policies.Count | Should -Be 2
@@ -3190,6 +3572,11 @@ Describe 'MCP access' {
         (& $state @($usersReport)).Kind | Should -Be 'Report-only'
         (& $state @((New-RawMcpPolicy -Name 'risk' -Identities @('id-a') -Risk @('high')), (New-RawMcpPolicy -Name 'other app' -App 'app-x' -Identities @('id-a')), (New-RawMcpPolicy -Name 'off' -State 'disabled' -Identities @('id-a')))).Kind | Should -Be ''
         (& $state @($idOn) @('u-a', 'u-b')).Kind | Should -Be 'Partly blocked'
+        (& $state @($idOn, (New-RawMcpPolicy -Name 'old token' -Users @('AllAgentIdUsers')))).Kind | Should -Be 'Blocked'
+    }
+    It 'does not treat a policy that names an agent user account under Users as a block: Entra does not apply those to agent users' {
+        $s = Get-McpBlockState -Policies @(New-RawMcpPolicy -Name 'named under users' -Users @('u-a')) -AppId 'app-mail' -IdentityKeys @('id-a') -AgentUserIds @('u-a')
+        $s.Kind | Should -Be ''; $s.Users | Should -Be ''
     }
     It 'builds the policy body for agent identities and for agent user accounts' {
         $i = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Identities -Ids @('id-a') -Mode 'Report-only'
@@ -3199,9 +3586,11 @@ Describe 'MCP access' {
         $i.grantControls.builtInControls | Should -Be @('block')
         $u = New-McpBlockPolicyBody -AppId 'app-mail' -ResourceName 'Work IQ Mail MCP' -Subject Users -Ids @('u-a') -Mode On
         $u.displayName | Should -Be 'Agent365 Bulk Actions: block MCP server Work IQ Mail MCP for agent user accounts'; $u.state | Should -Be 'enabled'
-        $u.conditions.Contains('clientApplications') | Should -BeFalse; $u.conditions.users.includeUsers | Should -Be @('u-a')
+        $u.conditions.Contains('clientApplications') | Should -BeFalse; $u.conditions.users.includeUsers | Should -Be @('None'); $u.conditions.agents.includeAgentUsers | Should -Be @('u-a')
+        (Get-McpBlockSubjectIds -Policy $u -Subject Users) | Should -Be @('u-a')
+        (Get-McpBlockSubjectIds -Policy (New-RawMcpPolicy -Name 'old' -Users @('u-old')) -Subject Users) | Should -Be @('u-old')
         (New-McpBlockPolicyBody -AppId 'a' -ResourceName 'n' -Subject Users -Ids @('u') -Mode On -ConditionsOnly).Keys | Should -Be @('conditions')
-        $raw = @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent user accounts') -Users @('u-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a')))
+        $raw = @((New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent identities') -Identities @('id-a')), (New-RawMcpPolicy -Name ($script:McpBlockPrefix + 'x for agent user accounts') -AgentUsers @('u-a')), (New-RawMcpPolicy -Name 'made by hand' -Identities @('id-a')))
         (Find-McpBlockPolicy -Policies $raw -AppId 'APP-MAIL' -Subject Identities -Mode On).displayName | Should -BeLike '*identities'
         (Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Users -Mode On).displayName | Should -BeLike '*user accounts'
         Find-McpBlockPolicy -Policies $raw -AppId 'app-mail' -Subject Identities -Mode 'Report-only' | Should -BeNullOrEmpty
@@ -3221,7 +3610,7 @@ Describe 'MCP access' {
             $r[0].Policies | Should -BeLike '*for agent identities*for agent user accounts*'
             @($script:writes | Where-Object Method -eq 'POST').Count | Should -Be 2
             ($script:writes | Where-Object { $_.Body.displayName -like '*identities' }).Body.conditions.clientApplications.includeAgentIdServicePrincipals | Should -Be @('id-a')
-            ($script:writes | Where-Object { $_.Body.displayName -like '*user accounts' }).Body.conditions.users.includeUsers | Should -Be @('u-a')
+            ($script:writes | Where-Object { $_.Body.displayName -like '*user accounts' }).Body.conditions.agents.includeAgentUsers | Should -Be @('u-a')
         }
         It 'moves an agent from report-only to on, keeping the other agents and deleting a policy left empty' {
             Mock Get-CaPoliciesRaw { @(
@@ -3913,7 +4302,7 @@ Describe 'Conditional Access check ignores MCP blocks' {
                   conditions = @{ clientApplications = @{ includeAgentIdServicePrincipals = @('agent-1') }; agentIdRiskLevels = @(); users = @{ includeUsers = @('None') }
                                   applications = @{ includeApplications = @('16b1878d-62c7-4009-aa25-68989d63bbad'); excludeApplications = @() } } }
         $c = Get-AgentCaCoverage -Agent 'A' -Ids @('agent-1') -Policies @(ConvertTo-AgentCaPolicy $raw) -RiskLevel 'high'
-        $c.Kind | Should -Be 'Unprotected'; $c.Policies[0].Partial | Should -BeTrue
+        $c.Kind | Should -Be 'Not covered'; $c.Policies[0].Partial | Should -BeTrue
         (@(Get-AgentCaDetailRows $c) | Where-Object Item -eq 'Block Mail MCP').Info | Should -BeLike '*specific resources*not counted as protection*'
     }
 }
@@ -4374,7 +4763,7 @@ Describe 'Pages read once and filter by the ticked agents' {
         @(Select-ChosenAgentRows -Rows $all.Rows).Count | Should -Be @($all.Rows).Count
         @(Select-ChosenAgentRows -Rows $all.Rows -OnlyIds @('P_A', 'P_C', 'T_B') | Where-Object { $_.Kind -ne 'Agent' }).Count | Should -Be 0
         $block = @{ id = 'p1'; displayName = 'Block mail'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }
-                    conditions = @{ agentIdRiskLevels = @(); users = @{ includeUsers = @('u-a'); excludeUsers = @() }; applications = @{ includeApplications = @('app-mail'); excludeApplications = @() }
+                    conditions = @{ agentIdRiskLevels = @(); users = @{ includeUsers = @('None'); excludeUsers = @() }; agents = @{ includeAgentUsers = @('u-a'); excludeAgentUsers = @() }; applications = @{ includeApplications = @('app-mail'); excludeApplications = @() }
                                     clientApplications = @{ includeAgentIdServicePrincipals = @('id-a') } } }
         $shown = @(Select-ChosenAgentRows -Rows $all.Rows -OnlyIds @('P_A'))
         foreach ($r in $all.Rows) { Set-McpBlockState -Row $r -Policies @($block) }
