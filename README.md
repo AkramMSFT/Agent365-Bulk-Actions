@@ -118,6 +118,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | `AgentIdentityBlueprint.ReadWrite.All` | Changing which MCP scopes a blueprint passes on to its agent identities (`-BlockMcp` and `-UnblockMcp` with `-Via Permission`, the console's **Remove permission...** and **Set servers...**, and undoing them). Needs the Agent ID Administrator role. Asked for only when a confirmed change needs it; not part of `-SignIn`. |
 | `DelegatedPermissionGrant.ReadWrite.All` | Removing, granting and allowing only chosen MCP servers in agents' delegated permission grants (`-BlockMcp` and `-UnblockMcp` with `-Via Permission`, the console's **Remove permission...** and **Set servers...**, and undoing them). Needs the Cloud Application Administrator, Application Administrator or Privileged Role Administrator role. The console asks for it only after you confirm such a change. It can grant any delegated permission, so the tool only ever adds or removes MCP scopes. |
 | `IdentityRiskyAgent.Read.All` | Reading an agent identity's Entra risk without changing it (`-CheckConditionalAccess`). `IdentityRiskyAgent.ReadWrite.All` also satisfies it. |
+| `AuditLog.Read.All` | Optional for `-CheckConditionalAccess`: which policy caused each denial of an agent, what report-only policies would have blocked, and when policies changed. Reading sign-in logs needs a role such as Reports Reader or Security Reader, and an administrator's consent. Without it nothing can be graded *Proven* for an agent acting as itself. The console has an **Add sign-in logs** button. |
 | `SecurityAlert.Read.All` | Reading DLP and Insider Risk alerts (`-AgentPolicyHits`). |
 | `User.RevokeSessions.All` | Ending the sessions of agents' user accounts (`-RevokeSessions`, the console's **Revoke sessions...**). Needs an Entra role that can manage those accounts. The console asks for it only when you use that action. |
 | `Group.Read.All` | Naming a group in `-AllowGroups`, a policy rule, or the console's group picker |
@@ -167,6 +168,8 @@ With your own app, `-SignIn` asks only for what the app was granted. A mode that
 | Graph beta `/security/rules/detectionRules` | Blocking a local AI agent on a device (a Defender custom detection rule that stops and quarantines its files) |
 | Graph beta `/identityProtection/riskyAgents` | Reading an agent identity's risk, confirming it compromised or dismissing the risk |
 | Graph beta `/identity/conditionalAccess/policies` | Reading Conditional Access policies; creating, updating and deleting this tool's MCP block policies |
+| Graph beta `/identity/conditionalAccess/evaluate` | Entra's What If evaluator: would a policy block this agent on this resource |
+| Graph beta `/auditLogs/signIns`, `v1.0` `/auditLogs/directoryAudits` | The policy behind each agent sign-in, and when Conditional Access policies changed |
 | Graph `v1.0` `/oauth2PermissionGrants` | Reading delegated permission grants; removing or adding an MCP scope (PATCH), deleting a grant left with nothing (DELETE) and granting an MCP server to an agent identity (POST) |
 | Graph `v1.0` `/users/{id}/revokeSignInSessions` | Ending the sessions of an agent's user accounts |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
@@ -455,25 +458,36 @@ In the console, select a tool on the Shadow AI page and press **Block on this de
 .\Agent365-Bulk-Actions.ps1 -CheckConditionalAccess -AllAgents -OutFile .\ca-all.csv     # every agent in the catalog, summarised by covering policy
 ```
 
-Read-only. For each agent it answers one question: would Microsoft Entra Conditional Access block this agent if its risk were High? Without `-ForAgent` or `-AllAgents` the tool checks the agents Defender flags as risky (last 30 days, optionally limited by `-MinSeverity`) together with the agents Entra ID Protection currently rates at risk or confirmed compromised.
+Read-only. A policy that names an agent does not by itself stop it: a policy reaches a token only if it targets that token's subject, and an agent can sign in three ways. For each agent the check shows what really stops it on each, from Entra's own What If evaluator for the resources the agent really calls and from its real sign-ins over the last 30 days. Without `-ForAgent` or `-AllAgents` it checks the agents Defender flags as risky (last 30 days, optionally limited by `-MinSeverity`) together with the agents Entra ID Protection currently rates at risk or confirmed compromised.
 
-**All agents.** `-AllAgents` checks every agent in the catalog (add `-AgentsOnly` for Copilot agents only). It first prints a *By coverage* table that counts agents with the same verdict and the same covering policies, then one line per agent, worst verdict first; the covering policy column appears only when agents differ. Agents with no Entra agent identity cannot be covered by Conditional Access for agents and are counted in one warning instead of one row each. `-OutFile` writes every agent with its verdict, `CoveredBy` and `PoliciesThatApply`.
+| How the agent signs in | Whose token | What can stop it |
+| --- | --- | --- |
+| **As itself** (app-only) | The agent identity | A policy on agent identities. Its target resources matter: *All agent resources* covers only tokens requested **for** an agent, not what the agent calls, such as Microsoft Graph, SharePoint or an MCP server. |
+| **For a user** (on-behalf-of) | The signed-in person | Policies on users. A policy on agent identities is never evaluated, and agent risk goes to the user, not the agent. A user policy can be narrowed to agent-assisted flows (Microsoft's template *Block assistive agent flows with high risk*, preview, Entra ID P2) or name the agent as the resource to stop people reaching it. To stop one agent, disable its identity or remove its permissions. |
+| **With its own user account** | The agent user account | Only a policy that targets agent users. *All users* does not include them, and neither does naming the account under Users or a policy on its agent identity. |
+
+An agent's verdict is the worst of the ways it really signed in over the last 30 days, or of acting as itself if it signed in none of them.
 
 | Verdict | Meaning |
 | --- | --- |
-| **Protected** | An enabled policy that blocks at High agent risk targets this agent identity and the resources it signs in to. The detail says whether it is blocked now. |
-| **Report-only** | Only a report-only policy targets it. Entra logs what it would have blocked and blocks nothing. |
-| **No effect** | An enabled policy targets the agent but protects no resources (its target resources are *None*), so it never applies. |
-| **Possible** | The policy selects agents by a custom security attribute rule. The rule is shown, not evaluated; check it in Entra. |
-| **Unprotected** | No enforced policy blocks the agent at High agent risk. A policy that only covers lower risk levels leaves it here. |
+| **Proven** | An enforced block applies, and real sign-ins show that same policy denying this agent. |
+| **Would block** | An enforced block applies, but no real sign-in has shown it yet. |
+| **User policies only** | It acts for users and only policies on those users apply. Nothing treats it as an agent. |
+| **Possible** | A policy selects agents by a custom security attribute rule, and What If gave no answer. |
+| **Report-only** | Only a report-only policy applies. Entra logs what it would have blocked and blocks nothing. |
+| **Partly** | Blocked for some of the resources it uses, or for some of its agent user accounts. |
+| **No effect** | An enabled policy targets it but protects no resources, so it never applies. |
+| **Wrong resources** | An enabled policy targets it but covers only *All agent resources*. |
+| **Not covered** | Nothing enforced blocks it at High risk. |
 
-- **Blocked now needs Entra to rate the agent.** Agent risk comes from Entra's own detections or from confirming the agent compromised. Defender alerts do not change it, so a Defender-risky agent that Entra has not flagged is *Protected* but *not blocked now*. Confirming it as compromised (see [Respond to a compromised agent](#respond-to-a-compromised-agent)) raises its risk to High, which the policy then enforces.
-- **Enabled does not mean effective.** An enabled policy whose target resources are *None* never applies; the tool lists these by name.
-- **Agents without an Entra agent identity** (for example declarative agents) cannot be covered by Conditional Access for agents and are listed separately.
+- **Blocked now** comes from What If at the agent's real risk level, on every resource it uses. Agent risk comes from Entra's own detections or from confirming the agent compromised; Defender alerts do not change it. See [Respond to a compromised agent](#respond-to-a-compromised-agent).
+- **Tokens after it was flagged.** The check counts tokens an agent received after Entra's risk record last changed. Some are expected: the policy was off, did not cover the resource, or the change had not taken effect yet.
+- **Across the tenant.** Findings cover security defaults (which switch Conditional Access off), agents at High risk that nothing blocks, policies that can never work, agent users and agent-assisted flows that nothing covers, and, with `AuditLog.Read.All`, how often policies changed and who changed them. A policy that is on now may not stay on.
+- **What no check can promise.** A policy change can take minutes to reach every sign-in, with mixed results meanwhile (up to 22 minutes in the tenant this was built against), and tokens already issued last until they expire. Conditional Access never applies to API keys, to the token exchange step, or to a blueprint creating identities. Agents with no Entra agent identity are listed separately. An agent that has not signed in has no evidence, whatever its verdict says.
+- **Limits of What If.** It evaluates an agent identity at a risk level. It has no input for agent session risk or for the agent behind a user's token, and it does not yet tell agent users apart, so those two flows are judged from the policy settings and from real sign-ins.
 - **MCP blocks are not protection.** A policy that names specific resources, such as one made by `-BlockMcp`, blocks the agent there only, so it is listed but not counted as protection at High risk.
-- **What is not evaluated.** Policies for the on-behalf-of flow (they target users), policies for agent user accounts, and attribute rules. Resources that accept an API key instead of a token are outside Conditional Access.
-- **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission) and `Application.Read.All`. The policy call is beta only. `-OutFile` writes agent, identity, Entra risk, verdict, detail and the policies that apply.
-- **In the console**, **Security > Conditional Access** shows the same result for the ticked agents, or every agent that has an Entra identity when none is ticked, with the policies behind the selected agent below. **Entra risk > Check Conditional Access...** opens it too.
+- **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission), `Application.Read.All`, `ThreatHunting.Read.All` and `User.Read.All`, and optionally `AuditLog.Read.All`. What it cannot read it names, and the verdicts fall back on the rest. The policy and What If calls are beta. `-OutFile` writes each agent with its verdict, a verdict per way of signing in, the tokens after it was flagged, the verdict from the settings alone and the policies that apply.
+- **In the console**, **Security > Conditional Access** shows the same result for the ticked agents, or every agent that has an Entra identity when none is ticked, with the findings across the tenant above and the evidence behind the selected agent below. **Entra risk > Check Conditional Access...** opens it too.
 
 ### Agent users and licenses
 
@@ -548,11 +562,11 @@ Agent 365's Tools registry (**Agents > Tools** in the Microsoft 365 admin center
 - **Not only agents.** Without `-ForAgent`, blueprints with no catalog entry and applications that are not agents (the Agent 365 CLI, for example) are listed with their kind when they hold MCP permissions.
 - **Blueprint entries.** A catalog entry that stands for a whole blueprint (an A365 SDK agent registered as a template) has no agent identity of its own. The tool counts the identities made from it under that entry and blocks through the blueprint, which covers all of them.
 
-**Blocking a server for chosen agents.** `-BlockMcp` puts the agents in a Conditional Access policy whose only resource is that server's Entra application, so Entra refuses them a token for it and nothing else changes. Entra does not accept agent identities and agent user accounts in one policy, so the tool keeps one policy for each per server and mode, named `Agent365 Bulk Actions: block MCP server <server> for agent identities` and `... for agent user accounts` (with `(report-only)` in report-only mode), and adds or removes agents in them. A policy left with nobody in it is deleted. Policies made by hand are read, never changed.
+**Blocking a server for chosen agents.** `-BlockMcp` puts the agents in a Conditional Access policy whose only resource is that server's Entra application, so Entra refuses them a token for it and nothing else changes. Entra does not accept agent identities and agent user accounts in one policy, and applies a policy to agent user accounts only when it targets them as agent users, so the tool keeps one policy for each per server and mode, named `Agent365 Bulk Actions: block MCP server <server> for agent identities` and `... for agent user accounts` (with `(report-only)` in report-only mode), and adds or removes agents in them. A policy left with nobody in it is deleted. Policies made by hand are read, never changed.
 
 - **Report-only first.** With `-ReportOnly` nothing is blocked; Entra's sign-in logs record what would have been. Running `-BlockMcp` again without it moves the agents to the enforced policy.
 - **The shared permission.** An agent that reaches a server only through a shared scope cannot be blocked from that server alone. Block *Agent Tools* (`-BlockMcp "Agent Tools"`), which stops every server the shared permission covers for that agent.
-- **What it does not cover.** An agent acting on behalf of a signed-in person (user policies apply there), Copilot Studio agents (they reach MCP servers through Power Platform connectors: use a Power Platform data policy, or remove the tool from the agent) and agents with no Entra agent identity. The block applies at the agent's next token request; a token already issued stays valid for up to an hour.
+- **What it does not cover.** An agent acting on behalf of a signed-in person (user policies apply there, so use `-Via Permission` to stop one agent reaching a server), Copilot Studio agents (they reach MCP servers through Power Platform connectors: use a Power Platform data policy, or remove the tool from the agent) and agents with no Entra agent identity. The block applies at the agent's next token request; a token already issued stays valid for up to an hour.
 - **Apply it at once.** Add `-RevokeSessions` to end the sessions of the blocked agents' user accounts straight after an enforced block; the console offers the same after **Block...**. See [Revoke an agent's sessions](#revoke-an-agents-sessions).
 - **Undo.** `-UnblockMcp` removes the block. `-Undo <log>` and **Undo last run** put each agent and server back the way it was: blocked, report-only or not blocked.
 - **Requirements.** To read: `DelegatedPermissionGrant.Read.All`, `Application.Read.All`, `Policy.Read.All`, `AgentIdentity.Read.All`, `User.Read.All`, `ThreatHunting.Read.All` and `CopilotPackages.Read.All`. To block: `Policy.ReadWrite.ConditionalAccess` and the Conditional Access Administrator role. All are part of `-SignIn`. Conditional Access for agents needs Microsoft 365 E7, or Agent 365 with at least Microsoft Entra ID P1. The policy calls are beta.
