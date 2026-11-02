@@ -102,7 +102,7 @@ pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf
 ```
 
-**To update,** download the ZIP again and replace the folder. Your sign-in is kept outside it, so you do not sign in again.
+**To update,** download the ZIP again and replace the folder. Your sign-in is kept outside it, so you do not sign in again. The tool tells you when your copy is not the latest: a line when it starts, and a **New version available** button in the console. To know, it asks GitHub at most once a day for the id of the script on `main`. That sends nothing about your tenant, nothing is downloaded or run, and with no answer it stays quiet. It does not ask from a git checkout or in an unattended run. Set the environment variable `A365_BULK_ACTIONS_NO_UPDATE_CHECK=1` to turn it off.
 
 **Signing in.** `-SignIn` starts the sign-in from the terminal and keeps the session for your Windows account. Microsoft Entra offers no way to type an administrator's password into a terminal (accounts with multi-factor authentication cannot use it, and this tool never handles a password), so the sign-in itself is completed in the Microsoft sign-in window that opens. After that, every mode, scheduled runs included, reuses the saved session silently until it expires or is revoked. The **Microsoft sign-in window always comes first**. Only when it cannot be shown (an SSH or Cloud Shell session, a Linux machine with no desktop, a window that fails to open) and you are at the terminal, the tool falls back to a **device code**: it prints a short code, you open https://microsoft.com/devicelogin on any device, enter the code and finish the sign-in. A code works for about two minutes, and the tool asks for a new one up to three times. `-DeviceCode` uses a code from the start. If you cancel the window, the tool says so and does not switch to a code on its own.
 
@@ -184,6 +184,7 @@ With your own app, `-SignIn` asks only for what the app was granted. A mode that
 | Graph `v1.0` `/oauth2PermissionGrants` | Reading delegated permission grants; removing or adding an MCP scope (PATCH), deleting a grant left with nothing (DELETE) and granting an MCP server to an agent identity (POST) |
 | Graph `v1.0` `/users/{id}/revokeSignInSessions` | Ending the sessions of an agent's user accounts |
 | Graph `/security/auditLog/queries` (Purview audit search) | AI activity |
+| GitHub `api.github.com` | Whether this copy is the latest version, at most once a day. Sends nothing about your tenant. See [Quick start](#quick-start) |
 
 On each run the tool ensures the `Microsoft.Graph.Authentication` module is present, signs in requesting only the permissions the chosen mode needs, reads the catalog, resolves your targets, applies the action and prints an `OK` or `FAIL` line per agent.
 

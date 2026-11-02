@@ -4787,6 +4787,89 @@ Describe 'Script hygiene' {
     }
 }
 
+Describe 'Telling people their copy is not the latest' {
+    BeforeEach {
+        $script:keepCheckFile = $script:UpdateCheckFile
+        $script:UpdateCheckFile = Join-Path $TestDrive 'update-check.json'
+        if (Test-Path -LiteralPath $script:UpdateCheckFile) { Remove-Item -LiteralPath $script:UpdateCheckFile }
+        $script:latestId = '1111111111111111111111111111111111111111'
+        Mock Invoke-RestMethod { @{ tree = @(@{ path = 'README.md'; sha = 'ffffffffffffffffffffffffffffffffffffffff' }, @{ path = 'Agent365-Bulk-Actions.ps1'; sha = $script:latestId }) } }
+        Mock Test-SignInPromptPossible { $true }
+    }
+    AfterEach { $script:UpdateCheckFile = $script:keepCheckFile; $env:A365_BULK_ACTIONS_NO_UPDATE_CHECK = $null }
+    BeforeAll {
+        function Set-LastCheck { param([double]$HoursAgo, [string]$Latest) @{ At = (Get-Date).ToUniversalTime().AddHours(-$HoursAgo).ToString('o'); Latest = $Latest } | ConvertTo-Json | Set-Content -LiteralPath $script:UpdateCheckFile }
+        function New-Copy { param([string]$Folder = 'copy') $d = Join-Path $TestDrive $Folder; $null = New-Item -ItemType Directory -Force -Path $d; $f = Join-Path $d 'Agent365-Bulk-Actions.ps1'; [IO.File]::WriteAllText($f, "hello`n"); $f }
+        $script:HelloId = 'ce013625030ba8dba906f756967f9e9ca394464a'
+    }
+    It 'names a file the way git does, whatever its line endings' {
+        Get-GitBlobId -Path (New-Copy) | Should -Be $script:HelloId
+        $crlf = Join-Path $TestDrive 'crlf.ps1'; [IO.File]::WriteAllText($crlf, "hello`r`n")
+        Get-GitBlobId -Path $crlf | Should -Be $script:HelloId
+        $bytes = Join-Path $TestDrive 'bytes.ps1'; [IO.File]::WriteAllBytes($bytes, [byte[]](0xE9, 0x0A))
+        Get-GitBlobId -Path $bytes | Should -Be (git hash-object --no-filters $bytes)
+    }
+    It 'asks GitHub only for this script, and at most once a day' {
+        Get-LatestBlobId | Should -Be $script:latestId
+        Get-LatestBlobId | Should -Be $script:latestId
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -eq $script:LatestTree -and $TimeoutSec -le 3 }
+        Set-LastCheck -HoursAgo 25 -Latest $script:latestId
+        $script:latestId = '2222222222222222222222222222222222222222'
+        Get-LatestBlobId | Should -Be '2222222222222222222222222222222222222222'
+    }
+    It 'tries again within the hour when GitHub gave no answer, and stays quiet meanwhile' {
+        Mock Invoke-RestMethod { throw 'no network' }
+        Get-LatestBlobId | Should -Be ''
+        Get-LatestBlobId | Should -Be ''
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+        Set-LastCheck -HoursAgo 2 -Latest ''
+        Get-LatestBlobId | Should -Be ''
+        Should -Invoke Invoke-RestMethod -Times 2 -Exactly
+    }
+    It 'keeps what it last heard when GitHub cannot be reached' {
+        Mock Invoke-RestMethod { throw 'no network' }
+        Set-LastCheck -HoursAgo 30 -Latest $script:latestId
+        Get-LatestBlobId | Should -Be $script:latestId
+    }
+    It 'accepts nothing that is not a git id, from GitHub or from its own file' {
+        $script:latestId = 'not an id'
+        Get-LatestBlobId | Should -Be ''
+        Set-Content -LiteralPath $script:UpdateCheckFile -Value 'not json'
+        $script:latestId = '3333333333333333333333333333333333333333'
+        Get-LatestBlobId | Should -Be '3333333333333333333333333333333333333333'
+        Set-LastCheck -HoursAgo 0.5 -Latest '../../evil'
+        Get-LatestBlobId | Should -Be ''
+    }
+    It 'says so only when this copy differs from the latest' {
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeTrue
+        Set-LastCheck -HoursAgo 1 -Latest $script:HelloId
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+    }
+    It 'stays quiet when GitHub gave no answer' {
+        Mock Invoke-RestMethod { throw 'no network' }
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+    }
+    It 'does not ask at all when turned off, in a git checkout, or with nobody watching' {
+        $env:A365_BULK_ACTIONS_NO_UPDATE_CHECK = '1'
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+        $env:A365_BULK_ACTIONS_NO_UPDATE_CHECK = $null
+        $checkout = New-Copy -Folder 'checkout'
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path (Split-Path -Parent $checkout) '.git')
+        Test-UpdateAvailable -ScriptPath $checkout | Should -BeFalse
+        Mock Test-SignInPromptPossible { $false }
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
+    }
+    It 'never stops the tool, even if something unexpected goes wrong' {
+        Mock Get-LatestBlobId { throw 'unexpected' }
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+        Test-UpdateAvailable -ScriptPath (Join-Path $TestDrive 'missing\Agent365-Bulk-Actions.ps1') | Should -BeFalse
+    }
+    It 'hides the console button until there is something to say' {
+        $GuiXaml | Should -Match 'x:Name="BtnNewVersion"[^>]*Visibility="Collapsed"'
+    }
+}
+
 Describe 'Saved sign-in kept through a failed sign-in' {
     BeforeEach {
         $script:keepPath = $script:SavedSignInPath

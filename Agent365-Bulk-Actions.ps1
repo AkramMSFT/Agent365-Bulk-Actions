@@ -664,6 +664,67 @@ if ($PSCmdlet.ParameterSetName -eq 'PolicyHits') { $scopes = @('CopilotPackages.
 if (-not $ClientId -and $env:A365_BULK_ACTIONS_CLIENT_ID) { $ClientId = $env:A365_BULK_ACTIONS_CLIENT_ID }
 if (-not $TenantId -and $env:A365_BULK_ACTIONS_TENANT_ID) { $TenantId = $env:A365_BULK_ACTIONS_TENANT_ID }
 $script:ClientId = $ClientId
+# ---------------------------------------------------------------------------------------------
+# Is this the latest version? People run a copy they downloaded, and nothing else tells them it has aged. GitHub is asked at most once a day
+# for the id of this script on main, and that is compared with this copy. It only ever leads to a notice: nothing is downloaded or run, and
+# nothing about the tenant is sent. No answer, for whatever reason, means no notice. A git checkout belongs to someone working on the tool, a
+# run nobody is watching has nobody to tell, and A365_BULK_ACTIONS_NO_UPDATE_CHECK=1 turns the check off.
+# ---------------------------------------------------------------------------------------------
+$script:LatestPage = 'https://github.com/AkramMSFT/Agent365-Bulk-Actions#quick-start'
+$script:LatestTree = 'https://api.github.com/repos/AkramMSFT/Agent365-Bulk-Actions/git/trees/main'
+$script:UpdateCheckFile = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME '.local/share' }) 'Agent365-Bulk-Actions/update-check.json'
+
+# The id git gives a file. Git uses SHA-1, and here the id is only compared, never trusted for anything. A checkout may hold CRLF line
+# endings where the repository holds LF, and Latin-1 keeps every other byte as it is.
+function Get-GitBlobId {
+    param([string]$Path)
+    $latin1 = [Text.Encoding]::GetEncoding(28591)
+    $body = $latin1.GetBytes($latin1.GetString([IO.File]::ReadAllBytes($Path)).Replace("`r`n", "`n"))
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try { $hash = $sha.ComputeHash([byte[]]($latin1.GetBytes("blob $($body.Length)`0") + $body)) } finally { $sha.Dispose() }
+    ([BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+# The id of this script on main: from the last answer when it is under a day old, or under an hour when GitHub gave none, otherwise from
+# GitHub. An answer that cannot be had keeps the last one known, so a copy kept offline still hears what was last heard.
+function Get-LatestBlobId {
+    param([string]$CacheFile = $script:UpdateCheckFile, [string]$FileName = 'Agent365-Bulk-Actions.ps1')
+    $idPattern = '^[0-9a-f]{40}$'
+    $known = ''
+    if (Test-Path -LiteralPath $CacheFile) {
+        try {
+            $cached = Get-Content -Raw -LiteralPath $CacheFile | ConvertFrom-Json
+            if ([string]$cached.Latest -match $idPattern) { $known = [string]$cached.Latest }
+            $hours = ((Get-Date).ToUniversalTime() - ([datetime]$cached.At).ToUniversalTime()).TotalHours
+            if ($hours -ge 0 -and $hours -lt $(if ($known) { 24 } else { 1 })) { return $known }
+        } catch { Write-Verbose $_.Exception.Message }
+    }
+    $latest = $known
+    try {
+        $tree = Invoke-RestMethod -Uri $script:LatestTree -TimeoutSec 3 -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Agent365-Bulk-Actions' }
+        $id = [string]@($tree.tree | Where-Object { $_.path -eq $FileName })[0].sha
+        if ($id -match $idPattern) { $latest = $id }
+    } catch { Write-Verbose $_.Exception.Message }
+    try {
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CacheFile)
+        @{ At = (Get-Date).ToUniversalTime().ToString('o'); Latest = $latest } | ConvertTo-Json | Set-Content -LiteralPath $CacheFile -Encoding utf8
+    } catch { Write-Verbose $_.Exception.Message }
+    $latest
+}
+
+function Test-UpdateAvailable {
+    param([string]$ScriptPath = $PSCommandPath)
+    try {
+        if ($env:A365_BULK_ACTIONS_NO_UPDATE_CHECK -or -not $ScriptPath -or -not (Test-SignInPromptPossible)) { return $false }
+        if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $ScriptPath) '.git')) { return $false }
+        $latest = Get-LatestBlobId
+        [bool]($latest -and $latest -ne (Get-GitBlobId -Path $ScriptPath))
+    } catch { Write-Verbose $_.Exception.Message; $false }
+}
+
+$script:UpdateAvailable = (-not $script:LoadOnly) -and (Test-UpdateAvailable)
+if ($script:UpdateAvailable) { Write-Host "This copy is not the latest version of the tool. Get the latest: $script:LatestPage" -ForegroundColor Yellow }
+
 if (-not $script:LoadOnly) {
     $connect = New-ConnectSettings -Scopes $scopes -Tenant $TenantId -Client $ClientId -SignIn:($PSCmdlet.ParameterSetName -eq 'SignIn')
     Connect-GraphSession -Connect $connect -DeviceCode:$DeviceCode -Fresh:($PSCmdlet.ParameterSetName -eq 'SignIn')
@@ -6701,6 +6762,7 @@ $GuiXaml = @'
           <TextBlock x:Name="Account" Foreground="{StaticResource Muted}" Margin="18,0,0,0" VerticalAlignment="Center"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+          <Button x:Name="BtnNewVersion" Content="New version available" Style="{StaticResource Btn}" Foreground="#B45309" Padding="12,6" Margin="0,0,14,0" Visibility="Collapsed" ToolTip="This copy is not the latest version of the tool. Opens the download page on GitHub."/>
           <TextBlock x:Name="ScopeText" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,14,0" ToolTip="The pages other than All agents cover the agents ticked there, or every agent when none is ticked."/>
           <Button x:Name="BtnRefresh" Content="Refresh catalog" Style="{StaticResource Btn}" Padding="12,6" ToolTip="Read the agent catalog again. Pages that have read data read it again when you next open them."/>
         </StackPanel>
@@ -10645,7 +10707,7 @@ function New-ConsoleWindow {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
-    foreach ($n in 'Account', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
+    foreach ($n in 'Account', 'BtnNewVersion', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
                    'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'ScopeText', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
@@ -11141,6 +11203,8 @@ function New-ConsoleWindow {
     # ---- wiring ----
 
     $script:ui.BtnRefresh.Add_Click({ & $script:ctx.Load })
+    if ($script:UpdateAvailable) { $script:ui.BtnNewVersion.Visibility = 'Visible' }
+    $script:ui.BtnNewVersion.Add_Click({ Start-Process $script:LatestPage })
     Register-TypingPause $script:ui.Search { if (-not $script:ctx.Resetting) { & $script:ctx.Refilter } }
     foreach ($b in 'FltAll', 'FltActive', 'FltBlocked') { $script:ui[$b].Add_Click({ & $script:ctx.Refilter }) }
     $script:ui.AgentsOnlyBox.Add_Click({ & $script:ctx.Refilter })
