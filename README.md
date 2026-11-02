@@ -62,7 +62,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Endpoint AI | Discover local AI agents and shadow AI on Defender-onboarded devices, with their telemetry and risk, and block one on a device | `-EndpointAi`, `-BlockLocalAgent`, `-UnblockLocalAgent` |
 | Containment | Verify the Entra identity is disabled with a block, preview who would lose an agent, list long-blocked agents | `-DisableIdentity`, `-Impact`, `-DeleteCandidates` |
 | Compromise response | Confirm an agent's Entra identity as compromised in Entra ID Protection, or dismiss the risk, and end the sessions of its user accounts | `-ConfirmCompromised`, `-DismissRisk`, `-RevokeSessions` |
-| Conditional Access | Check whether a Conditional Access policy blocks each risky agent, or every agent, at High agent risk, and which policies apply | `-CheckConditionalAccess` |
+| Conditional Access | See what really stops each agent, per way it signs in, from Entra's What If evaluator and its real sign-ins | `-CheckConditionalAccess` |
 | Policy | Declare rules once, review the plan, apply it | `-Policy`, `-Apply` |
 | Snapshots | Save the inventory and report what changed since an earlier one | `-Snapshot`, `-CompareTo` |
 | Console | A desktop app laid out like the Agent 365 portal: Home, All agents, Shadow AI, Tools, Users, and Security pages for alerts with response actions, built-in hunting queries, Purview audit, policy hits and Conditional Access | `-Gui` |
@@ -475,7 +475,7 @@ Read-only. A policy that names an agent does not by itself stop it: a policy rea
 | How the agent signs in | Whose token | What can stop it |
 | --- | --- | --- |
 | **As itself** (app-only) | The agent identity | A policy on agent identities. Its target resources matter: *All agent resources* covers only tokens requested **for** an agent, not what the agent calls, such as Microsoft Graph, SharePoint or an MCP server. |
-| **For a user** (on-behalf-of) | The signed-in person | Policies on users. A policy on agent identities is never evaluated, and agent risk goes to the user, not the agent. A user policy can be narrowed to agent-assisted flows (Microsoft's template *Block assistive agent flows with high risk*, preview, Entra ID P2) or name the agent as the resource to stop people reaching it. To stop one agent, disable its identity or remove its permissions. |
+| **For a user** (on-behalf-of) | The signed-in person | Policies on users. A policy on agent identities is never evaluated, and agent risk goes to the user, not the agent. A user policy can be narrowed to agent-assisted flows (Microsoft's template *Block assistive agent flows with high risk*, preview, Entra ID P2) or name the agent as the resource to stop people reaching it. An agent-assisted policy applies to all agents, not one: to stop one agent, disable its identity or remove its permissions. |
 | **With its own user account** | The agent user account | Only a policy that targets agent users. *All users* does not include them, and neither does naming the account under Users or a policy on its agent identity. |
 
 An agent's verdict is the worst of the ways it really signed in over the last 30 days, or of acting as itself if it signed in none of them.
@@ -495,10 +495,24 @@ An agent's verdict is the worst of the ways it really signed in over the last 30
 - **Blocked now** comes from What If at the agent's real risk level, on every resource it uses. Agent risk comes from Entra's own detections or from confirming the agent compromised; Defender alerts do not change it. See [Respond to a compromised agent](#respond-to-a-compromised-agent).
 - **Tokens after it was flagged.** The check counts tokens an agent received after Entra's risk record last changed. Some are expected: the policy was off, did not cover the resource, or the change had not taken effect yet.
 - **Across the tenant.** Findings cover security defaults (which switch Conditional Access off), agents at High risk that nothing blocks, policies that can never work, agent users and agent-assisted flows that nothing covers, and, with `AuditLog.Read.All`, how often policies changed and who changed them. A policy that is on now may not stay on.
-- **What no check can promise.** A policy change can take minutes to reach every sign-in, with mixed results meanwhile (up to 22 minutes in the tenant this was built against), and tokens already issued last until they expire. Conditional Access never applies to API keys, to the token exchange step, or to a blueprint creating identities. Agents with no Entra agent identity are listed separately. An agent that has not signed in has no evidence, whatever its verdict says.
+- **What no check can promise.** A new or removed policy can take more than 15 minutes to reach every sign-in, with mixed results meanwhile (see the measurements below), and tokens already issued last until they expire. Have a High risk block on before you need it. Conditional Access never applies to API keys, to the token exchange step, or to a blueprint creating identities. Agents with no Entra agent identity are listed separately. An agent that has not signed in has no evidence, whatever its verdict says.
 - **Limits of What If.** It evaluates an agent identity at a risk level. It has no input for agent session risk or for the agent behind a user's token, and it does not yet tell agent users apart, so those two flows are judged from the policy settings and from real sign-ins.
 - **MCP blocks are not protection.** A policy that names specific resources, such as one made by `-BlockMcp`, blocks the agent there only, so it is listed but not counted as protection at High risk.
 - **Requirements.** `Policy.Read.All`, `IdentityRiskyAgent.Read.All` (or the ReadWrite permission), `Application.Read.All`, `ThreatHunting.Read.All` and `User.Read.All`, and optionally `AuditLog.Read.All`. What it cannot read it names, and the verdicts fall back on the rest. The policy and What If calls are beta. `-OutFile` writes each agent with its verdict, a verdict per way of signing in, the tokens after it was flagged, the verdict from the settings alone and the policies that apply.
+- **Prove it live.** `tools/Test-ConditionalAccessLive.ps1` creates a throwaway agent, requests real tokens every way an agent can sign in, applies policies aimed only at it, and removes everything. It writes to the tenant, needs an administrator and takes over an hour, so read its help first.
+
+    One run in the tenant this was built against, trying every 20 seconds for 15 minutes per round. Your timings may differ.
+
+    | What changed | What it did | What it left alone |
+    | --- | --- | --- |
+    | New policy on the agent identity | Acting as itself: denied 2 of 8 tries in the first 3 minutes, rising to 7 of 8 after 12. Not settled at 15. | Its own account (40 of 40 issued) and OBO (39 of 39). |
+    | Policy naming the agent's user account under Users | Nothing. 40 of 40 issued. | |
+    | New policy targeting agent users | Its own account: denied from the first try, 40 of 40. | Acting as itself, and OBO. |
+    | Removing the policy on the agent identity | Some tokens were still denied 24 minutes later. | |
+    | New user policy naming the agent as the resource | People reaching the agent: about half denied throughout, 21 of 39. Not settled at 15. | An OBO token already held kept working. |
+    | New user policy for agent-assisted flows, on one resource | OBO to that resource: 24 of 41 denied, rising from 2 of 8 to about 6 of 8. Not settled at 15. | The person's own access to that resource (41 of 41 issued), and OBO elsewhere. |
+    | Confirming the agent compromised, under a policy already on | Acting as itself: every try denied after 3.6 minutes. | OBO (22 of 22 issued). Confirming an agent compromised does not stop it acting for a user. |
+
 - **In the console**, **Security > Conditional Access** shows the same result for the ticked agents, or every agent that has an Entra identity when none is ticked, with the findings across the tenant above and the evidence behind the selected agent below. **Entra risk > Check Conditional Access...** opens it too.
 
 ### Agent users and licenses

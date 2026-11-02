@@ -2625,7 +2625,7 @@ function Get-OboCaFlow {
     elseif ($reporting.Count) { $grade = 'Report-only'; $text = 'Not enforced. Only report-only for agent-assisted flows: {0}.' -f (& $names $reporting) }
     elseif (@($Policies | Where-Object { $_.TargetsUsers -and $_.State -eq 'enabled' }).Count) {
         $grade = 'User policies only'
-        $text = 'Only policies on the signed-in user apply{0}. No policy treats this as an agent, so a policy on its identity or its agent risk does not stop it. Blocking agent-assisted flows, naming it as a resource, disabling its identity or removing its permissions does.' -f $(if ($userPolicies.Count) { " ($($userPolicies -join '; '))" } else { '' })
+        $text = 'Only policies on the signed-in user apply{0}. No policy treats this as an agent, so a policy on its identity or its agent risk does not stop it. A policy for agent-assisted flows or one naming it as a resource can, and so can disabling its identity or removing its permissions.' -f $(if ($userPolicies.Count) { " ($($userPolicies -join '; '))" } else { '' })
     }
     else { $grade = 'Not covered'; $text = 'No enforced policy applies to users, so nothing is checked when this agent acts for one.' }
     [pscustomobject]@{ Flow = 'For a user'; Used = [bool]($events -or $denied); Grade = $grade; Text = ('{0} {1}' -f $text, (Format-CaSeen $events $denied $last 'sign-in(s)')) }
@@ -2674,7 +2674,7 @@ function Get-AgentCaFindings {
         $off = @($Changes | Where-Object { $_.Old -eq 'enabled' -and $_.New -ne 'enabled' })
         & $add 'Warning' ('Conditional Access policies changed {0} time(s) in {1} days, {2} of them by applications ({3}), and {4} change(s) took a policy out of enforcement. A policy that is on now may not stay on.' -f @($Changes).Count, $script:CaEvidenceDays, $byApps.Count, (@($byApps | ForEach-Object { $_.By } | Get-Distinct) -join '; '), $off.Count)
     }
-    & $add 'Note' 'A policy change can take several minutes to reach every sign-in, with mixed results meanwhile, and tokens already issued last until they expire. Conditional Access never applies to API keys, to the token exchange step, or to a blueprint creating identities.'
+    & $add 'Note' 'A new or removed policy can take more than 15 minutes to reach every sign-in, with mixed results meanwhile, so have a High risk block on before you need it: confirming an agent compromised under a policy already on took minutes. Tokens already issued last until they expire. Conditional Access never applies to API keys, to the token exchange step, or to a blueprint creating identities.'
     if (-not $HasAuditLog) { & $add 'Note' 'Add the AuditLog.Read.All permission to see which policy caused each denial, what report-only policies would have blocked, and when policies changed. Until then nothing can be graded Proven for an agent acting as itself.' }
     @($out | Sort-Object @{ e = { @{ Problem = 0; Warning = 1; Note = 2 }[$_.Level] } })
 }
