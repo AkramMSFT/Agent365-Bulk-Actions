@@ -2737,6 +2737,8 @@ Describe 'Conditional Access evidence: what really stops an agent' {
         (Get-AgentCaOverall @($self, $obo, $own)).Grade | Should -Be 'Not covered'
         $idle = [pscustomobject]@{ Flow = 'For a user'; Used = $false; Grade = 'Not covered'; Text = 'd' }
         (Get-AgentCaOverall @($self, $idle)).Grade | Should -Be 'Would block'
+        $quietAccount = [pscustomobject]@{ Flow = 'Own user account'; Used = $false; Grade = 'Not covered'; Text = 'e' }
+        (Get-AgentCaOverall @($self, $quietAccount) -Fallback 'Own user account').Grade | Should -Be 'Not covered'
     }
     Context 'findings across the tenant' {
         BeforeAll {
@@ -2861,6 +2863,92 @@ Describe 'Conditional Access evidence: what really stops an agent' {
             $script:asked | Should -Be @('i1', 'i3')
             @($r.Rows | ForEach-Object { $_.AsItself }) | Should -Be @('Would block', 'Would block', 'Would block')
             ($r.Rows | Where-Object Agent -eq 'I2').Flows[0].Text | Should -Not -BeLike '*gave no answer*'
+        }
+        It 'gives agents with their own user account a row when every agent is checked, and marks ways not seen' {
+            Set-ReportMocks
+            Mock Get-AgentUserIdsByIdentity { @{ 'i1' = @('u1'); 'i9' = @('u9') } }
+            Mock Get-AgentIdentityIds { $script:idsAsked = $IdentityIds; @{ 'I1' = [pscustomobject]@{ Identity = 'I1'; AppId = 'A1'; Blueprint = 'BP1'; Principal = 'P1'; Name = 'Alpha' }; 'i9' = [pscustomobject]@{ Identity = 'i9'; AppId = 'A9'; Blueprint = 'BP9'; Principal = ''; Name = 'Teammate' } } }
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf { @{} }
+            $r = Get-AgentCaReport -Packages $script:Pk -WithUnlistedAgentUsers
+            @($r.Rows).Count | Should -Be 2
+            $mate = $r.Rows | Where-Object Agent -eq 'Teammate'
+            $mate.AgentType | Should -Be 'Own user account'; $mate.Id | Should -Be ''
+            $mate.OwnAccountCell | Should -Be 'Not covered, not seen'; $mate.Overall | Should -Be 'Not covered'
+            $script:idsAsked | Should -Contain 'i9'
+            ($r.Rows | Where-Object Agent -eq 'Alpha').AgentType | Should -Be 'Custom'
+            @((Get-AgentCaReport -Packages $script:Pk).Rows).Count | Should -Be 1
+        }
+        It 'holds a Copilot Studio agent''s block to Teams' {
+            Set-ReportMocks
+            Mock Get-AgentRiskStates { @{ 'I1' = [pscustomobject]@{ Level = 'high'; State = 'confirmedCompromised'; Detail = ''; Modified = $null } } }
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf { @{ "i1|$script:G|high" = (New-WhatIf @('Block')) } }
+            $r = Get-AgentCaReport -Packages @([pscustomobject]@{ id = 'T_1'; displayName = 'Alpha'; agentIdentityId = 'I1'; platform = 'Copilot Studio' })
+            $r.Rows[0].AgentType | Should -Be 'Copilot Studio'
+            $r.Rows[0].AsItself | Should -Be 'Partly'; $r.Rows[0].AsItselfCell | Should -Be 'Partly, not seen'
+            $r.Rows[0].BlockedNowText | Should -Be 'Yes, in Teams only'; $r.Rows[0].Overall | Should -Be 'Partly'
+            (Get-AgentCaDetailRows $r.Rows[0] | Where-Object Item -eq 'Type').Info | Should -BeLike 'Copilot Studio.*only when it runs in Teams*'
+        }
+        It 'counts the catalog entries without an agent identity by kind' {
+            Set-ReportMocks
+            Mock Get-AgentCaSeen { [pscustomobject]@{ AppOnly = @{}; Obo = @{}; Inbound = @{}; AgentUser = @{}; Policies = @{} } }
+            Mock Get-AgentCaWhatIf { @{} }
+            $pk = @($script:Pk) + @([pscustomobject]@{ id = 'T_2'; displayName = 'Helper'; platform = 'Microsoft 365 Copilot Agent Builder' }, [pscustomobject]@{ id = 'T_3'; displayName = 'Mate'; elementTypes = @('AgenticUserTemplates') })
+            $r = Get-AgentCaReport -Packages $pk
+            $r.NoIdentityKinds['Declarative'] | Should -Be 1; $r.NoIdentityKinds['Agent user template'] | Should -Be 1
+            @($r.Findings | Where-Object { $_.Finding -like 'Catalog entries without an agent identity*1 declarative*1 agent user templates*' }).Count | Should -Be 1
+        }
+    }
+    Context 'the kind of agent' {
+        It 'reads the kind from the catalog entry' {
+            Get-AgentKind ([pscustomobject]@{ platform = 'Copilot Studio'; agentIdentityId = 'i' }) | Should -Be 'Copilot Studio'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Foundry'; agentIdentityId = 'i' }) | Should -Be 'Foundry'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Not Available'; agentIdentityId = 'i' }) | Should -Be 'Custom'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Not Available'; elementTypes = @('AgenticUserTemplates', 'Bots') }) | Should -Be 'Agent user template'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Microsoft 365 Copilot Agent Builder' }) | Should -Be 'Declarative'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Not Available'; elementTypes = @('DeclarativeCopilots') }) | Should -Be 'Declarative'
+            Get-AgentKind ([pscustomobject]@{ platform = 'Not Available'; elementTypes = @('Bots', 'ComposeExtensions') }) | Should -Be 'Other'
+        }
+        It 'holds a Copilot Studio block to Teams, and leaves other kinds as they are' {
+            $flow = [pscustomobject]@{ Flow = 'As itself'; Used = $true; Grade = 'Would block'; Text = 'What If: blocked.' }
+            $cs = Limit-AsItselfByKind -Flow $flow -Kind 'Copilot Studio'
+            $cs.Grade | Should -Be 'Partly'; $cs.Text | Should -BeLike 'Teams only:*What If: blocked.'; $cs.Used | Should -BeTrue
+            (Limit-AsItselfByKind -Flow ([pscustomobject]@{ Flow = 'As itself'; Used = $false; Grade = 'Report-only'; Text = 'x' }) -Kind 'Copilot Studio').Grade | Should -Be 'Report-only'
+            (Limit-AsItselfByKind -Flow $flow -Kind 'Foundry').Grade | Should -Be 'Would block'
+            (Limit-AsItselfByKind -Flow $flow -Kind 'Custom').Text | Should -Be 'What If: blocked.'
+        }
+        It 'counts an agent listed twice in the catalog once' {
+            $row = { param($a, $i, $o) [pscustomobject]@{ Agent = $a; IdentityId = $i; Overall = $o } }
+            $rows = @((& $row 'One' 'i1' 'Partly'), (& $row 'One again' 'I1' 'Partly'), (& $row 'Two' 'i2' 'Would block'))
+            @(Get-CaDistinctRows $rows).Count | Should -Be 2
+            Format-CaAgentCount $rows | Should -Be '2 agent(s) in 3 catalog entries'
+            Format-CaAgentCount @($rows[0], $rows[2]) | Should -Be '2 agent(s)'
+            Format-CaVerdictCounts $rows | Should -Be '1 partly, 1 would block'
+        }
+        It 'says a user-risk policy is what responds when an agent acts for a person, and promises nothing untested' {
+            $risk = { param($name, $users) ConvertTo-AgentCaPolicy @{ id = $name; displayName = $name; state = 'enabled'; grantControls = @{ builtInControls = @('mfa') }
+                        conditions = @{ users = @{ includeUsers = $users }; userRiskLevels = @('high'); applications = @{ includeApplications = @('All') } } } }
+            $mfa = New-Pol -Name 'Mfa' -Users @('All') -Grant @('mfa') -Risk @()
+            $all = Get-OboCaFlow -AgentApps @('a1') -Policies @($mfa, (& $risk 'Risky users' @('All'))) -Obo @{} -Inbound @{} -SeenPolicies @{}
+            $all.Grade | Should -Be 'User policies only'
+            $all.Text | Should -BeLike '*against the person, and a user-risk policy responds: Risky users.*'
+            $all.Text | Should -BeLike '*should stop it too, but that has not been tested*'
+            (Get-OboCaFlow -AgentApps @('a1') -Policies @($mfa, (& $risk 'Partners' @('u7'))) -Obo @{} -Inbound @{} -SeenPolicies @{}).Text | Should -BeLike '*covers only some users: Partners.*'
+            (Get-OboCaFlow -AgentApps @('a1') -Policies @($mfa) -Obo @{} -Inbound @{} -SeenPolicies @{}).Text | Should -BeLike '*no user-risk policy is enforced*'
+        }
+        It 'finds what the kind of agent and user risk leave open' {
+            $good = New-Pol -Name 'Good' -Include @('All')
+            $rows = @([pscustomobject]@{ Agent = 'S1'; IdentityId = 's1'; AgentType = 'Copilot Studio' }, [pscustomobject]@{ Agent = 'S1 again'; IdentityId = 's1'; AgentType = 'Copilot Studio' }, [pscustomobject]@{ Agent = 'F1'; IdentityId = 'f1'; AgentType = 'Foundry' })
+            $f = @(Get-AgentCaFindings -Policies @($good) -SecurityDefaults $false -AgentUserIds @() -Rows $rows -Changes @() -HasAuditLog $true -NoIdentityKinds @{ Declarative = 12; 'Agent user template' = 3 })
+            @($f | Where-Object { $_.Finding -like 'No enforced user-risk policy covers all users.*' }).Count | Should -Be 1
+            @($f | Where-Object { $_.Finding -like '1 Copilot Studio agent(s): *only when they run in Teams*' }).Count | Should -Be 1
+            @($f | Where-Object { $_.Finding -like '1 Foundry agent(s): *API key*' }).Count | Should -Be 1
+            @($f | Where-Object { $_.Finding -like 'Catalog entries without an agent identity*12 declarative*; 3 agent user templates*' }).Count | Should -Be 1
+            $narrow = ConvertTo-AgentCaPolicy @{ id = 'n'; displayName = 'Partners'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }; conditions = @{ users = @{ includeUsers = @('u7') }; userRiskLevels = @('high'); applications = @{ includeApplications = @('All') } } }
+            @(Get-AgentCaFindings -Policies @($good, $narrow) -SecurityDefaults $false -AgentUserIds @() -Rows @() -Changes @() -HasAuditLog $true | Where-Object { $_.Finding -like '*(only some users: Partners)*' }).Count | Should -Be 1
+            $risky = ConvertTo-AgentCaPolicy @{ id = 'r'; displayName = 'Risky users'; state = 'enabled'; grantControls = @{ builtInControls = @('block') }; conditions = @{ users = @{ includeUsers = @('All') }; userRiskLevels = @('high'); applications = @{ includeApplications = @('All') } } }
+            @(Get-AgentCaFindings -Policies @($good, $risky) -SecurityDefaults $false -AgentUserIds @() -Rows @() -Changes @() -HasAuditLog $true | Where-Object { $_.Finding -like '*user-risk*' }).Count | Should -Be 0
         }
     }
     It 'sorts the worst verdict first, then the highest risk, then agents seen signing in' {
@@ -3308,6 +3396,16 @@ Describe 'Purview policy hits' {
         @(Select-PolicyHitRows -Rows $rows -Days 30 -Text 'CARDS').Count | Should -Be 2
         @(Select-PolicyHitRows -Rows $rows -Days 30 -Text '[(*').Count | Should -Be 0
         $rows[0].Hits | Should -Be 5
+    }
+    It 'lists the hits that name only a person when none in the period is tied to an agent' {
+        $loose = @((New-PhRow -Agent '' -AgentId '' -Policy 'Generic' -N30 9), (New-PhRow -Agent '' -AgentId '' -Policy 'Other' -N7 1 -N30 2))
+        $v = Select-PolicyHitView -Rows $loose -Days 30
+        $v.Fallback | Should -BeTrue; @($v.Rows).Count | Should -Be 2
+        $mixed = @($loose) + @(New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N30 1)
+        $t = Select-PolicyHitView -Rows $mixed -Days 30
+        $t.Fallback | Should -BeFalse; @($t.Rows).Count | Should -Be 1; $t.Rows[0].Agent | Should -Be 'Alpha'
+        @((Select-PolicyHitView -Rows $mixed -Days 30 -All).Rows).Count | Should -Be 3
+        (Select-PolicyHitView -Rows @() -Days 30).Fallback | Should -BeFalse
     }
     It 'totals hits by source and counts those that name only a person, then lists each agent' {
         $rows = @((New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Policy 'Cards' -N30 5), (New-PhRow -Agent 'Alpha' -AgentId 'T_A' -Source 'DLP alert' -Policy 'Cards alert' -N30 4),
