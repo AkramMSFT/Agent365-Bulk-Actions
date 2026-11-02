@@ -40,6 +40,10 @@
   { "version": "beta", "path": "/identityProtection/riskyAgents/dismiss", "use": "Dismiss an agent identity's risk" },
   { "version": "beta", "path": "/identity/conditionalAccess/policies", "use": "Read Conditional Access; create MCP block policies" },
   { "version": "beta", "path": "/identity/conditionalAccess/policies/{id}", "use": "Update or delete MCP block policies" },
+  { "version": "beta", "path": "/identity/conditionalAccess/evaluate", "use": "What If: would a policy block this agent on this resource" },
+  { "version": "beta", "path": "/auditLogs/signIns", "use": "The policy behind each agent sign-in" },
+  { "version": "v1.0", "path": "/auditLogs/directoryAudits", "use": "When Conditional Access policies changed, and who changed them" },
+  { "version": "v1.0", "path": "/policies/identitySecurityDefaultsEnforcementPolicy", "use": "Whether security defaults switch Conditional Access off" },
   { "version": "beta", "path": "/security/rules/detectionRules", "use": "List and create local AI agent blocks" },
   { "version": "beta", "path": "/security/rules/detectionRules/{id}", "use": "Update or delete a local AI agent block" }
 ]

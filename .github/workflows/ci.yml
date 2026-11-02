@@ -40,7 +40,7 @@ jobs:
       - name: Lint
         shell: pwsh
         run: |
-          $findings = './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1' | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }
+          $findings = './Agent365-Bulk-Actions.ps1', './tools/Watch-GraphApi.ps1', './tools/Test-ConditionalAccessLive.ps1' | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Settings ./PSScriptAnalyzerSettings.psd1 }
           $findings | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap
           if ($findings) { exit 1 }
 
