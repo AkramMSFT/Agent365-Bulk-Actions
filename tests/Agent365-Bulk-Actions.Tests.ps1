@@ -4808,6 +4808,7 @@ Describe 'Starting from a download' -Skip:(-not $IsWindows) {
             param([string]$Folder, [string]$SearchPath)
             $start = [Diagnostics.ProcessStartInfo]::new($env:ComSpec, '/d /c ""' + (Join-Path $Folder 'Start-Console.cmd') + '""')
             $start.UseShellExecute = $false; $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true
+            [void]$start.Environment.Remove('PSExecutionPolicyPreference')
             if ($SearchPath) { $start.Environment['PATH'] = $SearchPath }
             $run = [Diagnostics.Process]::Start($start)
             $run.StandardInput.Close()
