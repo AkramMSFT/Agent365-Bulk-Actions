@@ -4787,6 +4787,69 @@ Describe 'Script hygiene' {
     }
 }
 
+Describe 'Starting from a download' -Skip:(-not $IsWindows) {
+    BeforeAll {
+        $script:LauncherFile = Join-Path $PSScriptRoot '..\Start-Console.cmd'
+        $script:LauncherText = [IO.File]::ReadAllText($script:LauncherFile)
+        function Set-FromInternet { param([string]$Path) Set-Content -LiteralPath $Path -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" }
+        function Test-FromInternet { param([string]$Path) [bool](Get-Item -LiteralPath $Path -Stream * | Where-Object Stream -EQ 'Zone.Identifier') }
+        # A folder as a browser and Explorer leave it, with a stand-in for the tool that notes what it was started with.
+        function New-Download {
+            param([string]$Name, [switch]$NoTool)
+            $folder = Join-Path $TestDrive $Name
+            New-Item -ItemType Directory -Path (Join-Path $folder 'tools') -Force | Out-Null
+            Copy-Item -LiteralPath $script:LauncherFile -Destination (Join-Path $folder 'Start-Console.cmd')
+            Set-Content -LiteralPath (Join-Path $folder 'tools\other.ps1') -Value '# other'
+            if (-not $NoTool) { Set-Content -LiteralPath (Join-Path $folder 'Agent365-Bulk-Actions.ps1') -Value 'Set-Content -LiteralPath (Join-Path $PSScriptRoot ''ran.txt'') -Value ($args -join '' '')' }
+            Get-ChildItem -LiteralPath $folder -Recurse -File | ForEach-Object { Set-FromInternet $_.FullName }
+            $folder
+        }
+        function Invoke-Launcher {
+            param([string]$Folder, [string]$SearchPath)
+            $start = [Diagnostics.ProcessStartInfo]::new($env:ComSpec, '/d /c ""' + (Join-Path $Folder 'Start-Console.cmd') + '""')
+            $start.UseShellExecute = $false; $start.RedirectStandardInput = $true; $start.RedirectStandardOutput = $true
+            if ($SearchPath) { $start.Environment['PATH'] = $SearchPath }
+            $run = [Diagnostics.Process]::Start($start)
+            $run.StandardInput.Close()
+            $output = $run.StandardOutput.ReadToEnd()
+            $run.WaitForExit()
+            [pscustomobject]@{ Output = $output; Exit = $run.ExitCode }
+        }
+    }
+    It 'unblocks the folder and starts the console, in a folder with spaces, brackets and an ampersand' {
+        $folder = New-Download 'Agent365 Bulk (1) & main'
+        $null = Invoke-Launcher -Folder $folder
+        Get-Content -LiteralPath (Join-Path $folder 'ran.txt') | Should -Be '-Gui'
+        Test-FromInternet (Join-Path $folder 'Agent365-Bulk-Actions.ps1') | Should -BeFalse
+        Test-FromInternet (Join-Path $folder 'tools\other.ps1') | Should -BeFalse
+        Test-FromInternet (Join-Path $folder 'Start-Console.cmd') | Should -BeFalse
+    }
+    It 'touches nothing when it was started without the rest of the tool, as from inside the ZIP or moved to Downloads' {
+        $folder = New-Download 'alone' -NoTool
+        $result = Invoke-Launcher -Folder $folder
+        $result.Exit | Should -Be 1
+        $result.Output | Should -Match 'Extract the whole ZIP'
+        Test-FromInternet (Join-Path $folder 'tools\other.ps1') | Should -BeTrue
+    }
+    It 'says what to do when PowerShell 7 is missing' {
+        $folder = New-Download 'no pwsh'
+        $result = Invoke-Launcher -Folder $folder -SearchPath (Join-Path $env:SystemRoot 'System32')
+        $result.Exit | Should -Be 1
+        $result.Output | Should -Match 'winget install Microsoft\.PowerShell'
+        Test-Path -LiteralPath (Join-Path $folder 'ran.txt') | Should -BeFalse
+    }
+    It 'leaves the execution policy alone' {
+        $script:LauncherText | Should -Not -Match '(?i)-ExecutionPolicy|Bypass'
+    }
+    It 'keeps the line endings a batch file needs, also in the ZIP' {
+        $script:LauncherText -replace "`r`n", '' | Should -Not -Match "`n"
+        [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\.gitattributes')) | Should -Match '\*\.cmd -text'
+    }
+    It 'is ASCII, like everything else in the tool' {
+        $script:LauncherText | Should -Not -Match '[^\x00-\x7F]'
+    }
+}
+
 Describe 'Telling people their copy is not the latest' {
     BeforeEach {
         $script:keepCheckFile = $script:UpdateCheckFile
@@ -4798,7 +4861,7 @@ Describe 'Telling people their copy is not the latest' {
     }
     AfterEach { $script:UpdateCheckFile = $script:keepCheckFile; $env:A365_BULK_ACTIONS_NO_UPDATE_CHECK = $null }
     BeforeAll {
-        function Set-LastCheck { param([double]$HoursAgo, [string]$Latest) @{ At = (Get-Date).ToUniversalTime().AddHours(-$HoursAgo).ToString('o'); Latest = $Latest } | ConvertTo-Json | Set-Content -LiteralPath $script:UpdateCheckFile }
+        function Set-LastCheck { param([double]$HoursAgo, [string]$Latest, [string]$Copy = '') @{ At = (Get-Date).ToUniversalTime().AddHours(-$HoursAgo).ToString('o'); Copy = $Copy; Latest = $Latest } | ConvertTo-Json | Set-Content -LiteralPath $script:UpdateCheckFile }
         function New-Copy { param([string]$Folder = 'copy') $d = Join-Path $TestDrive $Folder; $null = New-Item -ItemType Directory -Force -Path $d; $f = Join-Path $d 'Agent365-Bulk-Actions.ps1'; [IO.File]::WriteAllText($f, "hello`n"); $f }
         $script:HelloId = 'ce013625030ba8dba906f756967f9e9ca394464a'
     }
@@ -4842,8 +4905,22 @@ Describe 'Telling people their copy is not the latest' {
     }
     It 'says so only when this copy differs from the latest' {
         Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeTrue
-        Set-LastCheck -HoursAgo 1 -Latest $script:HelloId
+        Set-LastCheck -HoursAgo 1 -Latest $script:HelloId -Copy $script:HelloId
         Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+    }
+    It 'does not tell a fresh download it is out of date because of an answer from before it existed' {
+        Set-LastCheck -HoursAgo 1 -Latest '4444444444444444444444444444444444444444' -Copy '4444444444444444444444444444444444444444'
+        $script:latestId = $script:HelloId
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+        Should -Invoke Invoke-RestMethod -Times 1 -Exactly
+        Set-LastCheck -HoursAgo 1 -Latest '4444444444444444444444444444444444444444' -Copy '4444444444444444444444444444444444444444'
+        Mock Invoke-RestMethod { throw 'no network' }
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeFalse
+    }
+    It 'keeps telling an old copy from its saved answer, without asking again' {
+        Set-LastCheck -HoursAgo 1 -Latest '4444444444444444444444444444444444444444' -Copy $script:HelloId
+        Test-UpdateAvailable -ScriptPath (New-Copy) | Should -BeTrue
+        Should -Invoke Invoke-RestMethod -Times 0 -Exactly
     }
     It 'stays quiet when GitHub gave no answer' {
         Mock Invoke-RestMethod { throw 'no network' }

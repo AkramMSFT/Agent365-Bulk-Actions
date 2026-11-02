@@ -79,23 +79,19 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 ## Quick start
 
 1. [Download the latest version](https://github.com/AkramMSFT/Agent365-Bulk-Actions/archive/refs/heads/main.zip) and extract the ZIP. **Code > Download ZIP** on this page gives you the same file.
-2. Open PowerShell 7 in the folder that holds `Agent365-Bulk-Actions.ps1`. If you do not have it, run `winget install Microsoft.PowerShell`.
-3. Allow the downloaded files to run. Windows blocks a script from the internet until you do, with the message *cannot be loaded, not digitally signed*.
+2. Double-click **`Start-Console.cmd`** in the extracted folder. It needs [PowerShell 7](https://aka.ms/powershell) (`winget install Microsoft.PowerShell`), and it says so if you do not have it.
+
+Windows blocks scripts downloaded from the internet, and a script cannot unblock itself. `Start-Console.cmd` unblocks the files in the tool's folder and opens the console, leaving your execution policy as it is. Windows may ask you to confirm the first time, because the file came from the internet: select **Run**, or **More info > Run anyway**. The first run also installs the Graph module if it is missing and opens the Microsoft sign-in window.
+
+**To use the command line instead,** open PowerShell 7 in that folder and unblock the files once. Without this step, Windows stops the script with *cannot be loaded, not digitally signed*.
 
 ```powershell
 Get-ChildItem -Recurse -File | Unblock-File
-```
 
-4. Sign in once, then use the tool:
-
-```powershell
 # Sign in (every permission the tool can use; later runs reuse it without a prompt)
 .\Agent365-Bulk-Actions.ps1 -SignIn
 
-# Open the console
-pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
-
-# Or work from the command line: list the Copilot agents
+# List the Copilot agents
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
 # Preview a change before making it
@@ -868,7 +864,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 | Symptom | What to do |
 | --- | --- |
-| "cannot be loaded" or "not digitally signed" | Windows blocks scripts downloaded from the internet. In the tool's folder, run `Get-ChildItem -Recurse -File \| Unblock-File`. |
+| "cannot be loaded" or "not digitally signed" | Windows blocks scripts downloaded from the internet. Double-click `Start-Console.cmd`, or in the tool's folder run `Get-ChildItem -Recurse -File \| Unblock-File`. If your organization enforces a stricter execution policy, such as AllSigned, ask its administrators. |
 | No packages returned | Confirm the tenant has an Agent 365 license and that you consented to `CopilotPackages.Read.All`. |
 | "No package named 'X'" | Run `-List` for the exact display name or id. |
 | "Multiple packages named 'X'" | Two packages share the name; pass the exact `P_` or `T_` id. |

@@ -686,17 +686,20 @@ function Get-GitBlobId {
 }
 
 # The id of this script on main: from the last answer when it is under a day old, or under an hour when GitHub gave none, otherwise from
-# GitHub. An answer that cannot be had keeps the last one known, so a copy kept offline still hears what was last heard.
+# GitHub. An answer that cannot be had keeps the last one known, so a copy kept offline still hears what was last heard. An answer only
+# counts for the copy it was given to: a fresh download must not be told it is out of date by what was true before it existed.
 function Get-LatestBlobId {
-    param([string]$CacheFile = $script:UpdateCheckFile, [string]$FileName = 'Agent365-Bulk-Actions.ps1')
+    param([string]$CopyId, [string]$CacheFile = $script:UpdateCheckFile, [string]$FileName = 'Agent365-Bulk-Actions.ps1')
     $idPattern = '^[0-9a-f]{40}$'
     $known = ''
     if (Test-Path -LiteralPath $CacheFile) {
         try {
             $cached = Get-Content -Raw -LiteralPath $CacheFile | ConvertFrom-Json
-            if ([string]$cached.Latest -match $idPattern) { $known = [string]$cached.Latest }
-            $hours = ((Get-Date).ToUniversalTime() - ([datetime]$cached.At).ToUniversalTime()).TotalHours
-            if ($hours -ge 0 -and $hours -lt $(if ($known) { 24 } else { 1 })) { return $known }
+            if ([string]$cached.Copy -eq $CopyId) {
+                if ([string]$cached.Latest -match $idPattern) { $known = [string]$cached.Latest }
+                $hours = ((Get-Date).ToUniversalTime() - ([datetime]$cached.At).ToUniversalTime()).TotalHours
+                if ($hours -ge 0 -and $hours -lt $(if ($known) { 24 } else { 1 })) { return $known }
+            }
         } catch { Write-Verbose $_.Exception.Message }
     }
     $latest = $known
@@ -707,7 +710,7 @@ function Get-LatestBlobId {
     } catch { Write-Verbose $_.Exception.Message }
     try {
         $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $CacheFile)
-        @{ At = (Get-Date).ToUniversalTime().ToString('o'); Latest = $latest } | ConvertTo-Json | Set-Content -LiteralPath $CacheFile -Encoding utf8
+        @{ At = (Get-Date).ToUniversalTime().ToString('o'); Copy = $CopyId; Latest = $latest } | ConvertTo-Json | Set-Content -LiteralPath $CacheFile -Encoding utf8
     } catch { Write-Verbose $_.Exception.Message }
     $latest
 }
@@ -717,8 +720,9 @@ function Test-UpdateAvailable {
     try {
         if ($env:A365_BULK_ACTIONS_NO_UPDATE_CHECK -or -not $ScriptPath -or -not (Test-SignInPromptPossible)) { return $false }
         if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $ScriptPath) '.git')) { return $false }
-        $latest = Get-LatestBlobId
-        [bool]($latest -and $latest -ne (Get-GitBlobId -Path $ScriptPath))
+        $mine = Get-GitBlobId -Path $ScriptPath
+        $latest = Get-LatestBlobId -CopyId $mine
+        [bool]($latest -and $latest -ne $mine)
     } catch { Write-Verbose $_.Exception.Message; $false }
 }
 
