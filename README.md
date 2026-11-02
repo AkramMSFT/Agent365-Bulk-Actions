@@ -2,6 +2,8 @@
 
 A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot administrators. It lists, inspects, contains and governs the agents in the organization catalog in bulk, from the command line or from a desktop console.
 
+**[Download the latest version](https://github.com/AkramMSFT/Agent365-Bulk-Actions/archive/refs/heads/main.zip)**, then follow the [Quick start](#quick-start). The `main` branch is always the latest version.
+
 > [!IMPORTANT]
 > Block, unblock and reassign, and the Entra agent-identity and agent-risk calls, use Microsoft Graph **`/beta`** endpoints, which Microsoft does not recommend for production automation. Try it in a lab tenant first. Every write previews first, asks for confirmation and writes a log that can be undone.
 
@@ -76,22 +78,31 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 
 ## Quick start
 
-```powershell
-# 1. Save Agent365-Bulk-Actions.ps1 to a folder and open PowerShell 7 there
-cd C:\Path\To\Scripts
+1. [Download the latest version](https://github.com/AkramMSFT/Agent365-Bulk-Actions/archive/refs/heads/main.zip) and extract the ZIP. **Code > Download ZIP** on this page gives you the same file.
+2. Open PowerShell 7 in the folder that holds `Agent365-Bulk-Actions.ps1`. If you do not have it, run `winget install Microsoft.PowerShell`.
+3. Allow the downloaded files to run. Windows blocks a script from the internet until you do, with the message *cannot be loaded, not digitally signed*.
 
-# 2. Sign in once from the terminal (every permission the tool can use; later runs reuse it without a prompt)
+```powershell
+Get-ChildItem -Recurse -File | Unblock-File
+```
+
+4. Sign in once, then use the tool:
+
+```powershell
+# Sign in (every permission the tool can use; later runs reuse it without a prompt)
 .\Agent365-Bulk-Actions.ps1 -SignIn
 
-# 3. List the Copilot agents
+# Open the console
+pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
+
+# Or work from the command line: list the Copilot agents
 .\Agent365-Bulk-Actions.ps1 -List -AgentsOnly
 
-# 4. Preview a change before making it
+# Preview a change before making it
 .\Agent365-Bulk-Actions.ps1 -Block "Contoso HR Agent" -WhatIf
-
-# 5. Or open the console
-pwsh -STA -File .\Agent365-Bulk-Actions.ps1 -Gui
 ```
+
+**To update,** download the ZIP again and replace the folder. Your sign-in is kept outside it, so you do not sign in again.
 
 **Signing in.** `-SignIn` starts the sign-in from the terminal and keeps the session for your Windows account. Microsoft Entra offers no way to type an administrator's password into a terminal (accounts with multi-factor authentication cannot use it, and this tool never handles a password), so the sign-in itself is completed in the Microsoft sign-in window that opens. After that, every mode, scheduled runs included, reuses the saved session silently until it expires or is revoked. The **Microsoft sign-in window always comes first**. Only when it cannot be shown (an SSH or Cloud Shell session, a Linux machine with no desktop, a window that fails to open) and you are at the terminal, the tool falls back to a **device code**: it prints a short code, you open https://microsoft.com/devicelogin on any device, enter the code and finish the sign-in. A code works for about two minutes, and the tool asks for a new one up to three times. `-DeviceCode` uses a code from the start. If you cancel the window, the tool says so and does not switch to a code on its own.
 
@@ -842,6 +853,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 
 | Symptom | What to do |
 | --- | --- |
+| "cannot be loaded" or "not digitally signed" | Windows blocks scripts downloaded from the internet. In the tool's folder, run `Get-ChildItem -Recurse -File \| Unblock-File`. |
 | No packages returned | Confirm the tenant has an Agent 365 license and that you consented to `CopilotPackages.Read.All`. |
 | "No package named 'X'" | Run `-List` for the exact display name or id. |
 | "Multiple packages named 'X'" | Two packages share the name; pass the exact `P_` or `T_` id. |
