@@ -5799,6 +5799,12 @@ function Format-RiskDetections {
     }) -join '; ')
 }
 
+# The agents worth listing: those with an indicator other than "Published agent", or with an Entra detection.
+function Select-NotableRiskRows {
+    param([object[]]$Rows)
+    @($Rows | Where-Object { $_.Notable -or @($_.Detections | Where-Object { $_ }).Count })
+}
+
 # Detections per type: how many, how many are still at risk, and on how many identities.
 function Get-RiskDetectionSummary {
     param([object[]]$Detections)
@@ -11851,7 +11857,7 @@ switch ($PSCmdlet.ParameterSetName) {
                 Write-Host ("Risk detections from Microsoft Entra ID Protection, last 90 days: {0}" -f $detections.Count) -ForegroundColor Cyan
                 if ($detections.Count) { Get-RiskDetectionSummary $detections | Select-Object Detection, Count, @{ n = 'still at risk'; e = { $_.AtRisk } }, Identities | Format-Table -AutoSize | Out-Host }
             } else { Write-Host "`nEntra ID Protection's risk detections need the IdentityRiskEvent.Read.All permission and a role such as Security Reader. Run -SignIn once to add it." -ForegroundColor DarkGray }
-            $notable = @($rows | Where-Object { $_.Notable -or @($_.Detections).Count })
+            $notable = Select-NotableRiskRows $rows
             $columns = @('Agent', 'Platform', @{ n = 'indicators'; e = { $_.Indicators -join '; ' } })
             if ($null -ne $detections) { $columns += @{ n = 'Entra detections'; e = { Format-RiskDetections $_.Detections } } }
             if ($notable.Count) { $notable | Select-Object $columns | Format-Table -AutoSize -Wrap | Out-Host }

@@ -589,6 +589,14 @@ Describe 'Entra risk detections' {
     It 'is part of the one sign-in' {
         $script:AllScopes | Should -Contain 'IdentityRiskEvent.Read.All'
     }
+    It 'lists the agents with an indicator besides "Published agent" or a detection, with or without the detections read' {
+        $quiet = [pscustomobject]@{ Agent = 'Quiet'; Notable = 0 }
+        $flagged = [pscustomobject]@{ Agent = 'Flagged'; Notable = 1 }
+        @(Select-NotableRiskRows @($quiet, $flagged) | ForEach-Object { $_.Agent }) | Should -Be @('Flagged')
+        $seen = [pscustomobject]@{ Agent = 'Seen'; Notable = 0; Detections = @((New-Det)) }
+        $none = [pscustomobject]@{ Agent = 'None'; Notable = 0; Detections = @() }
+        @(Select-NotableRiskRows @($seen, $none) | ForEach-Object { $_.Agent }) | Should -Be @('Seen')
+    }
 }
 
 Describe 'Graph batching' {
