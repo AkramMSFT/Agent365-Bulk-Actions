@@ -21,6 +21,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
   - [Block, unblock and undo](#block-unblock-and-undo)
   - [Find stale agents](#find-stale-agents)
   - [Find risky agents](#find-risky-agents)
+  - [Risk indicators](#risk-indicators)
   - [Ownership](#ownership)
   - [Entra accountability](#entra-accountability)
   - [Restrict who can use an agent](#restrict-who-can-use-an-agent)
@@ -52,6 +53,7 @@ A single PowerShell tool for Microsoft Agent 365 and Microsoft 365 Copilot admin
 | Block and unblock | Block or unblock agents by name or id, from a picker, or from a CSV; reverse any run from its log | `-Block`, `-Unblock`, `-Select`, `-FromCsv`, `-Undo` |
 | Stale agents | Find agents with no usage telemetry, or an old manifest, and block them | `-Stale` |
 | Risky agents | Find agents with Defender AI-security alerts or detections, ranked by severity, and block them | `-Risky` |
+| Risk indicators | Defender's posture risk indicators per agent, such as an active threat, weak instructions or privileged access | `-RiskIndicators` |
 | Ownership | Propose an owner for shared agents whose owner is missing, or assign one by hand | `-Ownerless`, `-Reassign` |
 | Accountability | Give Entra agent identities a sponsor (and optionally an owner), proposed from the owner chain | `-Accountability`, `-AddSponsor` |
 | Access scope | Restrict who can use an agent (nobody, owner only, named users and groups) as a softer step than blocking | `-Restrict` |
@@ -114,7 +116,7 @@ The tool signs in with delegated permissions and requests only what the chosen m
 | --- | --- |
 | `CopilotPackages.Read.All` | Read-only modes (`-List`, `-Detail`, `-Inventory`, `-Snapshot`, and any mode with `-Action list`) |
 | `CopilotPackages.ReadWrite.All` | Blocking, unblocking, reassigning and restricting agents |
-| `ThreatHunting.Read.All` | Activity-based staleness, risky agents, inventory details, delete candidates, policies, Endpoint AI |
+| `ThreatHunting.Read.All` | Activity-based staleness, risky agents, risk indicators, inventory details, delete candidates, policies, Endpoint AI |
 | `User.Read.All`, `AgentIdentity.Read.All` | Ownership, accountability, inventory and the console |
 | `AgentIdentity.EnableDisable.All` | `-DisableIdentity` when the tool has to disable an identity itself, and the console |
 | `AgentIdentity.ReadWrite.All` | Adding sponsors or owners to agent identities. Needs the Agent ID Administrator role. The console asks for it only when you use that action. |
@@ -266,6 +268,20 @@ Behaviors carry no severity of their own, so the table is the mapping the tool a
 
 Not every signal can be attributed to a catalog agent. Defender for AI Services alerts name an Azure AI account rather than an agent, real-time block records can lack an agent identity, and a Prompt Shield record whose agent name is missing or duplicated is skipped. Run `-Risky -Action list` first, and override the default query with `-HuntingQuery` if it does not fit your tenant (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id).
 
+### Risk indicators
+
+```powershell
+.\Agent365-Bulk-Actions.ps1 -RiskIndicators                              # count per indicator, then the agents that carry one
+.\Agent365-Bulk-Actions.ps1 -RiskIndicators -OutFile .\indicators.csv    # every agent Defender assessed
+```
+
+Microsoft Defender rates each AI agent's posture from risk indicators, the conditions in the **Risk indicators** column of its AI agents page. Security Exposure Management keeps them as flags on each agent's node in the exposure graph (`ExposureGraphNodes` in Advanced Hunting), with the registry id that ties the node to its catalog entry, so the tool can list them. One agent's indicators also appear on the **Risk** tab of **Details...**, in `-Detail` and in `-Inventory`, and the console's Hunting page has the query as **Agent risk indicators**.
+
+- **What they are.** Conditions such as *Active threat* (alerts on the agent), *Weak instructions*, *Privileged business system access*, *Agent with high autonomy*, *Coordinator agent*, *No authentication*, *No guardrails* and *Data exfiltration risk*. The names come from the data, so a new indicator appears without a change to the tool. *Published agent* is an indicator too, but most agents carry it, so the list leaves out agents that have nothing else.
+- **What is not there.** Defender combines the indicators into a risk level using severities that are not in the data, so the tool shows the indicators, not the level. Security recommendations are not there either.
+- **Not the same as risky agents.** `-Risky` reads alerts and detections over 30 days. These indicators describe the agent's configuration and access as Defender assesses it now; *Active threat* is where the two meet.
+- **Requirements.** `ThreatHunting.Read.All`. Defender assesses the indicators with Microsoft 365 E7, or Agent 365, and security for AI agents enabled.
+
 ### Ownership
 
 ```powershell
@@ -406,7 +422,7 @@ Things to know:
 - **Prompts and credentials are hidden.** Command lines are shown with the text after `-p`, `--prompt` or `--message`, API keys, bearer tokens and `sk-` keys replaced.
 - **Alerts name the device, not the process.** An alert is counted against a tool only when it fired within 15 minutes of that tool running, so the match is by timing. Other alerts on the device are listed in the evidence without affecting the level.
 - **Defender keeps about 30 days** of endpoint telemetry. The software inventory and Defender's discovery record are current.
-- **The portal's own risk level needs a different licence.** Microsoft 365 E7, or Agent 365 with Defender for Endpoint Plan 2, adds a risk level, risk indicators and recommendations in the Defender portal's AI agent inventory. They are not available through Advanced Hunting, so this tool computes its own from the rules above.
+- **The portal's own risk level needs a different licence.** Microsoft 365 E7, or Agent 365 with Defender for Endpoint Plan 2, adds a risk level, risk indicators and recommendations in the Defender portal's AI agent inventory. The risk level is not available through Advanced Hunting, so this tool computes its own from the rules above. `-RiskIndicators` lists the indicators the exposure graph holds; in the tenant this was built against it held none of the local-agent ones.
 - **Removed agents are left out.** An agent Defender marks as deleted or uninstalled is not listed. An older version of an agent that was reinstalled is counted once.
 
 
@@ -765,6 +781,7 @@ Use one primary mode per run. Options marked "with ..." only apply to that mode.
 | Parameter | Values | What it does |
 | --- | --- | --- |
 | `-List` | switch | List catalog packages. |
+| `-RiskIndicators` | switch | List Defender's posture risk indicators per agent. Works with `-OutFile`. |
 | `-Block` | names and/or ids | Block packages by display name or `P_`/`T_` id. |
 | `-Unblock` | names and/or ids | Unblock packages. |
 | `-Select` | switch | Pick agents from a grid or numbered menu, then apply `-Action`. |

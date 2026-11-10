@@ -139,6 +139,9 @@ param(
     [Parameter(ParameterSetName = 'List')]
     [switch]$List,
 
+    [Parameter(ParameterSetName = 'List')]
+    [switch]$RiskIndicators,                  # Defender's posture risk indicators per agent: active threat, weak instructions, privileged access...
+
     [Parameter(ParameterSetName = 'Block', Mandatory, Position = 0)]
     [string[]]$Block,                         # one or more P_ or T_ ids, or display names
 
@@ -624,7 +627,7 @@ if (($PSCmdlet.ParameterSetName -eq 'Stale' -and $By -eq 'activity') -or
     $PSCmdlet.ParameterSetName -in @('Risky', 'Gui')) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -in @('Ownerless', 'Reassign', 'Gui')) { $scopes += 'User.Read.All', 'AgentIdentity.Read.All' }
 if ($DisableIdentity -or $PSCmdlet.ParameterSetName -eq 'Gui') { $scopes += 'AgentIdentity.Read.All', 'AgentIdentity.EnableDisable.All' }
-if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory', 'AiActivity')) { $scopes += 'ThreatHunting.Read.All' }
+if ($PSCmdlet.ParameterSetName -in @('DeleteCandidates', 'Policy', 'Detail', 'Inventory', 'AiActivity') -or $RiskIndicators) { $scopes += 'ThreatHunting.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'AiActivity') { $scopes += 'AuditLogsQuery.Read.All' }
 if ($PSCmdlet.ParameterSetName -eq 'Restrict') { $scopes += 'User.Read.All'; if ($AllowGroups) { $scopes += 'Group.Read.All' } }
 if ($PSCmdlet.ParameterSetName -in @('Compromise', 'DismissRisk')) { $scopes += 'IdentityRiskyAgent.ReadWrite.All' }
@@ -5559,6 +5562,12 @@ function Get-AgentDetail {
         $riskInfo['Last signal'] = $(if ($riskEntry.LastAlert) { $riskEntry.LastAlert.ToString('yyyy-MM-dd') })
         $n = 0; foreach ($s in ([string]$riskEntry.Reasons -split '; ')) { if ($s) { $n++; $riskInfo["Signal $n"] = $s } }
     } else { $riskInfo['Security signals (30 days)'] = 'none found' }
+    try {
+        $id = ([string]$Package.id).ToLowerInvariant()
+        $mine = @(Get-RiskIndicatorRows -Packages @($Package) -Nodes @(Get-AgentRiskIndicators | Where-Object { $_.TitleIds -contains $id }))
+        $riskInfo['Risk indicators (Defender)'] = if (-not $mine.Count) { 'not assessed' } elseif ($mine[0].Indicators.Count) { $mine[0].Indicators -join '; ' } else { 'none' }
+        foreach ($k in @($mine | ForEach-Object { $_.Keys })) { if ($script:RiskIndicatorNotes.ContainsKey($k)) { $riskInfo['  ' + (Get-RiskIndicatorLabel -Key $k)] = $script:RiskIndicatorNotes[$k] } }
+    } catch { $riskInfo['Risk indicators (Defender)'] = 'could not be read: ' + $_.Exception.Message }
     [pscustomobject]@{
         Id = $d.id; Name = $d.displayName
         Overview = [ordered]@{
@@ -5619,6 +5628,79 @@ function Get-AgentRisk {
     $null
 }
 
+# Defender's posture risk indicators: the conditions behind the risk level on its AI agents page, such as weak instructions, an
+# active threat or privileged access. Security Exposure Management keeps them as flags on each agent's node in the exposure graph,
+# with the registry id that ties the node to its catalog entry. The risk level itself and each indicator's severity are not there.
+$script:RiskIndicatorKql = @'
+ExposureGraphNodes
+| where NodeLabel in ("ai-agent", "copilot-studio-ai-agent")
+| extend raw = todynamic(NodeProperties).rawData
+| mv-apply e = EntityIds on (summarize TitleIds = make_set_if(tolower(extract(@"titleid=([^;]+)", 1, tostring(e.id))), tostring(e.type) == "A365RegistryAIAgentId"))
+| mv-apply k = bag_keys(raw) to typeof(string) on (
+    where k endswith "Indicator" and isnotnull(raw[k]) and tostring(raw[k]) != "false"
+    | summarize Keys = make_list(k), Values = make_list(tostring(raw[k])))
+| project Name = coalesce(tostring(raw.aiAgentMetadata.name), NodeName), Platform = tostring(raw.aiAgentMetadata.platform), TitleIds, Keys, Values
+'@
+
+# What Microsoft documents for the indicators it describes; any other indicator is shown by its name alone.
+$script:RiskIndicatorNotes = @{
+    'activeThreatIndicator'                        = 'Active security alerts are associated with the agent.'
+    'weakInstructionsIndicator'                    = 'The instructions do not give enough guidance for safe and predictable behaviour.'
+    'privilegedBusinessSystemAccessIndicator'      = 'The agent has write access to key business systems.'
+    'privilegedSoftwareDevelopmentAccessIndicator' = 'The agent has access to software development systems.'
+}
+
+# The words for an indicator, from its name (privilegedBusinessSystemAccessIndicator: "Privileged business system access"), with
+# the level when Defender records one, as it can for blast radius.
+function Get-RiskIndicatorLabel {
+    param([string]$Key, [object]$Value)
+    $words = ($Key -replace 'Indicator$', '') -creplace '(?<=[a-z0-9])(?=[A-Z])', ' '
+    $label = if ($words) { $words.Substring(0, 1).ToUpperInvariant() + $words.Substring(1).ToLowerInvariant() } else { $Key }
+    $text = if ($null -eq $Value -or $Value -is [string]) { [string]$Value } else { $Value | ConvertTo-Json -Compress -Depth 3 }
+    if ($text -match '"[A-Za-z]*[Ll]evel"\s*:\s*"([^"]+)"') { '{0} ({1})' -f $label, $Matches[1] } else { $label }
+}
+
+# Every agent node in the exposure graph with its indicator names and values, read at most once in ten minutes.
+function Get-AgentRiskIndicators {
+    Get-HuntingCached 'riskindicators' {
+        @(Invoke-HuntingQuery -Query $script:RiskIndicatorKql -Hint 'Risk indicators come from Security Exposure Management in Defender Advanced Hunting (ThreatHunting.Read.All). Defender assesses them with Microsoft 365 E7, or Agent 365.' | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_.Name; Platform = [string]$_.Platform
+                               TitleIds = @(ConvertTo-ObjectList $_.TitleIds | ForEach-Object { ([string]$_).ToLowerInvariant() } | Where-Object { $_ })
+                               Keys = @(ConvertTo-ObjectList $_.Keys | ForEach-Object { [string]$_ }); Values = @(ConvertTo-ObjectList $_.Values) }
+        })
+    }
+}
+
+# One row per agent Defender assessed, with its indicators by name and every catalog entry its registry ids name (the catalog
+# can list one agent twice, as a shared and a published entry). An agent the catalog does not list keeps the name Defender gives
+# it. Agents with an active threat come first, then those with the most indicators. Being published is an indicator too, but so
+# common that Notable does not count it.
+function Get-RiskIndicatorRows {
+    param([object[]]$Packages, [object[]]$Nodes)
+    $byId = @{}
+    foreach ($p in @($Packages)) { if ($p.id) { $byId[([string]$p.id).ToLowerInvariant()] = $p } }
+    $order = { if ($_ -eq 'activeThreatIndicator') { 0 } elseif ($_ -eq 'publishedAgentIndicator') { 2 } else { 1 } }
+    $rows = foreach ($n in @($Nodes)) {
+        $listed = @($n.TitleIds | Where-Object { $byId.ContainsKey($_) } | ForEach-Object { $byId[$_] })
+        $names = @($n.Keys); $values = @($n.Values)
+        $byKey = @{}
+        for ($i = 0; $i -lt $names.Count; $i++) { $byKey[$names[$i]] = $(if ($i -lt $values.Count) { $values[$i] } else { $null }) }
+        $keys = @($byKey.Keys | Sort-Object @{ e = $order }, @{ e = { $_ } })
+        [pscustomobject]@{
+            Agent = $(if ($listed.Count) { [string]$listed[0].displayName } else { $n.Name }); Ids = @($listed | ForEach-Object { [string]$_.id }); Platform = $n.Platform
+            Indicators = @($keys | ForEach-Object { Get-RiskIndicatorLabel -Key $_ -Value $byKey[$_] }); Keys = $keys
+            Notable = @($keys | Where-Object { $_ -ne 'publishedAgentIndicator' }).Count; ActiveThreat = [bool]($keys -contains 'activeThreatIndicator')
+        }
+    }
+    @($rows | Sort-Object @{ e = { -[int]$_.ActiveThreat } }, @{ e = { -$_.Notable } }, Agent)
+}
+
+# How many agents carry each indicator, the most common first.
+function Get-RiskIndicatorSummary {
+    param([object[]]$Rows)
+    @($Rows | ForEach-Object { $_.Indicators } | Group-Object | Sort-Object @{ e = { -$_.Count } }, Name | ForEach-Object { [pscustomobject]@{ Indicator = $_.Name; Agents = $_.Count } })
+}
+
 # Does a permission list satisfy the filter: any permission, a Microsoft Graph application permission, or an MCP server permission?
 function Test-PermissionMatch {
     param([object[]]$Perms, [string]$Mode)
@@ -5651,7 +5733,7 @@ function Show-AgentDetail {
 
 # One row per agent for -Inventory: the catalog record plus the Defender columns; -Deep adds usage and sharing per agent.
 function Get-InventoryRows {
-    param([object[]]$Packages, [hashtable]$InfoTable, [switch]$Deep, [switch]$WithPermissions)
+    param([object[]]$Packages, [hashtable]$InfoTable, [switch]$Deep, [switch]$WithPermissions, [hashtable]$IndicatorMap = @{})
     Initialize-UserCache -Ids @($Packages | ForEach-Object { $_.ownerId })
     $detailMap = if ($Deep) { Get-PackageDetailMap -Ids @($Packages | ForEach-Object { $_.id }) } else { @{} }
     $permMap = if ($WithPermissions) {
@@ -5670,6 +5752,7 @@ function Get-InventoryRows {
             ToolCount = @(Get-ItemList $info.Tools).Count; Tools = (Get-NameText $info.Tools); McpServers = (Get-NameText $info.McpServers)
             DataSources = ($info.DataSources -join '; '); Capabilities = ($info.Capabilities -join '; ')
             SharedWithCount = [int]$info.SharedCount; AgentIdentity = $p.agentIdentityId
+            RiskIndicators = [string]$IndicatorMap[([string]$p.id).ToLowerInvariant()]
         }
         if ($Deep) {
             foreach ($c in 'AvailableTo', 'DeployedTo', 'CatalogSharedWith', 'ActiveUsers', 'Sessions', 'LastUsed') { $row[$c] = '' }
@@ -9933,6 +10016,21 @@ agents
           Owners, CreatedDateTime, LastUpdatedDateTime, AgentId, EntraAgentID, EntraBlueprintID, BotId
 | order by case(Severity == "High", 1, Severity == "Medium", 2, 3) asc, Events desc, Agent asc
 '@ },
+    [pscustomobject]@{ Category = 'Posture'; Name = 'Agent risk indicators'
+                       Description = 'Defender''s posture risk indicators per agent from the exposure graph: active threat, weak instructions, privileged access, high autonomy and others. Agents that carry only "Published agent" are left out.'
+                       Query = @'
+// Security Exposure Management keeps the indicators as flags on each agent's node; Defender's risk level and their severities are not in the data
+ExposureGraphNodes
+| where NodeLabel in ("ai-agent", "copilot-studio-ai-agent")
+| extend raw = todynamic(NodeProperties).rawData
+| mv-apply k = bag_keys(raw) to typeof(string) on (where k endswith "Indicator" and isnotnull(raw[k]) and tostring(raw[k]) != "false" | summarize Indicators = make_list(k))
+| mv-apply e = EntityIds on (summarize CatalogIds = make_set_if(extract(@"titleid=([^;]+)", 1, tostring(e.id)), tostring(e.type) == "A365RegistryAIAgentId"))
+| extend Notable = array_length(set_difference(Indicators, dynamic(["publishedAgentIndicator"]))), ActiveThreat = set_has_element(Indicators, "activeThreatIndicator")
+| where Notable > 0
+| project ActiveThreat, Notable, Agent = coalesce(tostring(raw.aiAgentMetadata.name), NodeName), Platform = tostring(raw.aiAgentMetadata.platform),
+          PublishedStatus = tostring(raw.aiAgentMetadata.publishedStatus), Indicators, CatalogIds, EntraAgentId = tostring(raw.aiAgentMetadata.entraAgentId)
+| order by ActiveThreat desc, Notable desc, Agent asc
+'@ },
     [pscustomobject]@{ Category = 'Access'; Name = 'Agent identity sign-ins from new locations'
                        Description = 'Agent and blueprint service principals signing in from a country, network, or to a resource not seen in their baseline period, with failures and the registry agent behind the identity'
                        Query = @'
@@ -11625,6 +11723,20 @@ if ($script:LoadOnly) { return }
 switch ($PSCmdlet.ParameterSetName) {
     'Gui' { Show-Console }
     'List' {
+        if ($RiskIndicators) {
+            $pk = @(Get-Packages)
+            Write-Host 'Reading risk indicators from Microsoft Defender...' -ForegroundColor DarkGray
+            $rows = @(Get-RiskIndicatorRows -Packages $pk -Nodes @(Get-AgentRiskIndicators))
+            if (-not $rows.Count) { Write-Host 'Defender has assessed no agent. It assesses risk indicators with Microsoft 365 E7, or Agent 365, and security for AI agents enabled.' -ForegroundColor Yellow; break }
+            Write-Host ("`nRisk indicators from Microsoft Defender, {0} agent(s) assessed:" -f $rows.Count) -ForegroundColor Cyan
+            Get-RiskIndicatorSummary $rows | Format-Table -AutoSize | Out-Host
+            $notable = @($rows | Where-Object { $_.Notable })
+            if ($notable.Count) { $notable | Select-Object Agent, Platform, @{ n = 'indicators'; e = { $_.Indicators -join '; ' } } | Format-Table -AutoSize -Wrap | Out-Host }
+            if ($rows.Count -gt $notable.Count) { Write-Host ('{0} more agent(s) carry no indicator, or only "Published agent". -OutFile lists every agent.' -f ($rows.Count - $notable.Count)) -ForegroundColor DarkGray }
+            Write-Host 'Defender combines these into a risk level using severities that are not in the data, so the level is not shown. Microsoft describes them at https://learn.microsoft.com/defender-xdr/security-for-ai/ai-agent-risk-assessment' -ForegroundColor DarkGray
+            Export-ActionLog -Records @($rows | Select-Object Agent, @{ n = 'CatalogIds'; e = { $_.Ids -join '; ' } }, Platform, @{ n = 'Indicators'; e = { $_.Indicators -join '; ' } }, Notable, ActiveThreat)
+            break
+        }
         Get-Packages -AgentsOnly:$AgentsOnly |
             Select-Object displayName, id, isBlocked,
                           @{ n = 'hosts'; e = { ($_.supportedHosts) -join ',' } }, type |
@@ -11898,7 +12010,10 @@ switch ($PSCmdlet.ParameterSetName) {
     'Inventory' {
         $pk = @(Get-Packages -AgentsOnly:$AgentsOnly)
         Write-Host ("Reading Defender agent records for {0} package(s)..." -f $pk.Count) -ForegroundColor DarkGray
-        $rows = @(Get-InventoryRows -Packages $pk -InfoTable (Get-AgentInfoTable) -Deep:$Deep -WithPermissions:$WithPermissions)
+        $indicatorMap = @{}
+        try { foreach ($r in (Get-RiskIndicatorRows -Packages $pk -Nodes @(Get-AgentRiskIndicators))) { foreach ($id in $r.Ids) { $indicatorMap[$id.ToLowerInvariant()] = $r.Indicators -join '; ' } } }
+        catch { Write-Warning ('Risk indicators could not be read, so that column is empty: {0}' -f $_.Exception.Message) }
+        $rows = @(Get-InventoryRows -Packages $pk -InfoTable (Get-AgentInfoTable) -Deep:$Deep -WithPermissions:$WithPermissions -IndicatorMap $indicatorMap)
         Write-Host ("`n{0} agent(s): {1} shared by a creator, {2} org-published, {3} with declared tools, {4} using MCP servers, {5} blocked." -f
             $rows.Count, @($rows | Where-Object { $_.Kind -eq 'Shared by a creator' }).Count, @($rows | Where-Object { $_.Kind -eq 'Org-published' }).Count,
             @($rows | Where-Object { $_.ToolCount -gt 0 }).Count, @($rows | Where-Object { $_.McpServers }).Count, @($rows | Where-Object { $_.Status -eq 'Blocked' }).Count) -ForegroundColor Cyan

@@ -506,6 +506,39 @@ Describe 'Agents with no Defender record count as having nothing' {
         $row.ToolCount | Should -Be 2
         $row.McpServers | Should -Be 'Work IQ Mail'
         $row.SharedWithCount | Should -Be 1
+        $row.RiskIndicators | Should -Be ''
+        (Get-InventoryRows -Packages @(New-Pkg 'P_has' 'Agent') -InfoTable @{ 'p_has' = $info } -IndicatorMap @{ 'p_has' = 'Active threat; Published agent' }).RiskIndicators | Should -Be 'Active threat; Published agent'
+    }
+}
+
+Describe 'Risk indicators' {
+    It 'names an indicator from its property, with a level when Defender records one' {
+        Get-RiskIndicatorLabel -Key 'privilegedBusinessSystemAccessIndicator' -Value 'true' | Should -Be 'Privileged business system access'
+        Get-RiskIndicatorLabel -Key 'agentWithHighAutonomyIndicator' | Should -Be 'Agent with high autonomy'
+        Get-RiskIndicatorLabel -Key 'blastRadiusIndicator' -Value '{"blastRadiusLevel":"High"}' | Should -Be 'Blast radius (High)'
+        Get-RiskIndicatorLabel -Key 'blastRadiusIndicator' -Value ([pscustomobject]@{ blastRadiusLevel = 'Low' }) | Should -Be 'Blast radius (Low)'
+    }
+    It 'gives each assessed agent one row with every catalog entry it names, keeps unlisted agents and puts active threats first' {
+        $pk = @([pscustomobject]@{ id = 'T_A'; displayName = 'Alpha' }, [pscustomobject]@{ id = 'T_A2'; displayName = 'Alpha (published)' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta' })
+        $nodes = @(
+            [pscustomobject]@{ Name = 'alpha'; Platform = 'Copilot Studio'; TitleIds = @('t_a', 't_a2', 't_gone'); Keys = @('publishedAgentIndicator', 'weakInstructionsIndicator'); Values = @('true', 'true') },
+            [pscustomobject]@{ Name = 'Beta'; Platform = 'Foundry'; TitleIds = @('t_b'); Keys = @('publishedAgentIndicator', 'activeThreatIndicator'); Values = @('true', 'true') },
+            [pscustomobject]@{ Name = 'Local tool'; Platform = 'Other'; TitleIds = @(); Keys = @(); Values = @() })
+        $rows = @(Get-RiskIndicatorRows -Packages $pk -Nodes $nodes)
+        $rows.Count | Should -Be 3
+        $rows[0].Agent | Should -Be 'Beta'; $rows[0].ActiveThreat | Should -BeTrue; $rows[0].Indicators | Should -Be @('Active threat', 'Published agent')
+        $rows[1].Agent | Should -Be 'Alpha'; $rows[1].Ids | Should -Be @('T_A', 'T_A2'); $rows[1].Indicators | Should -Be @('Weak instructions', 'Published agent'); $rows[1].Notable | Should -Be 1
+        $rows[2].Agent | Should -Be 'Local tool'; @($rows[2].Ids).Count | Should -Be 0; $rows[2].Notable | Should -Be 0
+        (Get-RiskIndicatorSummary $rows | Where-Object Indicator -eq 'Published agent').Agents | Should -Be 2
+    }
+    It 'reads the exposure graph once in ten minutes and keeps the raw names and values' {
+        $script:HuntingCache.Remove('riskindicators')
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Name = 'Alpha'; Platform = 'Copilot Studio'; TitleIds = @('T_A'); Keys = @('activeThreatIndicator'); Values = @('true') }) }
+        $null = @(Get-AgentRiskIndicators); $n = @(Get-AgentRiskIndicators)
+        Should -Invoke Invoke-HuntingQuery -Times 1 -Exactly
+        $n[0].TitleIds | Should -Be @('t_a'); $n[0].Keys | Should -Be @('activeThreatIndicator')
+        $script:RiskIndicatorKql | Should -Match 'ExposureGraphNodes'
+        $script:HuntingCache.Remove('riskindicators')
     }
 }
 
@@ -4474,9 +4507,9 @@ Describe 'Revoke sessions' {
 Describe 'Security pages' {
     It 'ships a curated set of hunting queries, each with a category, a name, a description and a query' {
         $q = @($script:HuntingQueries)
-        $q.Count | Should -Be 18
+        $q.Count | Should -Be 19
         @($q | Where-Object { -not $_.Category -or -not $_.Name -or -not $_.Description -or -not $_.Query }).Count | Should -Be 0
-        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 18
+        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 19
         @($q | ForEach-Object { $_.Category } | Get-Distinct) | Should -Be @('Inventory', 'Telemetry', 'Alerts', 'Runtime protection', 'Posture', 'Access', 'Tools and MCP', 'Data security', 'Network')
         @($q | Where-Object { $_.Query -match '[^\x00-\x7F]' }).Count | Should -Be 0
     }
