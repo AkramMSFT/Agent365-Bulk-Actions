@@ -542,6 +542,55 @@ Describe 'Risk indicators' {
     }
 }
 
+Describe 'Entra risk detections' {
+    BeforeAll {
+        function New-Det { param([string]$Type = 'signInSpike', [string]$Identity = 'i1', [string]$IdentityType = 'agentIdentity', [string]$State = 'atRisk', [string]$Level = 'high', [string]$Name = 'Entra name', [string]$When = '2026-11-01T10:00:00Z')
+            [pscustomobject]@{ Type = $Type; Label = (Get-RiskDetectionLabel $Type); Level = $Level; State = $State; IdentityId = $Identity; IdentityType = $IdentityType; Name = $Name; Detected = [datetimeoffset]$When } }
+    }
+    It 'names a detection from Microsoft''s list, or from its type when it is new' {
+        Get-RiskDetectionLabel 'signInSpike' | Should -Be 'Sign-in spike'
+        Get-RiskDetectionLabel 'adminConfirmedAgentCompromised' | Should -Be 'Confirmed compromised'
+        Get-RiskDetectionLabel 'someNewDetection' | Should -Be 'Some new detection'
+    }
+    It 'reads 90 days once in ten minutes, asking for every value of the identity type' {
+        $script:HuntingCache.Remove('agentriskdetections')
+        Mock Get-GraphAll { $script:askedUri = $Uri; $script:askedHeaders = $Headers
+            @([pscustomobject]@{ riskEventType = 'unfamiliarResourceAccess'; riskLevel = 'medium'; riskState = 'atRisk'; identityId = 'I1'; identityType = 'agentIdentity'; displayName = 'A'; detectedDateTime = '2026-11-02T08:00:00Z' }) }
+        $null = @(Get-AgentRiskDetections); $r = @(Get-AgentRiskDetections)
+        Should -Invoke Get-GraphAll -Times 1 -Exactly
+        $script:askedUri | Should -Match '/beta/identityProtection/agentRiskDetections\?\$filter=detectedDateTime ge \d{4}-\d\d-\d\dT'
+        $script:askedHeaders.Prefer | Should -Be 'include-unknown-enum-members'
+        $r[0].Label | Should -Be 'Unfamiliar resource access'; $r[0].IdentityId | Should -Be 'i1'; $r[0].Detected.Year | Should -Be 2026
+        $script:HuntingCache.Remove('agentriskdetections')
+    }
+    It 'puts each detection on its agent''s row, through an agent user''s parent too, and gives the rest rows of their own' {
+        $pk = @([pscustomobject]@{ id = 'T_A'; displayName = 'Alpha'; agentIdentityId = 'I1' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta'; agentIdentityId = 'I2' })
+        $rows = @([pscustomobject]@{ Agent = 'Alpha'; Ids = @('T_A'); Platform = 'Foundry'; Assessed = $true; Indicators = @('Published agent'); Keys = @('publishedAgentIndicator'); Notable = 0; ActiveThreat = $false })
+        $dets = @((New-Det -Identity 'i1'), (New-Det -Type 'failedAccessAttempt' -Identity 'u1' -IdentityType 'agentUser' -State 'dismissed'),
+                  (New-Det -Type 'unfamiliarResourceAccess' -Identity 'i2' -State 'dismissed'), (New-Det -Type 'suspiciousCredentialUsage' -Identity 'bp9' -IdentityType 'agentIdentityBlueprintPrincipal' -Name 'Some blueprint'))
+        $out = @(Add-RiskDetectionRows -Rows $rows -Packages $pk -Detections $dets -UsersByIdentity @{ 'I1' = @('U1') })
+        $out.Count | Should -Be 3
+        $alpha = $out | Where-Object Agent -eq 'Alpha'
+        @($alpha.Detections).Count | Should -Be 2; $alpha.AtRisk | Should -BeTrue
+        $beta = $out | Where-Object Agent -eq 'Beta'
+        $beta.Ids | Should -Be @('T_B'); $beta.Assessed | Should -BeFalse; $beta.AtRisk | Should -BeFalse
+        ($out | Where-Object Agent -eq 'Some blueprint').Ids.Count | Should -Be 0
+        $out[-1].Agent | Should -Be 'Beta'
+    }
+    It 'writes one entry per type with the latest, and counts what is still at risk' {
+        $dets = @((New-Det -When '2026-10-01T00:00:00Z' -State 'dismissed'), (New-Det -When '2026-11-03T00:00:00Z'), (New-Det -Type 'failedAccessAttempt' -Level 'low' -Identity 'i2'))
+        Format-RiskDetections $dets | Should -Be 'Sign-in spike x2 (high, atRisk, 2026-11-03); Failed access attempt (low, atRisk, 2026-11-01)'
+        Format-RiskDetections @() | Should -Be ''
+        $s = @(Get-RiskDetectionSummary $dets)
+        ($s | Where-Object Detection -eq 'Sign-in spike').Count | Should -Be 2
+        ($s | Where-Object Detection -eq 'Sign-in spike').AtRisk | Should -Be 1
+        ($s | Where-Object Detection -eq 'Sign-in spike').Identities | Should -Be 1
+    }
+    It 'is part of the one sign-in' {
+        $script:AllScopes | Should -Contain 'IdentityRiskEvent.Read.All'
+    }
+}
+
 Describe 'Graph batching' {
     BeforeEach {
         Mock Write-Progress { }

@@ -474,7 +474,7 @@ if (-not $script:LoadOnly) {
 $script:AllScopes = @('CopilotPackages.Read.All', 'CopilotPackages.ReadWrite.All', 'ThreatHunting.Read.All', 'CustomDetection.ReadWrite.All', 'Policy.Read.All', 'IdentityRiskyAgent.Read.All', 'User.Read.All', 'AgentIdentity.Read.All',
                       'AgentIdentity.EnableDisable.All', 'AgentIdentity.ReadWrite.All', 'Group.Read.All', 'Application.Read.All',
                       'DelegatedPermissionGrant.Read.All', 'AuditLogsQuery.Read.All', 'IdentityRiskyAgent.ReadWrite.All', 'SecurityAlert.Read.All',
-                      'Policy.ReadWrite.ConditionalAccess', 'User.RevokeSessions.All', 'DelegatedPermissionGrant.ReadWrite.All', 'AuditLog.Read.All')
+                      'Policy.ReadWrite.ConditionalAccess', 'User.RevokeSessions.All', 'DelegatedPermissionGrant.ReadWrite.All', 'AuditLog.Read.All', 'IdentityRiskEvent.Read.All')
 
 # A sign-in failure explained in terms of what to do. A session that cannot show a sign-in window (a scheduled task, a
 # non-interactive shell) fails with a message about window handles, which says nothing useful.
@@ -5568,6 +5568,18 @@ function Get-AgentDetail {
         $riskInfo['Risk indicators (Defender)'] = if (-not $mine.Count) { 'not assessed' } elseif ($mine[0].Indicators.Count) { $mine[0].Indicators -join '; ' } else { 'none' }
         foreach ($k in @($mine | ForEach-Object { $_.Keys })) { if ($script:RiskIndicatorNotes.ContainsKey($k)) { $riskInfo['  ' + (Get-RiskIndicatorLabel -Key $k)] = $script:RiskIndicatorNotes[$k] } }
     } catch { $riskInfo['Risk indicators (Defender)'] = 'could not be read: ' + $_.Exception.Message }
+    $field = 'Entra risk detections (90 days)'
+    if (-not $d.agentIdentityId) { $riskInfo[$field] = 'none: the agent has no Entra agent identity' }
+    elseif (-not (Test-GraphScope 'IdentityRiskEvent.Read.All')) { $riskInfo[$field] = 'needs the IdentityRiskEvent.Read.All permission: run -SignIn once' }
+    else {
+        try {
+            $users = try { Get-AgentUserIdsByIdentity } catch { @{} }
+            $me = [pscustomobject]@{ id = [string]$Package.id; displayName = [string]$d.displayName; agentIdentityId = [string]$d.agentIdentityId }
+            $found = @(Add-RiskDetectionRows -Rows @() -Packages @($me) -Detections @(Get-AgentRiskDetections) -UsersByIdentity $users | Where-Object { $_.Ids -contains $me.id } | ForEach-Object { $_.Detections })
+            $riskInfo[$field] = if ($found.Count) { Format-RiskDetections $found } else { 'none' }
+            foreach ($t in @($found | ForEach-Object { $_.Type } | Get-Distinct)) { if ($script:AgentRiskDetectionTypes.ContainsKey($t)) { $riskInfo['  ' + (Get-RiskDetectionLabel $t)] = $script:AgentRiskDetectionTypes[$t][1] } }
+        } catch { $riskInfo[$field] = 'could not be read: ' + $_.Exception.Message }
+    }
     [pscustomobject]@{
         Id = $d.id; Name = $d.displayName
         Overview = [ordered]@{
@@ -5687,7 +5699,7 @@ function Get-RiskIndicatorRows {
         for ($i = 0; $i -lt $names.Count; $i++) { $byKey[$names[$i]] = $(if ($i -lt $values.Count) { $values[$i] } else { $null }) }
         $keys = @($byKey.Keys | Sort-Object @{ e = $order }, @{ e = { $_ } })
         [pscustomobject]@{
-            Agent = $(if ($listed.Count) { [string]$listed[0].displayName } else { $n.Name }); Ids = @($listed | ForEach-Object { [string]$_.id }); Platform = $n.Platform
+            Agent = $(if ($listed.Count) { [string]$listed[0].displayName } else { $n.Name }); Ids = @($listed | ForEach-Object { [string]$_.id }); Platform = $n.Platform; Assessed = $true
             Indicators = @($keys | ForEach-Object { Get-RiskIndicatorLabel -Key $_ -Value $byKey[$_] }); Keys = $keys
             Notable = @($keys | Where-Object { $_ -ne 'publishedAgentIndicator' }).Count; ActiveThreat = [bool]($keys -contains 'activeThreatIndicator')
         }
@@ -5699,6 +5711,101 @@ function Get-RiskIndicatorRows {
 function Get-RiskIndicatorSummary {
     param([object[]]$Rows)
     @($Rows | ForEach-Object { $_.Indicators } | Group-Object | Sort-Object @{ e = { -$_.Count } }, Name | ForEach-Object { [pscustomobject]@{ Indicator = $_.Name; Agents = $_.Count } })
+}
+
+# Microsoft Entra ID Protection's risk detections for agents: why Entra rated an agent at risk, such as a sign-in spike, unfamiliar
+# resource access or an administrator confirming it compromised. Entra keeps 90 days. Reading them needs IdentityRiskEvent.Read.All
+# and a role such as Security Reader; without it everything else still shows. Beta only.
+$script:AgentRiskDetectionBase = 'https://graph.microsoft.com/beta/identityProtection/agentRiskDetections'
+$script:AgentRiskDetectionTypes = @{
+    adminConfirmedAgentCompromised = @('Confirmed compromised', 'An administrator confirmed the agent compromised.')
+    earlyLifeMaliciousActivity     = @('Early life malicious activity', 'The newly created agent immediately behaved like an attacker.')
+    entraDirectoryReconnaissance   = @('Entra directory reconnaissance', 'The agent performed suspicious reconnaissance or high-risk directory operations.')
+    failedAccessAttempt            = @('Failed access attempt', 'The agent tried and failed to reach resources it is not authorized for, which can mean its token is being replayed.')
+    threatIntelligenceAccount      = @('Microsoft Entra threat intelligence', 'Microsoft saw activity consistent with known attack patterns.')
+    signInSpike                    = @('Sign-in spike', 'The agent signed in far more often than usual, which can mean automation or a toolkit.')
+    suspiciousCredentialUsage      = @('Suspicious credential usage', 'New credentials were added to the agent''s blueprint and then used.')
+    unfamiliarResourceAccess       = @('Unfamiliar resource access', 'The agent targeted resources it does not usually access.')
+}
+
+# The words for a detection type, from Microsoft's list or, for a type added later, from its name.
+function Get-RiskDetectionLabel {
+    param([string]$Type)
+    if ($script:AgentRiskDetectionTypes.ContainsKey($Type)) { $script:AgentRiskDetectionTypes[$Type][0] } else { Get-RiskIndicatorLabel -Key $Type }
+}
+
+# Every agent risk detection of the last 90 days, read at most once in ten minutes.
+function Get-AgentRiskDetections {
+    Get-HuntingCached 'agentriskdetections' {
+        $since = (Get-Date).ToUniversalTime().AddDays(-90).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        @(Get-GraphAll -Uri ('{0}?$filter=detectedDateTime ge {1}&$top=500' -f $script:AgentRiskDetectionBase, $since) -Headers @{ Prefer = 'include-unknown-enum-members' } | ForEach-Object {
+            [pscustomobject]@{
+                Type = [string]$_.riskEventType; Label = (Get-RiskDetectionLabel ([string]$_.riskEventType)); Level = [string]$_.riskLevel; State = [string]$_.riskState
+                IdentityId = ([string]$_.identityId).ToLowerInvariant(); IdentityType = [string]$_.identityType; Name = [string]$_.displayName
+                Detected = $(if ($_.detectedDateTime) { [datetimeoffset]$_.detectedDateTime } else { $null })
+            }
+        })
+    }
+}
+
+# Adds Entra's detections to the risk indicator rows. A detection goes to the row of its catalog agent, found through the agent
+# identity or, for an agent's user account, through its parent identity. A detection whose agent has no row, such as one for a
+# blueprint or for an identity Defender has not assessed, gets a row of its own. Rows with an active threat or a detection still
+# at risk come first.
+function Add-RiskDetectionRows {
+    param([object[]]$Rows, [object[]]$Packages, [object[]]$Detections, [hashtable]$UsersByIdentity = @{})
+    $catalogOf = @{}
+    foreach ($p in @($Packages)) {
+        if (-not $p.agentIdentityId) { continue }
+        $k = ([string]$p.agentIdentityId).ToLowerInvariant()
+        $catalogOf[$k] = @(@($catalogOf[$k]) + [string]$p.id | Where-Object { $_ })
+    }
+    $parentOf = @{}
+    foreach ($id in @($UsersByIdentity.Keys)) { foreach ($u in @($UsersByIdentity[$id])) { if ($u) { $parentOf[([string]$u).ToLowerInvariant()] = ([string]$id).ToLowerInvariant() } } }
+    $rowOf = @{}
+    foreach ($r in @($Rows)) {
+        $r | Add-Member -NotePropertyName Detections -NotePropertyValue @() -Force
+        foreach ($id in @($r.Ids)) { $rowOf[([string]$id).ToLowerInvariant()] = $r }
+    }
+    $extra = [ordered]@{}
+    foreach ($d in @($Detections)) {
+        $identity = if ($d.IdentityType -eq 'agentUser' -and $parentOf.ContainsKey($d.IdentityId)) { $parentOf[$d.IdentityId] } else { $d.IdentityId }
+        $ids = @($catalogOf[$identity] | Where-Object { $_ })
+        $row = @($ids | ForEach-Object { $rowOf[$_.ToLowerInvariant()] } | Where-Object { $_ })[0]
+        if (-not $row) {
+            $key = if ($ids.Count) { $ids[0].ToLowerInvariant() } else { "entra:$identity" }
+            if (-not $extra.Contains($key)) {
+                $p = if ($ids.Count) { @($Packages | Where-Object { [string]$_.id -eq $ids[0] })[0] }
+                $extra[$key] = [pscustomobject]@{ Agent = $(if ($p) { [string]$p.displayName } else { $d.Name }); Ids = $ids; Platform = ''; Assessed = $false
+                                                  Indicators = @(); Keys = @(); Notable = 0; ActiveThreat = $false; Detections = @() }
+                foreach ($id in $ids) { $rowOf[$id.ToLowerInvariant()] = $extra[$key] }
+            }
+            $row = $extra[$key]
+        }
+        $row.Detections = @($row.Detections) + $d
+    }
+    $all = @(@($Rows) + @($extra.Values))
+    foreach ($r in $all) { $r | Add-Member -NotePropertyName AtRisk -NotePropertyValue ([bool]@($r.Detections | Where-Object { $_.State -in 'atRisk', 'confirmedCompromised' }).Count) -Force }
+    @($all | Sort-Object @{ e = { -[int]($_.ActiveThreat -or $_.AtRisk) } }, @{ e = { -($_.Notable + @($_.Detections).Count) } }, Agent)
+}
+
+# An agent's detections in one line, one entry per type with the latest, the most recent type first:
+# "Sign-in spike x3 (high, atRisk, 2026-11-01)".
+function Format-RiskDetections {
+    param([object[]]$Detections)
+    (@($Detections | Where-Object { $_ } | Group-Object Label | Sort-Object @{ e = { @($_.Group | Sort-Object Detected -Descending)[0].Detected }; Descending = $true } | ForEach-Object {
+        $last = @($_.Group | Sort-Object Detected -Descending)[0]
+        '{0}{1} ({2}, {3}{4})' -f $_.Name, $(if ($_.Count -gt 1) { " x$($_.Count)" } else { '' }), $last.Level, $last.State, $(if ($last.Detected) { ', ' + $last.Detected.ToString('yyyy-MM-dd') } else { '' })
+    }) -join '; ')
+}
+
+# Detections per type: how many, how many are still at risk, and on how many identities.
+function Get-RiskDetectionSummary {
+    param([object[]]$Detections)
+    @($Detections | Group-Object Label | Sort-Object @{ e = { -$_.Count } }, Name | ForEach-Object {
+        [pscustomobject]@{ Detection = $_.Name; Count = $_.Count; AtRisk = @($_.Group | Where-Object { $_.State -in 'atRisk', 'confirmedCompromised' }).Count
+                           Identities = @($_.Group | ForEach-Object { $_.IdentityId } | Get-Distinct).Count }
+    })
 }
 
 # Does a permission list satisfy the filter: any permission, a Microsoft Graph application permission, or an MCP server permission?
@@ -11727,14 +11834,31 @@ switch ($PSCmdlet.ParameterSetName) {
             $pk = @(Get-Packages)
             Write-Host 'Reading risk indicators from Microsoft Defender...' -ForegroundColor DarkGray
             $rows = @(Get-RiskIndicatorRows -Packages $pk -Nodes @(Get-AgentRiskIndicators))
-            if (-not $rows.Count) { Write-Host 'Defender has assessed no agent. It assesses risk indicators with Microsoft 365 E7, or Agent 365, and security for AI agents enabled.' -ForegroundColor Yellow; break }
-            Write-Host ("`nRisk indicators from Microsoft Defender, {0} agent(s) assessed:" -f $rows.Count) -ForegroundColor Cyan
-            Get-RiskIndicatorSummary $rows | Format-Table -AutoSize | Out-Host
-            $notable = @($rows | Where-Object { $_.Notable })
-            if ($notable.Count) { $notable | Select-Object Agent, Platform, @{ n = 'indicators'; e = { $_.Indicators -join '; ' } } | Format-Table -AutoSize -Wrap | Out-Host }
-            if ($rows.Count -gt $notable.Count) { Write-Host ('{0} more agent(s) carry no indicator, or only "Published agent". -OutFile lists every agent.' -f ($rows.Count - $notable.Count)) -ForegroundColor DarkGray }
-            Write-Host 'Defender combines these into a risk level using severities that are not in the data, so the level is not shown. Microsoft describes them at https://learn.microsoft.com/defender-xdr/security-for-ai/ai-agent-risk-assessment' -ForegroundColor DarkGray
-            Export-ActionLog -Records @($rows | Select-Object Agent, @{ n = 'CatalogIds'; e = { $_.Ids -join '; ' } }, Platform, @{ n = 'Indicators'; e = { $_.Indicators -join '; ' } }, Notable, ActiveThreat)
+            $detections = $null
+            if (Test-GraphScope 'IdentityRiskEvent.Read.All') {
+                Write-Host 'Reading risk detections from Microsoft Entra ID Protection...' -ForegroundColor DarkGray
+                try {
+                    $detections = @(Get-AgentRiskDetections)
+                    $users = try { Get-AgentUserIdsByIdentity } catch { @{} }
+                    $rows = @(Add-RiskDetectionRows -Rows $rows -Packages $pk -Detections $detections -UsersByIdentity $users)
+                } catch { Write-Warning ('Entra risk detections could not be read: {0}' -f $_.Exception.Message) }
+            }
+            if (-not $rows.Count) { Write-Host 'Defender has assessed no agent, and Entra has no risk detection for one. Defender assesses risk indicators with Microsoft 365 E7, or Agent 365, and security for AI agents enabled.' -ForegroundColor Yellow; break }
+            $assessed = @($rows | Where-Object { $_.Assessed })
+            Write-Host ("`nRisk indicators from Microsoft Defender, {0} agent(s) assessed:" -f $assessed.Count) -ForegroundColor Cyan
+            Get-RiskIndicatorSummary $assessed | Format-Table -AutoSize | Out-Host
+            if ($null -ne $detections) {
+                Write-Host ("Risk detections from Microsoft Entra ID Protection, last 90 days: {0}" -f $detections.Count) -ForegroundColor Cyan
+                if ($detections.Count) { Get-RiskDetectionSummary $detections | Select-Object Detection, Count, @{ n = 'still at risk'; e = { $_.AtRisk } }, Identities | Format-Table -AutoSize | Out-Host }
+            } else { Write-Host "`nEntra ID Protection's risk detections need the IdentityRiskEvent.Read.All permission and a role such as Security Reader. Run -SignIn once to add it." -ForegroundColor DarkGray }
+            $notable = @($rows | Where-Object { $_.Notable -or @($_.Detections).Count })
+            $columns = @('Agent', 'Platform', @{ n = 'indicators'; e = { $_.Indicators -join '; ' } })
+            if ($null -ne $detections) { $columns += @{ n = 'Entra detections'; e = { Format-RiskDetections $_.Detections } } }
+            if ($notable.Count) { $notable | Select-Object $columns | Format-Table -AutoSize -Wrap | Out-Host }
+            if ($rows.Count -gt $notable.Count) { Write-Host ('{0} more agent(s) carry no indicator, or only "Published agent", and no Entra detection. -OutFile lists every agent.' -f ($rows.Count - $notable.Count)) -ForegroundColor DarkGray }
+            Write-Host 'Defender combines its indicators into a risk level using severities that are not in the data, so the level is not shown. Microsoft describes them at https://learn.microsoft.com/defender-xdr/security-for-ai/ai-agent-risk-assessment' -ForegroundColor DarkGray
+            Export-ActionLog -Records @($rows | Select-Object Agent, @{ n = 'CatalogIds'; e = { $_.Ids -join '; ' } }, Platform, @{ n = 'Indicators'; e = { $_.Indicators -join '; ' } }, Notable, ActiveThreat,
+                                                              @{ n = 'EntraDetections'; e = { Format-RiskDetections $_.Detections } }, @{ n = 'EntraAtRisk'; e = { [bool]$_.AtRisk } })
             break
         }
         Get-Packages -AgentsOnly:$AgentsOnly |
