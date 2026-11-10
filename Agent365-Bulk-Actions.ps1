@@ -5667,7 +5667,7 @@ $script:RiskIndicatorNotes = @{
 function Get-RiskIndicatorLabel {
     param([string]$Key, [object]$Value)
     $words = ($Key -replace 'Indicator$', '') -creplace '(?<=[a-z0-9])(?=[A-Z])', ' '
-    $label = if ($words) { $words.Substring(0, 1).ToUpperInvariant() + $words.Substring(1).ToLowerInvariant() } else { $Key }
+    $label = if ($words) { ($words.Substring(0, 1).ToUpperInvariant() + $words.Substring(1).ToLowerInvariant()) -creplace '\b(Ai|ai)\b', 'AI' -creplace '\b(Mcp|mcp)\b', 'MCP' } else { $Key }
     $text = if ($null -eq $Value -or $Value -is [string]) { [string]$Value } else { $Value | ConvertTo-Json -Compress -Depth 3 }
     if ($text -match '"[A-Za-z]*[Ll]evel"\s*:\s*"([^"]+)"') { '{0} ({1})' -f $label, $Matches[1] } else { $label }
 }
@@ -5726,6 +5726,7 @@ $script:AgentRiskDetectionTypes = @{
     signInSpike                    = @('Sign-in spike', 'The agent signed in far more often than usual, which can mean automation or a toolkit.')
     suspiciousCredentialUsage      = @('Suspicious credential usage', 'New credentials were added to the agent''s blueprint and then used.')
     unfamiliarResourceAccess       = @('Unfamiliar resource access', 'The agent targeted resources it does not usually access.')
+    aiCompoundAccountRisk          = @('Unified risk signals', 'Entra raised the agent''s risk by combining signals from other Microsoft security products, such as Security for AI in Defender.')
 }
 
 # The words for a detection type, from Microsoft's list or, for a type added later, from its name.
@@ -11858,9 +11859,11 @@ switch ($PSCmdlet.ParameterSetName) {
                 if ($detections.Count) { Get-RiskDetectionSummary $detections | Select-Object Detection, Count, @{ n = 'still at risk'; e = { $_.AtRisk } }, Identities | Format-Table -AutoSize | Out-Host }
             } else { Write-Host "`nEntra ID Protection's risk detections need the IdentityRiskEvent.Read.All permission and a role such as Security Reader. Run -SignIn once to add it." -ForegroundColor DarkGray }
             $notable = Select-NotableRiskRows $rows
-            $columns = @('Agent', 'Platform', @{ n = 'indicators'; e = { $_.Indicators -join '; ' } })
-            if ($null -ne $detections) { $columns += @{ n = 'Entra detections'; e = { Format-RiskDetections $_.Detections } } }
-            if ($notable.Count) { $notable | Select-Object $columns | Format-Table -AutoSize -Wrap | Out-Host }
+            foreach ($r in $notable) {
+                Write-Host ('{0}{1}' -f $r.Agent, $(if ($r.Platform) { "  ($($r.Platform))" } else { '' })) -ForegroundColor White
+                if ($r.Indicators.Count) { Write-Host ('  Defender: {0}' -f ($r.Indicators -join '; ')) }
+                if (@($r.Detections | Where-Object { $_ }).Count) { Write-Host ('  Entra:    {0}' -f (Format-RiskDetections $r.Detections)) }
+            }
             if ($rows.Count -gt $notable.Count) { Write-Host ('{0} more agent(s) carry no indicator, or only "Published agent", and no Entra detection. -OutFile lists every agent.' -f ($rows.Count - $notable.Count)) -ForegroundColor DarkGray }
             Write-Host 'Defender combines its indicators into a risk level using severities that are not in the data, so the level is not shown. Microsoft describes them at https://learn.microsoft.com/defender-xdr/security-for-ai/ai-agent-risk-assessment' -ForegroundColor DarkGray
             Export-ActionLog -Records @($rows | Select-Object Agent, @{ n = 'CatalogIds'; e = { $_.Ids -join '; ' } }, Platform, @{ n = 'Indicators'; e = { $_.Indicators -join '; ' } }, Notable, ActiveThreat,

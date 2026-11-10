@@ -551,6 +551,9 @@ Describe 'Entra risk detections' {
         Get-RiskDetectionLabel 'signInSpike' | Should -Be 'Sign-in spike'
         Get-RiskDetectionLabel 'adminConfirmedAgentCompromised' | Should -Be 'Confirmed compromised'
         Get-RiskDetectionLabel 'someNewDetection' | Should -Be 'Some new detection'
+        Get-RiskDetectionLabel 'aiCompoundAccountRisk' | Should -Be 'Unified risk signals'
+        Get-RiskDetectionLabel 'aiPromptAbuse' | Should -Be 'AI prompt abuse'
+        Get-RiskIndicatorLabel -Key 'exposedMcpServerIndicator' | Should -Be 'Exposed MCP server'
     }
     It 'reads 90 days once in ten minutes, asking for every value of the identity type' {
         $script:HuntingCache.Remove('agentriskdetections')
