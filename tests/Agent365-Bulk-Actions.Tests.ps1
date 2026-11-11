@@ -232,6 +232,60 @@ Describe 'Risk query' {
         $idx['t_abc'].DetectionCount | Should -Be 5
         $idx['t_abc'].Reasons | Should -Be 'x; y'
     }
+    It 'files a row with an environment-scoped agent id under the id inside it too, so the agent matches its manifest id' {
+        $scoped = 'Default-00000000-0000-0000-0000-000000000001_11111111-2222-3333-4444-555555555555'
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Key = 'Default-00000000-0000-0000-0000-000000000001_11111111-2222-3333-4444-555555555555'; AlertCount = 3; DetectionCount = 1; Severity = 'Medium'; LastAlert = $null; Reasons = @('x'); Categories = @() }) }
+        $idx = Get-RiskyIndex -Days 30
+        $idx[$scoped.ToLowerInvariant()].AlertCount | Should -Be 3
+        $idx['11111111-2222-3333-4444-555555555555'].AlertCount | Should -Be 3
+        $script:HuntingCache = @{}
+        $p = New-Pkg 'T_B' 'Beta'; $p.manifestId = '11111111-2222-3333-4444-555555555555'
+        (Get-AgentRisk $p).AlertCount | Should -Be 3
+        Get-AgentRisk (New-Pkg 'T_C' 'Gamma') | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Package risk' {
+    It 'adds up the entries under all of an agent''s ids, each once, keeping the worst severity and the latest signal' {
+        $alerts = [pscustomobject]@{ AlertCount = 8; DetectionCount = 2; Severity = 'Medium'; LastAlert = [datetimeoffset]'2026-10-19T10:00:00Z'; Reasons = 'Jailbreak; Tool misuse'; Categories = 'Jailbreak' }
+        $shield = [pscustomobject]@{ AlertCount = 0; DetectionCount = 1; Severity = 'High'; LastAlert = [datetimeoffset]'2026-10-01T10:00:00Z'; Reasons = 'Prompt Shield blocked a jailbreak attempt; Jailbreak'; Categories = 'Jailbreak' }
+        $p = New-Pkg 'T_B' 'Beta'; $p.manifestId = 'm-1'
+        $idx = @{ 't_b' = $shield; 'm-1' = $alerts; 'default-x_m-1' = $alerts }
+        $r = Get-PackageRisk -Package $p -Index $idx
+        $r.AlertCount | Should -Be 8; $r.DetectionCount | Should -Be 3; $r.Severity | Should -Be 'High'
+        $r.LastAlert | Should -Be ([datetimeoffset]'2026-10-19T10:00:00Z')
+        $r.Reasons | Should -Be 'Prompt Shield blocked a jailbreak attempt; Jailbreak; Tool misuse'
+        $r.Categories | Should -Be 'Jailbreak'
+    }
+    It 'returns the one entry as it is, or nothing' {
+        $one = [pscustomobject]@{ AlertCount = 1; DetectionCount = 0; Severity = 'Low'; LastAlert = $null; Reasons = ''; Categories = '' }
+        Get-PackageRisk -Package (New-Pkg 'T_A' 'Alpha') -Index @{ 't_a' = $one; 'app-t_a' = $one } | Should -Be $one
+        Get-PackageRisk -Package (New-Pkg 'T_A' 'Alpha') -Index @{} | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Agent key forms' {
+    It 'gives the id in lower case, then the id inside an environment-scoped id' {
+        @(Get-AgentKeyForms 'Default-00000000-0000-0000-0000-000000000001_ABCDEF00-1111-2222-3333-444444444444') |
+            Should -Be @('default-00000000-0000-0000-0000-000000000001_abcdef00-1111-2222-3333-444444444444', 'abcdef00-1111-2222-3333-444444444444')
+        @(Get-AgentKeyForms '00000000-0000-0000-0000-000000000002_abcdef00-1111-2222-3333-444444444444') | Select-Object -Last 1 | Should -Be 'abcdef00-1111-2222-3333-444444444444'
+        @(Get-AgentKeyForms ' Bot-1 ') | Should -Be @('bot-1')
+        @(Get-AgentKeyForms 'T_00000000-0000-0000-0000-000000000003') | Should -Be @('t_00000000-0000-0000-0000-000000000003')
+        @(Get-AgentKeyForms '').Count | Should -Be 0
+    }
+}
+
+Describe 'Endpoint times' {
+    It 'shows Advanced Hunting''s UTC times in local time, like the text it may also send' {
+        $utc = [datetime]::SpecifyKind([datetime]'2026-10-06T10:00:00', [DateTimeKind]::Utc)
+        $t = ConvertTo-EndpointTime $utc
+        $t.Kind | Should -Be ([DateTimeKind]::Local)
+        $t | Should -Be $utc.ToLocalTime()
+        (ConvertTo-EndpointTime '2026-10-06T10:00:00Z') | Should -Be $t
+        $local = Get-Date
+        ConvertTo-EndpointTime $local | Should -Be $local
+        ConvertTo-EndpointTime '' | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Get-RiskyPackages' {
@@ -259,7 +313,7 @@ Describe 'Get-DeleteCandidates' {
         $empty = Join-Path $TestDrive 'empty'; New-Item -ItemType Directory -Force $empty | Out-Null
         $script:empty = $empty
         $script:logFile = Join-Path $TestDrive 'history.csv'
-        [pscustomobject]@{ Timestamp = $script:old; Action = 'block'; Id = 'P_old'; Result = 'Done' } | Export-Csv $script:logFile -NoTypeInformation
+        [pscustomobject]@{ Timestamp = $script:old; Action = 'block'; Id = 'P_old'; Result = 'Done' } | Export-Csv $script:logFile
     }
     It 'lists agents blocked long enough, using logs and audit events' {
         $c = @(Get-DeleteCandidates -MinDays 30 -HistoryPaths $script:logFile -LogDir $script:empty)
@@ -278,7 +332,7 @@ Describe 'Get-DeleteCandidates' {
     }
     It 'never reports an agent that was unblocked afterwards' {
         $later = [datetimeoffset]::UtcNow.AddDays(-10).ToString('o')
-        [pscustomobject]@{ Timestamp = $later; Action = 'unblock'; Id = 'P_old'; Result = 'Done' } | Export-Csv $script:logFile -NoTypeInformation -Append
+        [pscustomobject]@{ Timestamp = $later; Action = 'unblock'; Id = 'P_old'; Result = 'Done' } | Export-Csv $script:logFile -Append
         (Get-DeleteCandidates -MinDays 0 -HistoryPaths $script:logFile -LogDir $script:empty -IncludeUnknown | Where-Object Id -eq 'P_old').BlockedSince | Should -Be 'unknown'
     }
 }
@@ -3605,6 +3659,20 @@ Describe 'Policy hits: clarity and Defender alerts' {
         $g = $r | Where-Object AlertId -eq 'al2'
         $g.Agent | Should -Be 'Ghost agent'; $g.AgentId | Should -Be ''; $g.InInventory | Should -BeFalse; $g.Source | Should -Be 'Security for AI'
     }
+    It 'ties an alert the inventory does not name to its agent by the agent id on the alert' {
+        $script:AgentAlertKql | Should -Match 'AgentKey = K,'
+        Mock Get-MgContext { [pscustomobject]@{ Account = 'a@b'; TenantId = 'ten-1' } }
+        Mock Invoke-HuntingQuery {
+            @([pscustomobject]@{ Timestamp = '2026-10-06T10:00:00Z'; AlertId = 'al3'; CatalogId = ''; AgentKey = 'default-00000000-0000-0000-0000-000000000001_11111111-2222-3333-4444-555555555555'; Label = 'Builder agent'; Title = 'Odd tool call'; Severity = 'Medium'; Category = 'Execution'; ServiceSource = 'Security for AI'; DetectionSource = ''; Via = 'Agent entity' },
+              [pscustomobject]@{ Timestamp = '2026-10-06T09:00:00Z'; AlertId = 'al4'; CatalogId = ''; AgentKey = 'no-such-agent'; Label = 'Ghost agent'; Title = 'Odd tool call'; Severity = 'Low'; Category = 'Execution'; ServiceSource = 'Security for AI'; DetectionSource = ''; Via = 'Agent entity' })
+        }
+        $p = New-Pkg 'T_B' 'Beta'; $p.manifestId = '11111111-2222-3333-4444-555555555555'
+        $r = @(Get-AgentDefenderAlerts -Packages @($p))
+        $b = $r | Where-Object AlertId -eq 'al3'
+        $b.Agent | Should -Be 'Beta'; $b.AgentId | Should -Be 'T_B'; $b.InInventory | Should -BeTrue
+        $g = $r | Where-Object AlertId -eq 'al4'
+        $g.Agent | Should -Be 'Ghost agent'; $g.InInventory | Should -BeFalse
+    }
     It 'selects the alerts of a period, at or above a severity, for chosen agents or a text, worst and newest first' {
         $now = Get-Date
         $rows = @((New-AlertRow -Title 'Old high' -Severity 'High' -Time $now.AddDays(-20)), (New-AlertRow -Title 'New low' -Severity 'Low' -Time $now.AddDays(-1)),
@@ -4829,7 +4897,7 @@ Describe 'Cached hunting results' {
         Mock Invoke-HuntingQuery { @([pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-40).ToString('o'); ActionType = 'BlockedAgent'; AgentId = 'T_A' }) }
         $pk = @((New-Pkg 'T_A' 'Alpha' -Blocked $true), (New-Pkg 'T_B' 'Beta' -Blocked $true))
         @(Get-DeleteCandidates -MinDays 30 -LogDir $logs -Packages $pk).Id | Should -Be @('T_A')
-        [pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-50).ToString('o'); Action = 'block'; Id = 'T_B'; Result = 'Done' } | Export-Csv (Join-Path $logs 'run.csv') -NoTypeInformation
+        [pscustomobject]@{ Timestamp = [datetimeoffset]::UtcNow.AddDays(-50).ToString('o'); Action = 'block'; Id = 'T_B'; Result = 'Done' } | Export-Csv (Join-Path $logs 'run.csv')
         @(Get-DeleteCandidates -MinDays 45 -LogDir $logs -Packages $pk).Id | Should -Be @('T_B')
         Should -Invoke Invoke-HuntingQuery -Times 1 -Exactly
     }
