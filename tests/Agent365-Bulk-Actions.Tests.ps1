@@ -602,6 +602,63 @@ Describe 'Entra risk detections' {
     }
 }
 
+Describe 'Console risk signals' {
+    BeforeAll {
+        $script:sigPk = @([pscustomobject]@{ id = 'T_A'; displayName = 'Alpha'; agentIdentityId = 'I1' }, [pscustomobject]@{ id = 'T_A2'; displayName = 'Alpha (published)' },
+                          [pscustomobject]@{ id = 'T_B'; displayName = 'Beta'; agentIdentityId = 'I2' }, [pscustomobject]@{ id = 'T_C'; displayName = 'Gamma' })
+        $script:sigNodes = @(
+            [pscustomobject]@{ Name = 'Alpha'; Platform = 'Copilot Studio'; TitleIds = @('t_a', 't_a2'); Keys = @('publishedAgentIndicator', 'activeThreatIndicator', 'weakInstructionsIndicator'); Values = @('true', 'true', 'true') },
+            [pscustomobject]@{ Name = 'Gamma'; Platform = 'Foundry'; TitleIds = @('t_c'); Keys = @('publishedAgentIndicator'); Values = @('true') })
+        $script:sigDets = @([pscustomobject]@{ Type = 'aiCompoundAccountRisk'; Label = 'Unified risk signals'; Level = 'low'; State = 'atRisk'; IdentityId = 'i2'; IdentityType = 'agentIdentity'; Name = 'Beta'; Detected = [datetimeoffset]'2026-11-05T00:00:00Z' })
+    }
+    It 'maps every catalog entry of an agent to its indicators and Entra detections' {
+        $m = Get-RiskSignalMap -Packages $script:sigPk -Nodes $script:sigNodes -Detections $script:sigDets
+        $m['t_a'] | Should -Be $m['t_a2']
+        $m['t_a'].ActiveThreat | Should -BeTrue; $m['t_a'].Notable | Should -Be 2
+        $m['t_b'].Assessed | Should -BeFalse; $m['t_b'].AtRisk | Should -BeTrue
+        $m['t_c'].Notable | Should -Be 0
+        $m.ContainsKey('t_d') | Should -BeFalse
+    }
+    It 'leaves the Entra part out when the detections were not read' {
+        $m = Get-RiskSignalMap -Packages $script:sigPk -Nodes $script:sigNodes -Detections $null
+        $m.ContainsKey('t_b') | Should -BeFalse
+        Test-RiskSignalMatch -Entry $m['t_a'] -Mode 'entra' | Should -BeFalse
+    }
+    It 'writes the cells with the worst first when sorted' {
+        $m = Get-RiskSignalMap -Packages $script:sigPk -Nodes $script:sigNodes -Detections $script:sigDets
+        $a = Get-RiskSignalCells $m['t_a']
+        $a.Indicators | Should -Be 'Active threat; Weak instructions; Published agent'; $a.IndicatorsSort | Should -Be 102; $a.EntraRisk | Should -Be ''
+        $b = Get-RiskSignalCells $m['t_b']
+        $b.Indicators | Should -Be ''; $b.EntraRisk | Should -Be 'Unified risk signals (low, atRisk, 2026-11-05)'; $b.EntraRiskSort | Should -Be 1001
+        $none = Get-RiskSignalCells $null
+        $none.Indicators | Should -Be ''; $none.EntraRisk | Should -Be ''; $none.IndicatorsSort | Should -Be 0
+    }
+    It 'matches the Indicators filter: an indicator besides Published agent, an active threat, or still at risk in Entra' {
+        $m = Get-RiskSignalMap -Packages $script:sigPk -Nodes $script:sigNodes -Detections $script:sigDets
+        $match = { param($Mode) @('t_a', 't_b', 't_c', 't_d' | Where-Object { Test-RiskSignalMatch -Entry $m[$_] -Mode $Mode }) }
+        & $match 'notable' | Should -Be @('t_a')
+        & $match 'activeThreat' | Should -Be @('t_a')
+        & $match 'entra' | Should -Be @('t_b')
+        @(& $match 'other').Count | Should -Be 0
+    }
+    It 'gives the console the controls, columns and Home card that show them' {
+        $GuiXaml | Should -Match 'x:Name="RiskColsBox"'
+        $GuiXaml | Should -Match '(?s)x:Name="IndicatorBox".*?Tag="notable".*?Tag="activeThreat".*?Tag="entra"'
+        $GuiXaml | Should -Match 'Header="Risk indicators" Binding="\{Binding Indicators\}"[^>]*SortMemberPath="IndicatorsSort"'
+        $GuiXaml | Should -Match 'Header="Entra risk" Binding="\{Binding EntraRisk\}"[^>]*SortMemberPath="EntraRiskSort"'
+        $GuiXaml | Should -Match 'Tag="agents:indicators".*x:Name="HomeIndicators"'
+    }
+    It 'finds every control the console looks up by name in its layout' {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\Agent365-Bulk-Actions.ps1'), [ref]$null, [ref]$null)
+        $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-ConsoleWindow' }, $true)
+        $loop = $fn.Find({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] -and $n.Body.Extent.Text -match '\$script:ui\[\$n\]' }, $true)
+        $names = @($loop.Condition.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+        $names.Count | Should -BeGreaterThan 40
+        $names | Should -Contain 'IndicatorBox'
+        @($names | Where-Object { $GuiXaml -notmatch ('x:Name="{0}"' -f [regex]::Escape($_)) }) | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Graph batching' {
     BeforeEach {
         Mock Write-Progress { }

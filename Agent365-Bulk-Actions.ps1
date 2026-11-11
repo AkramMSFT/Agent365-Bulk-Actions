@@ -5806,6 +5806,41 @@ function Select-NotableRiskRows {
     @($Rows | Where-Object { $_.Notable -or @($_.Detections | Where-Object { $_ }).Count })
 }
 
+# Each catalog entry's risk indicators and Entra detections for the console, by catalog id in lower case. Detections are $null
+# when they were not read (no permission), and then rows carry no Entra columns.
+function Get-RiskSignalMap {
+    param([object[]]$Packages, [object[]]$Nodes, [object[]]$Detections, [hashtable]$UsersByIdentity = @{})
+    $rows = @(Get-RiskIndicatorRows -Packages $Packages -Nodes $Nodes)
+    if ($null -ne $Detections) { $rows = @(Add-RiskDetectionRows -Rows $rows -Packages $Packages -Detections $Detections -UsersByIdentity $UsersByIdentity) }
+    $map = @{}
+    foreach ($r in $rows) { foreach ($id in @($r.Ids)) { if ($id) { $map[([string]$id).ToLowerInvariant()] = $r } } }
+    $map
+}
+
+# The console's cells for one entry: the indicators and the detections as text, each with a value to sort by (an active threat
+# or a detection still at risk first, then how many).
+function Get-RiskSignalCells {
+    param([object]$Entry)
+    $det = @($Entry.Detections | Where-Object { $_ })
+    [pscustomobject]@{
+        Indicators = (@($Entry.Indicators) -join '; '); IndicatorsSort = [int]$Entry.Notable + $(if ($Entry.ActiveThreat) { 100 } else { 0 })
+        EntraRisk = $(if ($det.Count) { Format-RiskDetections $det } else { '' }); EntraRiskSort = $det.Count + $(if ($Entry.AtRisk) { 1000 } else { 0 })
+    }
+}
+
+# Does an entry match the console's Indicators filter: notable (an indicator besides Published agent), activeThreat, or entra
+# (a detection still at risk)?
+function Test-RiskSignalMatch {
+    param([object]$Entry, [string]$Mode)
+    if (-not $Entry) { return $false }
+    switch ($Mode) {
+        'notable'      { [bool]$Entry.Notable }
+        'activeThreat' { [bool]$Entry.ActiveThreat }
+        'entra'        { [bool]$Entry.AtRisk }
+        default        { $false }
+    }
+}
+
 # Detections per type: how many, how many are still at risk, and on how many identities.
 function Get-RiskDetectionSummary {
     param([object[]]$Detections)
@@ -6961,7 +6996,11 @@ $GuiXaml = @'
         <Trigger Property="IsSelected" Value="True"><Setter Property="Background" Value="#E6F0FA"/></Trigger>
       </Style.Triggers>
     </Style>
-    <Style x:Key="Cell" TargetType="TextBlock"><Setter Property="TextTrimming" Value="CharacterEllipsis"/></Style>
+    <Style x:Key="Cell" TargetType="TextBlock">
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+      <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+      <Style.Triggers><Trigger Property="Text" Value=""><Setter Property="ToolTip" Value="{x:Null}"/></Trigger></Style.Triggers>
+    </Style>
     <Style x:Key="Pill" TargetType="Border">
       <Setter Property="CornerRadius" Value="10"/><Setter Property="Padding" Value="10,2"/><Setter Property="HorizontalAlignment" Value="Left"/>
     </Style>
@@ -7093,6 +7132,7 @@ $GuiXaml = @'
             <TextBlock Text="Security" FontSize="16" FontWeight="SemiBold" Foreground="{StaticResource Ink}" Margin="0,8,0,10"/>
             <WrapPanel>
               <Button Style="{StaticResource HomeCard}" Tag="alerts"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Defender alerts, 30 days"/><TextBlock x:Name="HomeAlerts" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeAlertsSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
+              <Button Style="{StaticResource HomeCard}" Tag="agents:indicators"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Agents with risk indicators"/><TextBlock x:Name="HomeIndicators" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeIndicatorsSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
               <Button Style="{StaticResource HomeCard}" Tag="ca"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Not protected by Conditional Access"/><TextBlock x:Name="HomeCa" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeCaSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
               <Button Style="{StaticResource HomeCard}" Tag="tools:unused"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Unused MCP permissions"/><TextBlock x:Name="HomeMcp" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeMcpSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
               <Button Style="{StaticResource HomeCard}" Tag="users:unlicensed"><StackPanel><TextBlock Style="{StaticResource CardLabel}" Text="Users without a license"/><TextBlock x:Name="HomeUsers" Style="{StaticResource CardValue}" Text="-"/><TextBlock x:Name="HomeUsersSub" Style="{StaticResource CardSub}"/></StackPanel></Button>
@@ -7140,6 +7180,7 @@ $GuiXaml = @'
                 <Button x:Name="BtnReset" Grid.Column="2" Content="Reset filters" Style="{StaticResource Btn}" Padding="14,6" Margin="16,0,0,0" HorizontalAlignment="Left" IsEnabled="False"/>
                 <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
                   <CheckBox x:Name="DetailColsBox" Content="Tools and sharing columns" Margin="0,0,18,0" ToolTip="Adds tools, MCP servers, sharing and channels to the grid (reads Defender agent records once)."/>
+                  <CheckBox x:Name="RiskColsBox" Content="Risk indicator columns" Margin="0,0,18,0" ToolTip="Adds Defender's risk indicators and Entra ID Protection's risk detections (last 90 days) to the grid. Refresh catalog reads them again."/>
                   <CheckBox x:Name="AgentsOnlyBox" Content="Copilot agents only"/>
                 </StackPanel>
               </Grid>
@@ -7176,6 +7217,14 @@ $GuiXaml = @'
                     <ComboBoxItem Content="Alerts only" Tag="Alerts"/>
                     <ComboBoxItem Content="Detections only" Tag="Detections"/>
                   </ComboBox>
+                  <Rectangle Width="1" Fill="{StaticResource Line}" Margin="22,2,22,2"/>
+                  <TextBlock Text="Indicators" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                  <ComboBox x:Name="IndicatorBox" Width="215" SelectedIndex="0" ToolTip="Defender's risk indicators, and Entra ID Protection's risk detections of the last 90 days. Shows the Risk indicators and Entra risk columns.">
+                    <ComboBoxItem Content="None" Tag=""/>
+                    <ComboBoxItem Content="Any besides Published agent" Tag="notable"/>
+                    <ComboBoxItem Content="Active threat" Tag="activeThreat"/>
+                    <ComboBoxItem Content="At risk in Entra" Tag="entra"/>
+                  </ComboBox>
                 </WrapPanel>
                 <WrapPanel VerticalAlignment="Center" Margin="0,10,0,0">
                   <TextBlock Text="" Width="84"/>
@@ -7199,8 +7248,8 @@ $GuiXaml = @'
                   <TextBlock Text="Match" VerticalAlignment="Center" Margin="0,0,8,0"/>
                   <Border Background="#E5E7EB" CornerRadius="7" Padding="1" VerticalAlignment="Center">
                     <StackPanel Orientation="Horizontal">
-                      <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale and Risk filter (default)"/>
-                      <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale and Risk filters"/>
+                      <RadioButton x:Name="MatchAll" Content="All" GroupName="m" IsChecked="True" Style="{StaticResource Seg}" ToolTip="An agent must match every active Stale, Risk and Indicators filter (default)"/>
+                      <RadioButton x:Name="MatchAny" Content="Any" GroupName="m" Style="{StaticResource Seg}" ToolTip="An agent may match any one of the active Stale, Risk and Indicators filters"/>
                     </StackPanel>
                   </Border>
                 </WrapPanel>
@@ -7298,6 +7347,8 @@ $GuiXaml = @'
                   <DataGridTextColumn Header="Alerts" Binding="{Binding Alerts}" Width="62" SortMemberPath="AlertsSort" IsReadOnly="True"/>
                   <DataGridTextColumn Header="Detections" Binding="{Binding Detections}" Width="90" SortMemberPath="DetectionsSort" IsReadOnly="True"/>
                   <DataGridTextColumn Header="Why" Binding="{Binding Why}" Width="2*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
+                  <DataGridTextColumn Header="Risk indicators" Binding="{Binding Indicators}" Width="2*" SortMemberPath="IndicatorsSort" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
+                  <DataGridTextColumn Header="Entra risk" Binding="{Binding EntraRisk}" Width="2*" SortMemberPath="EntraRiskSort" IsReadOnly="True" ElementStyle="{StaticResource Cell}" Visibility="Collapsed"/>
                   <DataGridTextColumn Header="Available to" Binding="{Binding Availability}" Width="150" IsReadOnly="True" Visibility="Collapsed" ElementStyle="{StaticResource Cell}"/>
                   <DataGridTextColumn Header="Suggested owner" Binding="{Binding Suggested}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
                   <DataGridTextColumn Header="Ownership note" Binding="{Binding OwnerNote}" Width="1.5*" IsReadOnly="True" ElementStyle="{StaticResource Cell}"/>
@@ -7362,7 +7413,8 @@ $GuiXaml = @'
 # Row model with change notification so checkboxes, status pills and analysis columns update live.
 if (-not ('AgentRow' -as [type])) {
     $notifyProps = 'Checked:bool', 'IsBlocked:bool', 'LastActivity:string', 'Idle:string', 'IdleSort:int',
-                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int', 'Availability:string'
+                   'Risk:string', 'RiskSort:int', 'Alerts:string', 'AlertsSort:int', 'Detections:string', 'DetectionsSort:int', 'Why:string', 'PermNote:string', 'Kind:string', 'ToolCount:string', 'ToolCountSort:int', 'Mcp:string', 'ToolsText:string', 'SharedCount:string', 'Channels:string', 'Owner:string', 'Suggested:string', 'OwnerNote:string', 'BlockedFor:string', 'BlockedForSort:int', 'Availability:string',
+                   'Indicators:string', 'IndicatorsSort:int', 'EntraRisk:string', 'EntraRiskSort:int'
     $props = foreach ($np in $notifyProps) {
         $n, $t = $np -split ':'
         "private $t _$n; public $t $n { get { return _$n; } set { if (_$n == value) return; _$n = value; Notify(`"$n`"); $(if ($n -eq 'IsBlocked') { 'Notify("Status");' }) } }"
@@ -10976,6 +11028,7 @@ function Invoke-ShellCard {
         'agents'           { $script:ui.FltAll.IsChecked = $true; & $script:ctx.Refilter }
         'agents:blocked'   { $script:ui.FltBlocked.IsChecked = $true; & $script:ctx.Refilter }
         'agents:owner'     { $script:ui.OwnerBox.SelectedIndex = 1 }
+        'agents:indicators' { if ($script:ui.IndicatorBox.SelectedIndex -ne 1) { $script:ui.IndicatorBox.SelectedIndex = 1 } }
         'tools:unused'     { $script:mcWindow.FindName('McShowBox').SelectedIndex = 1 }
         'users:unlicensed' { $script:auWindow.FindName('AuUnlicensed').IsChecked = $true; Update-AgentUsersWindow -Window $script:auWindow }
     }
@@ -10995,6 +11048,12 @@ function Update-ShellHome {
         $a = @(Select-AgentAlertRows -Rows $script:aaWindow.Tag -Days 30 -OnlyIds $script:aaState.OnlyIds)
         & $set 'HomeAlerts' $a.Count (('{0} high, on {1} agent(s).' -f @($a | Where-Object { $_.Severity -eq 'High' }).Count, @($a | ForEach-Object { if ($_.AgentId) { $_.AgentId } else { $_.Agent } } | Get-Distinct).Count) + (& $scopeOf $script:aaState))
     } else { & $set 'HomeAlerts' '-' 'Not read yet. Select to open Alerts.' }
+    if ($null -ne $script:ctx.RiskSignals) {
+        $entries = @($rows | ForEach-Object { $script:ctx.RiskSignals[$_.Id.ToLowerInvariant()] })
+        $n = { param($Mode) @($entries | Where-Object { Test-RiskSignalMatch -Entry $_ -Mode $Mode }).Count }
+        $entra = if ($script:ctx.EntraNote) { 'Entra detections were not read.' } else { '{0} at risk in Entra.' -f (& $n 'entra') }
+        & $set 'HomeIndicators' (& $n 'notable') ('Besides Published agent. {0} with an active threat. {1}' -f (& $n 'activeThreat'), $entra)
+    } else { & $set 'HomeIndicators' '-' 'Not read yet. Select to list them on All agents.' }
     if ($script:caWindow -and $script:caWindow.Tag) {
         $c = @(Get-CaDistinctRows @($script:caWindow.Tag.Rows))
         & $set 'HomeCa' @($c | Where-Object { $_.Overall -notin 'Would block', 'Proven' }).Count (('{0}, of {1} agent(s) with an identity.' -f (Format-CaVerdictCounts $c), $c.Count) + (& $scopeOf $script:caState))
@@ -11014,11 +11073,11 @@ function New-ConsoleWindow {
     $script:w = [Windows.Markup.XamlReader]::Parse($GuiXaml)
     $script:ui = @{}
     foreach ($n in 'Account', 'BtnNewVersion', 'CountTotal', 'CountBlocked', 'CountShown', 'BtnRefresh', 'Search', 'FltAll', 'FltActive', 'FltBlocked',
-                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'ScopeText', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny',
+                   'AgentsOnlyBox', 'StaleBox', 'NeverSeenBox', 'RiskBox', 'SignalBox', 'BtnReset', 'OwnerBox', 'BlockedBox', 'IdentityBox', 'BtnAssign', 'BtnApplyOwner', 'BtnCompromise', 'DetailColsBox', 'BtnDetails', 'BtnAi', 'BtnRestrict', 'ScopeText', 'AccessBox', 'ToolsBox', 'PermBox', 'MatchAll', 'MatchAny', 'RiskColsBox', 'IndicatorBox',
                     'Grid', 'HeaderCheck', 'EmptyNote', 'EmptyText', 'SelectedText', 'BtnSelectVisible', 'BtnClearSel',
                    'BtnExport', 'BtnUndo', 'BtnUnblock', 'BtnBlock', 'Status') { $script:ui[$n] = $script:w.FindName($n) }
 
-    $script:ctx = @{ Window = $script:w; RowById = @{}; Bulk = $false; Resetting = $false; Loaded = $false; OwnerMode = 'owner'; InfoTable = $null; ToolsSet = $null; PermSet = $null; AccessSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @() }
+    $script:ctx = @{ Window = $script:w; RowById = @{}; Bulk = $false; Resetting = $false; Loaded = $false; OwnerMode = 'owner'; InfoTable = $null; ToolsSet = $null; PermSet = $null; AccessSet = $null; PermCache = @{}; StaleSet = $null; RiskSet = $null; OwnerSet = $null; BlockedSet = $null; Suggest = @{}; LastRun = @(); RiskSignals = $null; IndicatorSet = $null; EntraNote = '' }
     $script:ctx.Rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[AgentRow]'
     $script:ctx.View = [Windows.Data.CollectionViewSource]::GetDefaultView($script:ctx.Rows)
     $script:ui.Grid.ItemsSource = $script:ctx.View
@@ -11100,13 +11159,13 @@ function New-ConsoleWindow {
             if ($null -ne $s -and -not $s.Contains($o.Id)) { return $false }
         }
         $active = 0; $hits = 0
-        foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet) { if ($null -ne $s) { $active++; if ($s.Contains($o.Id)) { $hits++ } } }
+        foreach ($s in $script:ctx.StaleSet, $script:ctx.RiskSet, $script:ctx.IndicatorSet) { if ($null -ne $s) { $active++; if ($s.Contains($o.Id)) { $hits++ } } }
         if ($active) {
             if ($script:ui.MatchAny.IsChecked) { if ($hits -eq 0) { return $false } }
             elseif ($hits -ne $active) { return $false }
         }
         $q = $script:ui.Search.Text.Trim()
-        if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Kind, $o.ToolsText, $o.Mcp, $o.Id) -join ' ').ToLowerInvariant().Contains($q.ToLowerInvariant())) { return $false }
+        if ($q -and -not (($o.Name, $o.Publisher, $o.Platform, $o.Kind, $o.ToolsText, $o.Mcp, $o.Indicators, $o.EntraRisk, $o.Id) -join ' ').ToLowerInvariant().Contains($q.ToLowerInvariant())) { return $false }
         $true
     }
     $script:ctx.View.Filter = [Predicate[object]]$script:ctx.Filter
@@ -11157,7 +11216,7 @@ function New-ConsoleWindow {
 
     $script:ctx.FilterActive = {
         [bool]($script:ui.Search.Text.Trim() -or $script:ui.FltActive.IsChecked -or $script:ui.FltBlocked.IsChecked -or
-               $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or
+               $script:ui.AgentsOnlyBox.IsChecked -or $null -ne $script:ctx.StaleSet -or $null -ne $script:ctx.RiskSet -or $null -ne $script:ctx.IndicatorSet -or
                $null -ne $script:ctx.OwnerSet -or $null -ne $script:ctx.BlockedSet -or $null -ne $script:ctx.ToolsSet -or $null -ne $script:ctx.PermSet -or $null -ne $script:ctx.AccessSet -or @($script:ctx.ColActive).Count -gt 0)
     }
     $script:ctx.Refilter = { $script:ctx.View.Refresh(); & $script:ctx.Summary; & $script:ctx.Columns; $script:ui.BtnReset.IsEnabled = (& $script:ctx.FilterActive) }
@@ -11192,6 +11251,8 @@ function New-ConsoleWindow {
             & $script:ctx.FillInfo
             & $script:ctx.Refilter
             Reset-ShellPages
+            $script:ctx.RiskSignals = $null
+            if ($script:ui.RiskColsBox.IsChecked -and (& $script:ctx.EnsureRiskSignals)) { & $script:ctx.Refilter }
             if ($script:shell -and $script:shell.Current -eq 'home') { Update-ShellHome }
             & $script:ctx.Idle ("Loaded {0} packages at {1}." -f $pkgs.Count, (Get-Date).ToString('HH:mm:ss'))
         } catch { & $script:ctx.Idle ('Load failed: ' + $_.Exception.Message); [void][Windows.MessageBox]::Show($_.Exception.Message, 'Could not load the catalog', 'OK', 'Error') }
@@ -11206,6 +11267,7 @@ function New-ConsoleWindow {
         $script:ui.Search.Text = ''; $script:ui.FltAll.IsChecked = $true; $script:ui.AgentsOnlyBox.IsChecked = $false
         $script:ui.StaleBox.SelectedIndex = 0; $script:ui.RiskBox.SelectedIndex = 0; $script:ui.SignalBox.SelectedIndex = 0; $script:ui.NeverSeenBox.IsChecked = $false; $script:ui.MatchAll.IsChecked = $true
         $script:ui.OwnerBox.SelectedIndex = 0; $script:ui.BlockedBox.SelectedIndex = 0; $script:ui.ToolsBox.SelectedIndex = 0; $script:ui.PermBox.SelectedIndex = 0; $script:ui.AccessBox.SelectedIndex = 0
+        $script:ui.IndicatorBox.SelectedIndex = 0; $script:ctx.IndicatorSet = $null
         & $script:ctx.ClearAccess; & $script:ctx.ClearStale; & $script:ctx.ClearRisk; & $script:ctx.ClearOwner; & $script:ctx.ClearBlocked; & $script:ctx.ClearTools; & $script:ctx.ClearPerm; & $script:ctx.ColClearAll
         $script:ctx.Resetting = $false
     }
@@ -11304,6 +11366,8 @@ function New-ConsoleWindow {
             'Shared with' = [bool]$script:ui.DetailColsBox.IsChecked; 'Channels' = [bool]$script:ui.DetailColsBox.IsChecked
             'Permissions held' = ($null -ne $script:ctx.PermSet)
             'Available to' = ([bool]$script:ui.DetailColsBox.IsChecked -or $null -ne $script:ctx.AccessSet)
+            'Risk indicators' = ([bool]$script:ui.RiskColsBox.IsChecked -or $null -ne $script:ctx.IndicatorSet)
+            'Entra risk' = ([bool]$script:ui.RiskColsBox.IsChecked -or $null -ne $script:ctx.IndicatorSet)
         }
         $dropped = $false
         foreach ($c in $script:ui.Grid.Columns) {
@@ -11478,6 +11542,44 @@ function New-ConsoleWindow {
             & $script:ctx.Idle ("{0} agent(s) flagged by {1} at {2} or above (last 30 days)." -f $found.Count, $script:ui.SignalBox.SelectedItem.Content.ToLowerInvariant(), $sev)
         } catch { & $script:ctx.FilterFailed 'RiskBox' 'Risk filter failed.' 'Risk filter' $_.Exception.Message }
     }
+
+    # Read Defender's risk indicators and, with the permission, Entra's risk detections once, and copy them onto the rows.
+    $script:ctx.EnsureRiskSignals = {
+        if ($null -ne $script:ctx.RiskSignals) { return $true }
+        try {
+            & $script:ctx.Busy 'Reading risk indicators from Microsoft Defender...'
+            $pk = @($script:ctx.Rows | ForEach-Object { $_.Package })
+            $nodes = @(Get-AgentRiskIndicators)
+            $detections = $null; $users = @{}; $script:ctx.EntraNote = ''
+            if (Test-GraphScope 'IdentityRiskEvent.Read.All') {
+                & $script:ctx.Busy 'Reading risk detections from Microsoft Entra ID Protection...'
+                try { $detections = @(Get-AgentRiskDetections); $users = try { Get-AgentUserIdsByIdentity } catch { @{} } }
+                catch { $script:ctx.EntraNote = 'Entra risk detections could not be read: ' + $_.Exception.Message }
+            } else { $script:ctx.EntraNote = 'Entra risk detections need the IdentityRiskEvent.Read.All permission: run -SignIn once.' }
+            $script:ctx.RiskSignals = Get-RiskSignalMap -Packages $pk -Nodes $nodes -Detections $detections -UsersByIdentity $users
+            & $script:ctx.FillRiskSignals
+            $true
+        } catch { & $script:ctx.Idle 'Could not read risk indicators.'; [void][Windows.MessageBox]::Show($_.Exception.Message, 'Risk indicators', 'OK', 'Error'); $false }
+    }
+    $script:ctx.FillRiskSignals = {
+        if ($null -eq $script:ctx.RiskSignals) { return }
+        foreach ($r in $script:ctx.Rows) {
+            $c = Get-RiskSignalCells $script:ctx.RiskSignals[$r.Id.ToLowerInvariant()]
+            $r.Indicators = $c.Indicators; $r.IndicatorsSort = $c.IndicatorsSort; $r.EntraRisk = $c.EntraRisk; $r.EntraRiskSort = $c.EntraRiskSort
+        }
+    }
+    # Agents by their risk indicators or Entra detections, for the current dropdown value (or clear it for "None").
+    $script:ctx.RunIndicators = {
+        $mode = [string]$script:ui.IndicatorBox.SelectedItem.Tag
+        $script:ctx.IndicatorSet = $null
+        if (-not $mode) { & $script:ctx.Refilter; & $script:ctx.Idle 'Indicators filter cleared.'; return }
+        if (-not (& $script:ctx.EnsureRiskSignals)) { $script:ui.IndicatorBox.SelectedIndex = 0; return }
+        $set = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($r in $script:ctx.Rows) { if (Test-RiskSignalMatch -Entry $script:ctx.RiskSignals[$r.Id.ToLowerInvariant()] -Mode $mode) { [void]$set.Add($r.Id) } }
+        $script:ctx.IndicatorSet = $set
+        & $script:ctx.Refilter
+        & $script:ctx.Idle (("{0} agent(s) match: {1}." -f $set.Count, [string]$script:ui.IndicatorBox.SelectedItem.Content) + $(if ($script:ctx.EntraNote) { ' ' + $script:ctx.EntraNote } else { '' }))
+    }
     $script:ctx.Confirm = {
         param([object[]]$Rows, [string]$Verb)
         [bool](New-ConfirmDialog -Rows $Rows -Verb $Verb -Owner $script:w).ShowDialog()
@@ -11527,6 +11629,14 @@ function New-ConsoleWindow {
         }
         & $script:ctx.Refilter
     })
+    $script:ui.RiskColsBox.Add_Click({
+        if ($script:ui.RiskColsBox.IsChecked) {
+            if (& $script:ctx.EnsureRiskSignals) { & $script:ctx.Idle ('Risk indicator columns loaded.' + $(if ($script:ctx.EntraNote) { ' ' + $script:ctx.EntraNote } else { '' })) }
+            else { $script:ui.RiskColsBox.IsChecked = $false }
+        }
+        & $script:ctx.Refilter
+    })
+    $script:ui.IndicatorBox.Add_SelectionChanged({ if (-not $script:ctx.Resetting) { & $script:ctx.RunIndicators } })
     $script:ctx.ShowDetails = {
         param($tab)
         $row = $script:ui.Grid.SelectedItem
@@ -11801,7 +11911,8 @@ function New-ConsoleWindow {
         $dlg = New-Object Microsoft.Win32.SaveFileDialog
         $dlg.Filter = 'CSV (*.csv)|*.csv|JSON (*.json)|*.json'; $dlg.FileName = 'agents.csv'
         if (-not $dlg.ShowDialog()) { return }
-        $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, Availability, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why, Id)
+        $out = @($script:ctx.View | Select-Object Name, Status, Kind, Platform, Publisher, Owner, Availability, ToolCount, Mcp, SharedCount, Channels, Modified, LastActivity, Idle, Risk, Alerts, Detections, Why,
+                                                  @{ n = 'RiskIndicators'; e = { $_.Indicators } }, EntraRisk, Id)
         Export-Rows -Rows $out -Path $dlg.FileName
         & $script:ctx.Idle "Exported $($out.Count) rows to $($dlg.FileName)"
     })
