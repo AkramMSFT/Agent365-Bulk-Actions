@@ -38,6 +38,7 @@
   { "version": "beta", "path": "/identityProtection/riskyAgents/{id}", "use": "Read one agent identity's risk" },
   { "version": "beta", "path": "/identityProtection/riskyAgents/confirmCompromised", "use": "Confirm an agent identity compromised" },
   { "version": "beta", "path": "/identityProtection/riskyAgents/dismiss", "use": "Dismiss an agent identity's risk" },
+  { "version": "beta", "path": "/identityProtection/agentRiskDetections", "use": "Entra ID Protection's risk detections for agents" },
   { "version": "beta", "path": "/identity/conditionalAccess/policies", "use": "Read Conditional Access; create MCP block policies" },
   { "version": "beta", "path": "/identity/conditionalAccess/policies/{id}", "use": "Update or delete MCP block policies" },
   { "version": "beta", "path": "/identity/conditionalAccess/evaluate", "use": "What If: would a policy block this agent on this resource" },

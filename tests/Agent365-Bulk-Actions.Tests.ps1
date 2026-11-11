@@ -506,6 +506,99 @@ Describe 'Agents with no Defender record count as having nothing' {
         $row.ToolCount | Should -Be 2
         $row.McpServers | Should -Be 'Work IQ Mail'
         $row.SharedWithCount | Should -Be 1
+        $row.RiskIndicators | Should -Be ''
+        (Get-InventoryRows -Packages @(New-Pkg 'P_has' 'Agent') -InfoTable @{ 'p_has' = $info } -IndicatorMap @{ 'p_has' = 'Active threat; Published agent' }).RiskIndicators | Should -Be 'Active threat; Published agent'
+    }
+}
+
+Describe 'Risk indicators' {
+    It 'names an indicator from its property, with a level when Defender records one' {
+        Get-RiskIndicatorLabel -Key 'privilegedBusinessSystemAccessIndicator' -Value 'true' | Should -Be 'Privileged business system access'
+        Get-RiskIndicatorLabel -Key 'agentWithHighAutonomyIndicator' | Should -Be 'Agent with high autonomy'
+        Get-RiskIndicatorLabel -Key 'blastRadiusIndicator' -Value '{"blastRadiusLevel":"High"}' | Should -Be 'Blast radius (High)'
+        Get-RiskIndicatorLabel -Key 'blastRadiusIndicator' -Value ([pscustomobject]@{ blastRadiusLevel = 'Low' }) | Should -Be 'Blast radius (Low)'
+    }
+    It 'gives each assessed agent one row with every catalog entry it names, keeps unlisted agents and puts active threats first' {
+        $pk = @([pscustomobject]@{ id = 'T_A'; displayName = 'Alpha' }, [pscustomobject]@{ id = 'T_A2'; displayName = 'Alpha (published)' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta' })
+        $nodes = @(
+            [pscustomobject]@{ Name = 'alpha'; Platform = 'Copilot Studio'; TitleIds = @('t_a', 't_a2', 't_gone'); Keys = @('publishedAgentIndicator', 'weakInstructionsIndicator'); Values = @('true', 'true') },
+            [pscustomobject]@{ Name = 'Beta'; Platform = 'Foundry'; TitleIds = @('t_b'); Keys = @('publishedAgentIndicator', 'activeThreatIndicator'); Values = @('true', 'true') },
+            [pscustomobject]@{ Name = 'Local tool'; Platform = 'Other'; TitleIds = @(); Keys = @(); Values = @() })
+        $rows = @(Get-RiskIndicatorRows -Packages $pk -Nodes $nodes)
+        $rows.Count | Should -Be 3
+        $rows[0].Agent | Should -Be 'Beta'; $rows[0].ActiveThreat | Should -BeTrue; $rows[0].Indicators | Should -Be @('Active threat', 'Published agent')
+        $rows[1].Agent | Should -Be 'Alpha'; $rows[1].Ids | Should -Be @('T_A', 'T_A2'); $rows[1].Indicators | Should -Be @('Weak instructions', 'Published agent'); $rows[1].Notable | Should -Be 1
+        $rows[2].Agent | Should -Be 'Local tool'; @($rows[2].Ids).Count | Should -Be 0; $rows[2].Notable | Should -Be 0
+        (Get-RiskIndicatorSummary $rows | Where-Object Indicator -eq 'Published agent').Agents | Should -Be 2
+    }
+    It 'reads the exposure graph once in ten minutes and keeps the raw names and values' {
+        $script:HuntingCache.Remove('riskindicators')
+        Mock Invoke-HuntingQuery { @([pscustomobject]@{ Name = 'Alpha'; Platform = 'Copilot Studio'; TitleIds = @('T_A'); Keys = @('activeThreatIndicator'); Values = @('true') }) }
+        $null = @(Get-AgentRiskIndicators); $n = @(Get-AgentRiskIndicators)
+        Should -Invoke Invoke-HuntingQuery -Times 1 -Exactly
+        $n[0].TitleIds | Should -Be @('t_a'); $n[0].Keys | Should -Be @('activeThreatIndicator')
+        $script:RiskIndicatorKql | Should -Match 'ExposureGraphNodes'
+        $script:HuntingCache.Remove('riskindicators')
+    }
+}
+
+Describe 'Entra risk detections' {
+    BeforeAll {
+        function New-Det { param([string]$Type = 'signInSpike', [string]$Identity = 'i1', [string]$IdentityType = 'agentIdentity', [string]$State = 'atRisk', [string]$Level = 'high', [string]$Name = 'Entra name', [string]$When = '2026-11-01T10:00:00Z')
+            [pscustomobject]@{ Type = $Type; Label = (Get-RiskDetectionLabel $Type); Level = $Level; State = $State; IdentityId = $Identity; IdentityType = $IdentityType; Name = $Name; Detected = [datetimeoffset]$When } }
+    }
+    It 'names a detection from Microsoft''s list, or from its type when it is new' {
+        Get-RiskDetectionLabel 'signInSpike' | Should -Be 'Sign-in spike'
+        Get-RiskDetectionLabel 'adminConfirmedAgentCompromised' | Should -Be 'Confirmed compromised'
+        Get-RiskDetectionLabel 'someNewDetection' | Should -Be 'Some new detection'
+        Get-RiskDetectionLabel 'aiCompoundAccountRisk' | Should -Be 'Unified risk signals'
+        Get-RiskDetectionLabel 'aiPromptAbuse' | Should -Be 'AI prompt abuse'
+        Get-RiskIndicatorLabel -Key 'exposedMcpServerIndicator' | Should -Be 'Exposed MCP server'
+    }
+    It 'reads 90 days once in ten minutes, asking for every value of the identity type' {
+        $script:HuntingCache.Remove('agentriskdetections')
+        Mock Get-GraphAll { $script:askedUri = $Uri; $script:askedHeaders = $Headers
+            @([pscustomobject]@{ riskEventType = 'unfamiliarResourceAccess'; riskLevel = 'medium'; riskState = 'atRisk'; identityId = 'I1'; identityType = 'agentIdentity'; displayName = 'A'; detectedDateTime = '2026-11-02T08:00:00Z' }) }
+        $null = @(Get-AgentRiskDetections); $r = @(Get-AgentRiskDetections)
+        Should -Invoke Get-GraphAll -Times 1 -Exactly
+        $script:askedUri | Should -Match '/beta/identityProtection/agentRiskDetections\?\$filter=detectedDateTime ge \d{4}-\d\d-\d\dT'
+        $script:askedHeaders.Prefer | Should -Be 'include-unknown-enum-members'
+        $r[0].Label | Should -Be 'Unfamiliar resource access'; $r[0].IdentityId | Should -Be 'i1'; $r[0].Detected.Year | Should -Be 2026
+        $script:HuntingCache.Remove('agentriskdetections')
+    }
+    It 'puts each detection on its agent''s row, through an agent user''s parent too, and gives the rest rows of their own' {
+        $pk = @([pscustomobject]@{ id = 'T_A'; displayName = 'Alpha'; agentIdentityId = 'I1' }, [pscustomobject]@{ id = 'T_B'; displayName = 'Beta'; agentIdentityId = 'I2' })
+        $rows = @([pscustomobject]@{ Agent = 'Alpha'; Ids = @('T_A'); Platform = 'Foundry'; Assessed = $true; Indicators = @('Published agent'); Keys = @('publishedAgentIndicator'); Notable = 0; ActiveThreat = $false })
+        $dets = @((New-Det -Identity 'i1'), (New-Det -Type 'failedAccessAttempt' -Identity 'u1' -IdentityType 'agentUser' -State 'dismissed'),
+                  (New-Det -Type 'unfamiliarResourceAccess' -Identity 'i2' -State 'dismissed'), (New-Det -Type 'suspiciousCredentialUsage' -Identity 'bp9' -IdentityType 'agentIdentityBlueprintPrincipal' -Name 'Some blueprint'))
+        $out = @(Add-RiskDetectionRows -Rows $rows -Packages $pk -Detections $dets -UsersByIdentity @{ 'I1' = @('U1') })
+        $out.Count | Should -Be 3
+        $alpha = $out | Where-Object Agent -eq 'Alpha'
+        @($alpha.Detections).Count | Should -Be 2; $alpha.AtRisk | Should -BeTrue
+        $beta = $out | Where-Object Agent -eq 'Beta'
+        $beta.Ids | Should -Be @('T_B'); $beta.Assessed | Should -BeFalse; $beta.AtRisk | Should -BeFalse
+        ($out | Where-Object Agent -eq 'Some blueprint').Ids.Count | Should -Be 0
+        $out[-1].Agent | Should -Be 'Beta'
+    }
+    It 'writes one entry per type with the latest, and counts what is still at risk' {
+        $dets = @((New-Det -When '2026-10-01T00:00:00Z' -State 'dismissed'), (New-Det -When '2026-11-03T00:00:00Z'), (New-Det -Type 'failedAccessAttempt' -Level 'low' -Identity 'i2'))
+        Format-RiskDetections $dets | Should -Be 'Sign-in spike x2 (high, atRisk, 2026-11-03); Failed access attempt (low, atRisk, 2026-11-01)'
+        Format-RiskDetections @() | Should -Be ''
+        $s = @(Get-RiskDetectionSummary $dets)
+        ($s | Where-Object Detection -eq 'Sign-in spike').Count | Should -Be 2
+        ($s | Where-Object Detection -eq 'Sign-in spike').AtRisk | Should -Be 1
+        ($s | Where-Object Detection -eq 'Sign-in spike').Identities | Should -Be 1
+    }
+    It 'is part of the one sign-in' {
+        $script:AllScopes | Should -Contain 'IdentityRiskEvent.Read.All'
+    }
+    It 'lists the agents with an indicator besides "Published agent" or a detection, with or without the detections read' {
+        $quiet = [pscustomobject]@{ Agent = 'Quiet'; Notable = 0 }
+        $flagged = [pscustomobject]@{ Agent = 'Flagged'; Notable = 1 }
+        @(Select-NotableRiskRows @($quiet, $flagged) | ForEach-Object { $_.Agent }) | Should -Be @('Flagged')
+        $seen = [pscustomobject]@{ Agent = 'Seen'; Notable = 0; Detections = @((New-Det)) }
+        $none = [pscustomobject]@{ Agent = 'None'; Notable = 0; Detections = @() }
+        @(Select-NotableRiskRows @($seen, $none) | ForEach-Object { $_.Agent }) | Should -Be @('Seen')
     }
 }
 
@@ -4474,9 +4567,9 @@ Describe 'Revoke sessions' {
 Describe 'Security pages' {
     It 'ships a curated set of hunting queries, each with a category, a name, a description and a query' {
         $q = @($script:HuntingQueries)
-        $q.Count | Should -Be 18
+        $q.Count | Should -Be 19
         @($q | Where-Object { -not $_.Category -or -not $_.Name -or -not $_.Description -or -not $_.Query }).Count | Should -Be 0
-        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 18
+        @($q | ForEach-Object { $_.Name } | Get-Distinct).Count | Should -Be 19
         @($q | ForEach-Object { $_.Category } | Get-Distinct) | Should -Be @('Inventory', 'Telemetry', 'Alerts', 'Runtime protection', 'Posture', 'Access', 'Tools and MCP', 'Data security', 'Network')
         @($q | Where-Object { $_.Query -match '[^\x00-\x7F]' }).Count | Should -Be 0
     }
