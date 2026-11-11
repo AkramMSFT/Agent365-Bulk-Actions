@@ -1535,7 +1535,8 @@ function Resolve-EndpointAiTool {
 function ConvertTo-EndpointTime {
     param($Value)
     if ($null -eq $Value -or [string]$Value -eq '') { return $null }
-    if ($Value -is [datetime]) { return $Value }
+    # Advanced Hunting returns UTC times; the pages compare them with the local clock.
+    if ($Value -is [datetime]) { return $(if ($Value.Kind -eq [DateTimeKind]::Utc) { $Value.ToLocalTime() } else { $Value }) }
     try { [datetimeoffset]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture).LocalDateTime } catch { $null }
 }
 
@@ -3392,16 +3393,16 @@ let byEntity = evidence
     | where EntityType == "AIAgent"
     | extend af = parse_json(AdditionalFields), K = tolower(tostring(parse_json(AdditionalFields).AgentId))
     | join kind=leftouter keys on $left.K == $right.Key
-    | project AlertId, CatalogId = coalesce(CatalogId, ""), Label = tostring(coalesce(af.AgentName, af.agentName, K)), Via = "Agent entity";
+    | project AlertId, CatalogId = coalesce(CatalogId, ""), AgentKey = K, Label = tostring(coalesce(af.AgentName, af.agentName, K)), Via = "Agent entity";
 let byResource = evidence
     | where EntityType == "CloudResource" and isnotempty(ResourceID)
     | extend ResourceID = tolower(ResourceID)
     | join kind=inner resources on ResourceID
-    | project AlertId, CatalogId, Label = "", Via = "Azure AI resource";
+    | project AlertId, CatalogId, AgentKey = "", Label = "", Via = "Azure AI resource";
 union byEntity, byResource
-| summarize Via = min(Via), Label = take_any(Label) by AlertId, CatalogId
+| summarize Via = min(Via), Label = take_any(Label), AgentKey = take_any(AgentKey) by AlertId, CatalogId
 | join kind=inner (AlertInfo | where Timestamp > ago(30d) | summarize arg_max(Timestamp, *) by AlertId) on AlertId
-| project Timestamp, AlertId, CatalogId, Label, Title, Severity, Category, ServiceSource, DetectionSource, Via
+| project Timestamp, AlertId, CatalogId, AgentKey, Label, Title, Severity, Category, ServiceSource, DetectionSource, Via
 | order by Timestamp desc
 '@
 
@@ -3409,12 +3410,15 @@ function Get-AgentDefenderAlerts {
     param([object[]]$Packages, [scriptblock]$OnStatus)
     if ($OnStatus) { & $OnStatus 'Reading Defender alerts that concern agents...' }
     $rows = Invoke-HuntingQuery -Query $script:AgentAlertKql -Hint 'Check ThreatHunting.Read.All consent and that Security for AI is onboarded.'
-    $byId = @{}
-    foreach ($p in @($Packages)) { $byId[([string]$p.id).ToLowerInvariant()] = $p }
+    # Defender's inventory names the catalog entry for most alerts; for the rest, the agent id on the alert can match another
+    # of the entry's ids, such as its manifest id.
+    $byKey = @{}
+    foreach ($p in @($Packages)) { foreach ($k in (Get-PackageKeys $p)) { if (-not $byKey.ContainsKey($k)) { $byKey[$k] = $p } } }
     $tenant = [string](Get-MgContext).TenantId
     @($rows | ForEach-Object {
         $cid = ([string]$_.CatalogId).ToLowerInvariant()
-        $pk = if ($cid) { $byId[$cid] } else { $null }
+        $pk = $null
+        foreach ($k in @($cid) + @(Get-AgentKeyForms ([string]$_.AgentKey))) { if ($k -and $byKey.ContainsKey($k)) { $pk = $byKey[$k]; break } }
         [pscustomobject]@{
             Time = (ConvertTo-EndpointTime $_.Timestamp); AlertId = [string]$_.AlertId
             Agent = $(if ($pk) { [string]$pk.displayName } elseif ($_.Label) { [string]$_.Label } else { $cid })
@@ -5635,9 +5639,27 @@ function Get-RiskCached {
 # The risk entry for one package (severity, alert and detection counts, reasons), or $null when it has none.
 function Get-AgentRisk {
     param([object]$Package)
-    $idx = Get-RiskCached
-    foreach ($k in (Get-PackageKeys $Package)) { if ($idx.ContainsKey($k)) { return $idx[$k] } }
-    $null
+    Get-PackageRisk -Package $Package -Index (Get-RiskCached)
+}
+
+# The risk entry for one package from an index keyed by agent id. An agent's signals can sit under more than one of its ids
+# (a Prompt Shield detection matched by name under the catalog id, its alerts under the id on the alert), so every entry
+# found under its ids counts, each once.
+function Get-PackageRisk {
+    param([object]$Package, [hashtable]$Index)
+    $found = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+    foreach ($k in (Get-PackageKeys $Package)) { $e = $Index[$k]; if ($e -and $seen.Add($e)) { $found.Add($e) } }
+    if ($found.Count -le 1) { return $(if ($found.Count) { $found[0] } else { $null }) }
+    $set = { param([string]$Name) (@($found | ForEach-Object { ([string]$_.$Name) -split '; ' } | Where-Object { $_ } | Select-Object -Unique) -join '; ') }
+    [pscustomobject]@{
+        AlertCount     = [int]($found | Measure-Object AlertCount -Sum).Sum
+        DetectionCount = [int]($found | Measure-Object DetectionCount -Sum).Sum
+        Severity       = ($found | Sort-Object { Get-SevRank $_.Severity } -Descending | Select-Object -First 1).Severity
+        LastAlert      = ($found | Where-Object LastAlert | Sort-Object LastAlert -Descending | Select-Object -First 1).LastAlert
+        Reasons        = (& $set 'Reasons')
+        Categories     = (& $set 'Categories')
+    }
 }
 
 # Defender's posture risk indicators: the conditions behind the risk level on its AI agents page, such as weak instructions, an
@@ -5912,6 +5934,18 @@ function Get-PackageKeys {
     }
 }
 
+# An agent id as Defender records it, in lower case, then the id inside it when it is scoped to a Power Platform environment.
+# Copilot Studio names an agent built with Agent Builder by its environment and manifest id, Default-<tenant>_<manifest id>,
+# and the catalog keeps the manifest id.
+function Get-AgentKeyForms {
+    param([string]$Key)
+    $k = $Key.Trim().ToLowerInvariant()
+    if (-not $k) { return }
+    $k
+    $guid = '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+    if ($k -match "^(default-)?${guid}_(?<id>${guid})$") { $Matches['id'] }
+}
+
 function Invoke-HuntingQuery {
     param([string]$Query, [string]$Hint)
     try {
@@ -6133,9 +6167,9 @@ union $legs
     }
     $idx = @{}
     foreach ($row in $rows) {
-        $k = [string]$row.Key
-        if ([string]::IsNullOrWhiteSpace($k)) { continue }
-        $idx[$k.ToLowerInvariant()] = [pscustomobject]@{
+        $forms = @(Get-AgentKeyForms ([string]$row.Key))
+        if (-not $forms.Count) { continue }
+        $entry = [pscustomobject]@{
             AlertCount     = [int]$row.AlertCount
             DetectionCount = [int]$row.DetectionCount
             Severity       = [string]$row.Severity
@@ -6143,6 +6177,8 @@ union $legs
             Reasons        = (& $joinSet $row.Reasons)
             Categories     = (& $joinSet $row.Categories)
         }
+        $idx[$forms[0]] = $entry
+        foreach ($k in @($forms | Select-Object -Skip 1)) { if (-not $idx.ContainsKey($k)) { $idx[$k] = $entry } }
     }
     $idx
 }
@@ -6158,8 +6194,7 @@ function Get-RiskyPackages {
     $idx = Get-RiskCached -Days $Days -Source $Source
     $minRank = Get-SevRank $MinSeverity
     $out = foreach ($p in (Select-PackageSet -Packages $Packages -Supplied:$PSBoundParameters.ContainsKey('Packages') -AgentsOnly:$AgentsOnly)) {
-        $hit = $null
-        foreach ($k in (Get-PackageKeys $p)) { if ($idx.ContainsKey($k)) { $hit = $idx[$k]; break } }
+        $hit = Get-PackageRisk -Package $p -Index $idx
         if ($hit -and ($hit.AlertCount + $hit.DetectionCount) -ge $MinAlerts -and (Get-SevRank $hit.Severity) -ge $minRank) {
             Add-Member -InputObject $p -Force -PassThru -NotePropertyMembers ([ordered]@{
                 RiskAlerts = $hit.AlertCount; RiskDetections = $hit.DetectionCount; RiskSeverity = $hit.Severity
@@ -6660,7 +6695,7 @@ function ConvertTo-CsvRows {
 function Export-Rows {
     param([object[]]$Rows, [string]$Path, [int]$Depth = 2, [switch]$AsArray)
     if ($Path -match '\.json$') { $Rows | ConvertTo-Json -Depth $Depth -AsArray:$AsArray | Set-Content -LiteralPath $Path -Encoding utf8 }
-    else { ConvertTo-CsvRows @($Rows) | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding utf8 }
+    else { ConvertTo-CsvRows @($Rows) | Export-Csv -LiteralPath $Path -Encoding utf8 }
 }
 
 # Save the per-agent results (and the state each agent had before the run) as CSV or JSON. A run that writes the same file

@@ -267,6 +267,8 @@ Results carry **severity**, **alerts**, **detections**, **why** (alert titles an
 
 Behaviors carry no severity of their own, so the table is the mapping the tool applies: a block means an attack was stopped, an audit or detect means it was seen but not stopped. `-RiskSource Both|Alerts|Detections` chooses the signals.
 
+An agent built with Agent Builder in Microsoft 365 Copilot appears in the evidence as `Default-<tenant id>_<manifest id>`, and the tool matches it on the manifest id. When an agent's signals sit under more than one of its ids, for example a Prompt Shield detection matched by name and alerts matched by id, they are added together. The console's Alerts page ties alerts to agents the same way.
+
 Not every signal can be attributed to a catalog agent. Defender for AI Services alerts name an Azure AI account rather than an agent, real-time block records can lack an agent identity, and a Prompt Shield record whose agent name is missing or duplicated is skipped. Run `-Risky -Action list` first, and override the default query with `-HuntingQuery` if it does not fit your tenant (return `Key, AlertCount, DetectionCount, Severity, LastAlert`, with `Key` set to the package id).
 
 ### Risk indicators
